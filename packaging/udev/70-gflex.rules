@@ -1,0 +1,14 @@
+# Werewolf VFLEX -- Tundra Labs, USB vendor 0x37BF (14271 decimal).
+# Product ID is deliberately not matched: the vendor app filters on VID only.
+
+# Raw USB (usbfs) for the direct-USB transport and the class-0xFF bootloader.
+# ATTR{} (not ATTRS{}) is correct: the usb_device node owns idVendor itself.
+SUBSYSTEM=="usb", ATTR{idVendor}=="37bf", MODE="0660", TAG+="uaccess"
+
+# Non-seat fallback -- ssh, headless, service accounts, non-systemd distros.
+#SUBSYSTEM=="usb", ATTR{idVendor}=="37bf", MODE="0660", GROUP="plugdev"
+
+# ALSA rawmidi node. Redundant on systemd; needed only headless / non-systemd.
+# ATTRS{} (not ATTR{}) is required: the sound node has no idVendor of its own,
+# so udev must walk up to the USB parent.
+#SUBSYSTEM=="sound", ATTRS{idVendor}=="37bf", MODE="0660", GROUP="audio"

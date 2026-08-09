@@ -1,0 +1,517 @@
+package usbfs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"sort"
+	"sync"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+// Transfer sizing and timing limits.
+const (
+	// MaxBulkTransferSize is the kernel's MAX_USBFS_BUFFER_SIZE. A larger
+	// USBDEVFS_BULK is rejected with EINVAL, so it is caught here instead
+	// where the message can say why.
+	MaxBulkTransferSize = 16384
+	// MaxControlTransferSize is the kernel's control-transfer limit: usbfs
+	// bounces wLength above one page. One page is at least 4 KiB on every
+	// architecture, so this is the portable floor.
+	MaxControlTransferSize = 4096
+	// DefaultTimeout is substituted when a caller passes a zero timeout and
+	// the context carries no deadline. usbfs reads a zero timeout as "wait
+	// forever", which would wedge the CLI on an unresponsive device; nothing
+	// in this package ever passes the kernel a literal zero.
+	DefaultTimeout = 5 * time.Second
+
+	// maxTimeoutMs caps the millisecond field so a very distant context
+	// deadline cannot overflow it.
+	maxTimeoutMs = 1<<31 - 1
+
+	// maxDescriptorBytes bounds the descriptor read. Real blobs are a few
+	// hundred bytes; this only stops a runaway loop.
+	maxDescriptorBytes = 64 * 1024
+)
+
+// Device is an open usbfs handle.
+//
+// A Device is safe for concurrent use. Transfers do not serialise against each
+// other -- the kernel handles concurrent URBs on distinct endpoints -- but the
+// bookkeeping of claimed interfaces does.
+type Device struct {
+	f   *os.File
+	ref DeviceRef
+
+	mu sync.Mutex
+	// claimed maps an interface number to whether this process detached a
+	// kernel driver in order to claim it, which is what tells ReleaseInterface
+	// whether it owes the system a reattach.
+	claimed map[int]bool
+	cfg     *Config
+}
+
+// Open opens the usbfs node named by ref.
+//
+// The node is root-only on a stock system; a failure here is usually
+// ErrPermission and means the udev rule is missing (SPEC.md §4.4).
+func Open(ref DeviceRef) (*Device, error) {
+	if ref.Path == "" {
+		return nil, errors.New("usbfs: DeviceRef has no device node path")
+	}
+	f, err := os.OpenFile(ref.Path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, wrapErrno("open", ref.Path, err)
+	}
+	return &Device{f: f, ref: ref, claimed: make(map[int]bool)}, nil
+}
+
+// Ref returns the reference the device was opened from.
+func (d *Device) Ref() DeviceRef { return d.ref }
+
+// String renders the device for diagnostics.
+func (d *Device) String() string { return d.ref.String() }
+
+// Close releases any interfaces still claimed -- reattaching kernel drivers as
+// it goes -- and then closes the file descriptor.
+//
+// The order matters. Closing the fd alone would make the kernel drop the usbfs
+// claim, but it would not rebind the driver that was detached, so the ALSA card
+// would stay missing. See ReleaseInterface.
+func (d *Device) Close() error {
+	d.mu.Lock()
+	nums := make([]int, 0, len(d.claimed))
+	for n := range d.claimed {
+		nums = append(nums, n)
+	}
+	d.mu.Unlock()
+	sort.Ints(nums)
+
+	var firstErr error
+	for _, n := range nums {
+		if err := d.ReleaseInterface(n); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if err := d.f.Close(); err != nil && firstErr == nil {
+		firstErr = wrapErrno("close", d.ref.Path, err)
+	}
+	return firstErr
+}
+
+// Descriptors reads and parses the device's descriptor blob.
+//
+// Reading a usbfs file from offset 0 yields the 18-byte device descriptor
+// immediately followed by every configuration descriptor tree, which is a
+// cheaper and more complete source than either sysfs or a GET_DESCRIPTOR
+// control transfer. The result is cached and must be treated as read-only;
+// SetConfiguration drops the cache, since it changes the answer.
+//
+// Because the blob flattens every configuration together, the returned
+// Config.Interfaces is narrowed to the configuration the device currently has
+// selected whenever the device declares more than one and that selection can be
+// determined from sysfs. Without the narrowing, a selection by interface number
+// could match an interface that only exists in some other configuration and then
+// claim a different interface with the same number, or none at all. Config.
+// Configurations always holds the full picture. The active value is read from
+// sysfs alone, never from the device, so this stays free of bus traffic and of a
+// context; a device whose configuration cannot be read that way is simply left
+// unnarrowed, which is what every caller did before this existed.
+func (d *Device) Descriptors() (*Config, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.cfg != nil {
+		return d.cfg, nil
+	}
+	raw, err := d.readRawDescriptors()
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := ParseDescriptors(raw)
+	if err != nil {
+		return nil, fmt.Errorf("usbfs: %s: %w", d.ref.Path, err)
+	}
+	// Narrowed before the value is published, so nothing ever observes the
+	// union on a device where the union would be wrong.
+	if v, ok := d.sysfsConfiguration(); ok {
+		cfg.Active = v
+		cfg.restrictToActive()
+	}
+	d.cfg = cfg
+	return cfg, nil
+}
+
+func (d *Device) readRawDescriptors() ([]byte, error) {
+	const chunk = 4096
+	buf := make([]byte, 0, chunk)
+	tmp := make([]byte, chunk)
+	var off int64
+	for len(buf) < maxDescriptorBytes {
+		// ReadAt (pread) rather than Seek+Read: it needs no lock against
+		// concurrent transfers and cannot be disturbed by them. usbfs
+		// implements llseek, so the fd supports pread.
+		n, err := d.f.ReadAt(tmp, off)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			off += int64(n)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, wrapErrno("read descriptors", d.ref.Path, err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if len(buf) == 0 {
+		return nil, fmt.Errorf("usbfs: %s returned no descriptor bytes", d.ref.Path)
+	}
+	return buf, nil
+}
+
+// ClaimInterface claims an interface for this process.
+//
+// With detachKernelDriver set, any kernel driver bound to the interface is
+// detached first. The preferred mechanism is USBDEVFS_DISCONNECT_CLAIM, which
+// detaches and claims in a single ioctl: doing it in two steps leaves a window
+// in which udev can rebind the driver before the claim lands, and the claim
+// then fails with EBUSY (SPEC.md §4.2). The two-step path is kept only as a
+// fallback for kernels older than 3.4.
+//
+// Detaching has a visible cost on a VFLEX in application mode: while
+// snd-usb-audio is detached the ALSA card and its /dev/snd/midiC*D* node
+// disappear, so any DAW or PipeWire client loses the port. Always Close (or
+// ReleaseInterface) so the driver is put back.
+func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
+	if detachKernelDriver {
+		// EXCEPT_DRIVER with "usbfs" means "detach whatever driver is bound
+		// unless it is usbfs itself". That is the right filter when the bound
+		// driver's name is not known ahead of time -- which is the case here,
+		// since the VFLEX presents as snd-usb-audio in application mode and as
+		// nothing at all in bootloader mode. Use ClaimInterfaceIfDriver when
+		// the name is known and detaching anything else would be wrong.
+		err := d.claimDetaching(num, disconnectClaimExceptDriver, "usbfs")
+		if err == nil {
+			d.markClaimed(num, true)
+			return nil
+		}
+		// Only an unimplemented ioctl justifies the racy fallback. usbfs
+		// answers ENOTTY for a request number it does not know, so anything
+		// else -- EBUSY, EINVAL for a bad interface number, EACCES -- is a
+		// real failure and is reported as it happened rather than being
+		// masked by a second attempt.
+		if !errors.Is(err, ErrNotSupported) {
+			return err
+		}
+		if err := d.detachDriver(num); err != nil {
+			return err
+		}
+	}
+	if err := d.claim(num); err != nil {
+		return err
+	}
+	d.markClaimed(num, detachKernelDriver)
+	return nil
+}
+
+// ClaimInterfaceIfDriver claims an interface atomically, detaching the bound
+// kernel driver only if its name equals driver (USBDEVFS_DISCONNECT_CLAIM with
+// USBDEVFS_DISCONNECT_CLAIM_IF_DRIVER). If some other driver is bound the
+// kernel refuses with EBUSY rather than detaching it.
+//
+// Use this when you know exactly what you are displacing, e.g.
+// ClaimInterfaceIfDriver(0, "snd-usb-audio"). There is no non-atomic fallback:
+// a caller who cares about which driver gets detached would not want the racy
+// two-step sequence either.
+func (d *Device) ClaimInterfaceIfDriver(num int, driver string) error {
+	if err := d.claimDetaching(num, disconnectClaimIfDriver, driver); err != nil {
+		return err
+	}
+	d.markClaimed(num, true)
+	return nil
+}
+
+// ReleaseInterface releases an interface and, if this process detached a kernel
+// driver to claim it, asks the kernel to rebind that driver.
+//
+// The reattach is not optional politeness. On a VFLEX in application mode the
+// detached driver is snd-usb-audio, and leaving it detached makes the user's
+// ALSA MIDI port vanish until the device is physically replugged -- so the
+// default rawmidi transport stops working and the failure looks like broken
+// hardware. Closing the fd does not rebind it; only USBDEVFS_CONNECT does.
+func (d *Device) ReleaseInterface(num int) error {
+	d.mu.Lock()
+	detached := d.claimed[num]
+	delete(d.claimed, num)
+	d.mu.Unlock()
+
+	n := uint32(num)
+	_, err := d.ioctl(fmt.Sprintf("release interface %d", num), ioctlReleaseInterface, unsafe.Pointer(&n), true)
+	runtime.KeepAlive(&n)
+	if err != nil {
+		// A device that has gone away has already released everything, and
+		// there is no driver left to rebind.
+		if errors.Is(err, ErrNoDevice) {
+			return nil
+		}
+		return err
+	}
+	if !detached {
+		return nil
+	}
+	if err := d.attachDriver(num); err != nil {
+		if errors.Is(err, ErrNoDevice) {
+			return nil
+		}
+		return fmt.Errorf("usbfs: interface %d was released but the kernel driver could not be reattached "+
+			"(the ALSA MIDI port will stay missing until the device is replugged): %w", num, err)
+	}
+	return nil
+}
+
+// SetInterface selects an alternate setting. The interface must already be
+// claimed; the kernel refuses otherwise.
+func (d *Device) SetInterface(num, alt int) error {
+	si := setInterface{iface: uint32(num), altSetting: uint32(alt)}
+	_, err := d.ioctl(fmt.Sprintf("set interface %d alt %d", num, alt), ioctlSetInterface, unsafe.Pointer(&si), true)
+	runtime.KeepAlive(&si)
+	return err
+}
+
+// Control runs a synchronous control transfer on endpoint 0.
+//
+// requestType is bmRequestType; its top bit selects the direction, so data is
+// filled in by the device when requestType&0x80 is set and sent to the device
+// otherwise. The return value is the number of bytes actually transferred,
+// which for an IN transfer may be shorter than len(data).
+//
+// See Transfer for how ctx and timeout interact.
+func (d *Device) Control(ctx context.Context, requestType, request uint8, value, index uint16, data []byte, timeout time.Duration) (int, error) {
+	if len(data) > MaxControlTransferSize {
+		return 0, fmt.Errorf("%w: %d bytes, the control limit is %d", ErrTooLarge, len(data), MaxControlTransferSize)
+	}
+	ms, err := timeoutMs(ctx, timeout)
+	if err != nil {
+		return 0, err
+	}
+	ptr, keep := bufferPointer(data)
+	ct := ctrlTransfer{
+		bRequestType: requestType,
+		bRequest:     request,
+		wValue:       value,
+		wIndex:       index,
+		wLength:      uint16(len(data)),
+		timeout:      ms,
+		data:         ptr,
+	}
+	n, err := d.ioctl(fmt.Sprintf("control transfer bmRequestType=0x%02x bRequest=0x%02x", requestType, request),
+		ioctlControl, unsafe.Pointer(&ct), false)
+	runtime.KeepAlive(keep)
+	runtime.KeepAlive(&ct)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Transfer runs a synchronous transfer on a bulk or interrupt endpoint.
+//
+// One entry point covers both because USBDEVFS_BULK does: the kernel looks up
+// the endpoint descriptor and, for an interrupt endpoint, rewrites the pipe and
+// submits an interrupt URB instead (usb_bulk_msg in drivers/usb/core/message.c).
+// The name is a misnomer, not a constraint. Callers still need Endpoint.IsBulk
+// and IsInterrupt for their own descriptor validation (SPEC.md §4.2).
+//
+// endpoint is the full bEndpointAddress, i.e. with 0x80 set for an IN endpoint;
+// that is what the ioctl expects, and it is also what determines the direction
+// of the transfer. Do not pass the bare 4-bit endpoint number (SPEC.md §10.2).
+//
+// Timeouts: usbfs takes a millisecond timeout in which 0 means "wait forever".
+// timeout and ctx's deadline are both honoured -- the shorter of the two wins,
+// and a zero timeout with no deadline falls back to DefaultTimeout so the
+// kernel never receives a zero. Cancelling ctx does *not* abort a transfer
+// already in flight: that would need the asynchronous URB interface, which this
+// package deliberately does not implement. ctx is checked before submitting and
+// bounds how long the ioctl can block, which is enough for a CLI.
+func (d *Device) Transfer(ctx context.Context, endpoint uint8, data []byte, timeout time.Duration) (int, error) {
+	if len(data) > MaxBulkTransferSize {
+		return 0, fmt.Errorf("%w: %d bytes, the usbfs limit is %d", ErrTooLarge, len(data), MaxBulkTransferSize)
+	}
+	ms, err := timeoutMs(ctx, timeout)
+	if err != nil {
+		return 0, err
+	}
+	ptr, keep := bufferPointer(data)
+	bt := bulkTransfer{
+		ep:      uint32(endpoint),
+		length:  uint32(len(data)),
+		timeout: ms,
+		data:    ptr,
+	}
+	dir := "OUT"
+	if endpoint&endpointDirMask != 0 {
+		dir = "IN"
+	}
+	n, err := d.ioctl(fmt.Sprintf("transfer %d bytes %s on endpoint 0x%02x", len(data), dir, endpoint),
+		ioctlBulk, unsafe.Pointer(&bt), false)
+	runtime.KeepAlive(keep)
+	runtime.KeepAlive(&bt)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// internals
+// ---------------------------------------------------------------------------
+
+func (d *Device) markClaimed(num int, detached bool) {
+	d.mu.Lock()
+	d.claimed[num] = detached
+	d.mu.Unlock()
+}
+
+func (d *Device) claim(num int) error {
+	n := uint32(num)
+	_, err := d.ioctl(fmt.Sprintf("claim interface %d", num), ioctlClaimInterface, unsafe.Pointer(&n), true)
+	runtime.KeepAlive(&n)
+	return err
+}
+
+// claimDetaching issues USBDEVFS_DISCONNECT_CLAIM: detach (subject to flags)
+// and claim, atomically.
+func (d *Device) claimDetaching(num int, flags uint32, driver string) error {
+	if len(driver) > maxDriverName {
+		return fmt.Errorf("usbfs: driver name %q is longer than %d bytes", driver, maxDriverName)
+	}
+	dc := disconnectClaim{iface: uint32(num), flags: flags}
+	// The kernel compares the whole fixed-size array, so the tail must stay
+	// zeroed; copy never writes past the name.
+	copy(dc.driver[:], driver)
+	_, err := d.ioctl(fmt.Sprintf("detach and claim interface %d", num), ioctlDisconnectClaim, unsafe.Pointer(&dc), true)
+	runtime.KeepAlive(&dc)
+	return err
+}
+
+// detachDriver unbinds whatever kernel driver holds the interface, without
+// claiming it. Only used on kernels too old for USBDEVFS_DISCONNECT_CLAIM.
+func (d *Device) detachDriver(num int) error {
+	err := d.interfaceIoctl(num, ioctlDisconnect, fmt.Sprintf("detach kernel driver from interface %d", num))
+	// ENODATA means no driver was bound, which is the desired end state.
+	if err != nil && errors.Is(err, unix.ENODATA) {
+		return nil
+	}
+	return err
+}
+
+// attachDriver asks the kernel to rebind the in-tree driver for the interface.
+func (d *Device) attachDriver(num int) error {
+	err := d.interfaceIoctl(num, ioctlConnect, fmt.Sprintf("reattach kernel driver to interface %d", num))
+	// ENODATA here means no driver wanted the interface -- nothing to rebind,
+	// which is not a failure.
+	if err != nil && errors.Is(err, unix.ENODATA) {
+		return nil
+	}
+	return err
+}
+
+// interfaceIoctl runs USBDEVFS_IOCTL, the wrapper that targets one interface
+// with a nested request code.
+func (d *Device) interfaceIoctl(num int, code uintptr, op string) error {
+	arg := usbdevfsIoctl{ifno: int32(num), ioctlCode: int32(code)}
+	_, err := d.ioctl(op, ioctlIoctl, unsafe.Pointer(&arg), true)
+	runtime.KeepAlive(&arg)
+	return err
+}
+
+// ioctl issues one ioctl on the device fd and returns its non-negative result
+// (the transferred byte count, for the transfer ioctls).
+//
+// retryEINTR must be false for anything that moves data: retrying a transfer
+// that the kernel may already have submitted could duplicate a write. It is
+// safe for the idempotent management ioctls. In practice usbfs waits
+// uninterruptibly, so EINTR is not expected either way.
+//
+// SyscallConn().Control is used rather than File.Fd() so that a concurrent
+// Close cannot pull the descriptor out from under the syscall, and so the
+// descriptor is not silently switched to blocking mode as a side effect.
+func (d *Device) ioctl(op string, req uintptr, arg unsafe.Pointer, retryEINTR bool) (int, error) {
+	rc, err := d.f.SyscallConn()
+	if err != nil {
+		return 0, wrapErrno(op, d.ref.Path, err)
+	}
+	var (
+		n     int
+		errno syscall.Errno
+	)
+	if cerr := rc.Control(func(fd uintptr) {
+		for {
+			r1, _, e := unix.Syscall(unix.SYS_IOCTL, fd, req, uintptr(arg))
+			n, errno = int(r1), e
+			if e == unix.EINTR && retryEINTR {
+				continue
+			}
+			return
+		}
+	}); cerr != nil {
+		return 0, wrapErrno(op, d.ref.Path, cerr)
+	}
+	if errno != 0 {
+		return 0, wrapErrno(op, d.ref.Path, errno)
+	}
+	return n, nil
+}
+
+// timeoutMs converts a caller timeout and a context deadline into the
+// millisecond value usbfs wants, and reports a context that has already expired
+// before anything is submitted.
+func timeoutMs(ctx context.Context, timeout time.Duration) (uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("usbfs: transfer not submitted: %w", err)
+	}
+	eff := timeout
+	if dl, ok := ctx.Deadline(); ok {
+		remaining := time.Until(dl)
+		if remaining <= 0 {
+			return 0, fmt.Errorf("usbfs: transfer not submitted: %w", context.DeadlineExceeded)
+		}
+		if eff <= 0 || remaining < eff {
+			eff = remaining
+		}
+	}
+	if eff <= 0 {
+		eff = DefaultTimeout
+	}
+	// Round up: a sub-millisecond budget must not become 0, which usbfs reads
+	// as "block forever".
+	ms := (int64(eff) + int64(time.Millisecond) - 1) / int64(time.Millisecond)
+	if ms < 1 {
+		ms = 1
+	}
+	if ms > maxTimeoutMs {
+		ms = maxTimeoutMs
+	}
+	return uint32(ms), nil
+}
+
+// bufferPointer yields the pointer to hand the kernel plus the slice to keep
+// alive across the syscall. A zero-length transfer is legal on the wire (a
+// zero-length packet is a real USB event), so it gets a one-byte scratch
+// buffer rather than a nil pointer.
+func bufferPointer(b []byte) (unsafe.Pointer, []byte) {
+	if len(b) == 0 {
+		z := make([]byte, 1)
+		return unsafe.Pointer(&z[0]), z
+	}
+	return unsafe.Pointer(&b[0]), b
+}

@@ -1,0 +1,13 @@
+# Build output is written outside the working tree by convention. These
+# patterns are a backstop for the case where a build is run without -o, not the
+# primary mechanism.
+/gflex
+/cmd/gflex/gflex
+
+# Go test and coverage output.
+*.test
+*.out
+coverage.*
+
+# Fuzz corpora land in GOCACHE; this catches a seed corpus written by hand.
+**/testdata/fuzz/
