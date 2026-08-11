@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A push that supersedes an in-flight run makes that run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned rather than @latest: a new staticcheck release can add checks, and a
+  # green tree turning red because a tool moved is a failure that teaches
+  # nothing. Bump this deliberately.
+  STATICCHECK_VERSION: v0.7.0
+
+jobs:
+  check:
+    name: build, lint and test (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Tracks the toolchain in go.mod, so this file needs no edit when Go
+          # is bumped there.
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: |
+          go install "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}"
+          staticcheck ./...
+
+      - name: test
+        run: go test -race -count=1 ./...
+
+      # The whole point of the pure-Go usbfs binding is that firmware update
+      # ships in the same static binary as everything else. If that stops being
+      # true it should fail here, not on a user's machine.
+      - name: static, cgo-free binary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -o /tmp/gflex ./cmd/gflex
+          file /tmp/gflex
+          if ldd /tmp/gflex 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::error::binary is dynamically linked; CGO_ENABLED=0 build regressed"
+            exit 1
+          fi
+
+      # A smoke test that the command tree is wired up: --dry-run touches no
+      # device, and this frame is pinned by testdata/golden/frames.json.
+      - name: smoke
+        run: |
+          out="$(/tmp/gflex voltage set 12V --dry-run 2>/dev/null)"
+          echo "$out"
+          echo "$out" | grep -q '04 92 2e e0' || {
+            echo "::error::set-voltage frame did not match the golden vector"
+            exit 1
+          }
+
+  arm64:
+    name: test (arm64)
+    # Free for public repositories. This job exists for one reason: internal/usbfs
+    # lays out ioctl structs by hand and passes them to the kernel through
+    # unsafe.Pointer, and the padding and alignment of those structs differ
+    # between amd64 and arm64. No amd64 run can catch a mistake there -- and
+    # arm64 is a likely deployment target, since a Raspberry Pi on a pedalboard
+    # is exactly this tool's use case.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test -race -count=1 ./...
