@@ -1,5 +1,8 @@
 # gflex
 
+[![CI](https://github.com/jzbz/gflex/actions/workflows/ci.yml/badge.svg)](https://github.com/jzbz/gflex/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Program a [Werewolf VFLEX](https://werewolf.us/) from Linux, without the proprietary phone app.
 
 The VFLEX is a programmable USB-C Power Delivery adapter: you tell it what voltage you want, it
