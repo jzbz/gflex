@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -172,6 +173,7 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 		force        bool
 		crcArg       int
 		ackFirst     bool
+		pageSize     int
 	)
 	cmd := &cobra.Command{
 		Use:   "flash [file]",
@@ -186,6 +188,9 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 			"  7. replay the settings a flash erases\n\n" +
 			"If verification fails the device is deliberately left in bootloader mode: it is\n" +
 			"re-flashable, not bricked. Use --recover to pick up from there.\n\n" +
+			"A raw .bin carries no page geometry of its own and is split into --page-size byte\n" +
+			"pages (512 by default); a JSON image and a --fetch download carry their own page\n" +
+			"split, so --page-size cannot be combined with either.\n\n" +
 			"This needs --yes, or an interactive confirmation (SPEC.md §13.6).",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -206,6 +211,26 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 				if fetchTimeout <= 0 {
 					return codedf(ExitUsage, "--fetch-timeout must be positive, got %s", fetchTimeout)
 				}
+				// The library treats a page size <= 0 as "unset, use the
+				// default" so that LoadOptions has a workable zero value. That
+				// is right for the zero value and wrong for an explicit
+				// negative: silently substituting 512 for a stated geometry,
+				// on the one path where wrong geometry can flash and even
+				// verify cleanly (SPEC.md §10.2, §14.12), is not a fallback
+				// anyone asked for. This is not a duplicate of the library's
+				// validation -- the library never rejects a negative at all.
+				if pageSize < 0 {
+					return codedf(ExitUsage, "--page-size must be positive, got %d (0 or unset means the "+
+						"%d-byte default)", pageSize, bootloader.DefaultPageSize)
+				}
+				// A fetched image is the vendor's JSON payload and carries its
+				// own page split (SPEC.md §10.3); --page-size would be
+				// silently ignored, and a silently ignored geometry flag on
+				// the flash path is a usage error, not a shrug.
+				if pageSize != 0 && fetch {
+					return codedf(ExitUsage, "--page-size splits a raw .bin; a --fetch image carries "+
+						"its own page split, so the flag would be ignored -- drop one of the two")
+				}
 				return app.runFlash(ctx, f, flashOpts{
 					path:         path,
 					recover:      recoverMode,
@@ -215,6 +240,7 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 					force:        force,
 					crc:          crcArg,
 					ackFirst:     ackFirst,
+					pageSize:     pageSize,
 				})
 			})
 		},
@@ -233,6 +259,11 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 	fl.BoolVar(&force, "force", false, "flash an image that carries no CRC, skipping verification")
 	fl.IntVar(&crcArg, "crc", -1, "expected CRC byte, when the image does not carry one")
 	fl.BoolVar(&ackFirst, "ack-mode", false, "stream in acknowledged mode from the start (slower, more robust)")
+	fl.IntVar(&pageSize, "page-size", 0, fmt.Sprintf(
+		"split a raw .bin into flash pages of this many bytes (0 means the %d-byte default); "+
+			"set it to the part's real page size -- a wrongly split raw image can flash and even "+
+			"verify cleanly (SPEC.md §10.2). Not for JSON images or --fetch, which carry their own split",
+		bootloader.DefaultPageSize))
 	return cmd
 }
 
@@ -245,6 +276,7 @@ type flashOpts struct {
 	force        bool
 	crc          int // -1 when not overridden
 	ackFirst     bool
+	pageSize     int // 0 when not overridden; raw .bin only
 }
 
 func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
@@ -381,10 +413,13 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 	}
 
 	// --- phase 4: wait for the application image to come back ---------------
-	if err := sleepCtx(ctx, postJumpDelay); err != nil {
-		return err
-	}
-	if err := a.waitForApplicationMode(ctx, reenumerationTimeout); err != nil {
+	// From here on the update itself is over: the CRC verified (or the
+	// unverified start was explicitly forced) and CMD_BOOTLOAD_END was sent,
+	// so every error return must go through postFlashFailure -- a bare error
+	// here reads as a failed update, discards the buffered crc line (Flush
+	// runs only on success), and sends someone to re-flash firmware that is
+	// fine.
+	if err := a.awaitApplicationReturn(ctx, f, res); err != nil {
 		return err
 	}
 
@@ -394,11 +429,7 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 		// The flash is already over and it worked; only the replay is lost. Say
 		// which is which, or "reconnecting after the update: no device" reads as
 		// a failed update and sends someone to flash it again.
-		return fmt.Errorf("the firmware update SUCCEEDED -- %s -- but reconnecting to the unit "+
-			"afterwards failed: %w\n"+
-			"  What did not run is the replay of the settings a flash erases (SPEC.md §10.4), so the\n"+
-			"  unit is running the new image with those values as the flash left them. Do NOT re-flash\n"+
-			"  for this -- reconnect and check `gflex info --all`", flashOutcomePhrase(res), err)
+		return a.postFlashFailure(f, res, "reconnecting to the unit", err)
 	}
 	defer c.Close()
 
@@ -643,6 +674,15 @@ func (a *App) runUpdate(ctx context.Context, f Formatter, dev *usbfs.Device, ifa
 	opts := bootloader.UpdateOptions{
 		ExpectSerial: expectSerial,
 		ACKMode:      o.ackFirst,
+		// Force carries --force through to the bootloader's own interlock.
+		// Without this mapping the flag stopped at CheckFlash: a raw .bin with
+		// --force passed the CLI check, the unit was jumped into the
+		// bootloader, and bootloader.update then refused with ErrUnverifiable
+		// -- telling the user to set the very flag they had set, with the unit
+		// stranded in bootloader mode. Force only permits *starting* an image
+		// that carries no CRC (SPEC.md §10.2, §13 interlock 6); the bootloader
+		// layer never lets it bypass a CRC mismatch (SPEC.md §10.5).
+		Force: o.force,
 		// SkipVerify is deliberately never set from --force. --force only
 		// unblocks the interlock on an image that carries no CRC, which the
 		// update package already declines to verify (Firmware.CRCKnown);
@@ -786,6 +826,70 @@ func (a *App) waitForApplicationMode(ctx context.Context, timeout time.Duration)
 	}
 }
 
+// awaitApplicationReturn is phase 4 of runFlash: the settle after
+// CMD_BOOTLOAD_END, then the wait for the unit to re-enumerate in application
+// mode (SPEC.md §10.1 step 4).
+//
+// It runs entirely after the update has succeeded, so its failures are the
+// benign kind that used to be reported as the malignant kind: a Ctrl-C landing
+// in the 4 s settle surfaced as nothing but "gflex: interrupted", and a hub
+// that re-enumerates slower than 15 s exited as a missing device -- both
+// reading as a failed update, when the firmware was already written, verified
+// and jumped into. Every error return is therefore phrased by
+// postFlashFailure.
+func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, res *bootloader.UpdateResult) error {
+	if err := sleepCtx(ctx, postJumpDelay); err != nil {
+		return a.postFlashFailure(f, res, "waiting out the post-jump settle", err)
+	}
+	if err := a.waitForApplicationMode(ctx, reenumerationTimeout); err != nil {
+		return a.postFlashFailure(f, res, "waiting for the unit to come back in application mode", err)
+	}
+	return nil
+}
+
+// postFlashFailure phrases every error that can occur once the update itself
+// is over: the image verified (or its unverified start was explicitly forced)
+// and CMD_BOOTLOAD_END was sent, so the unit is booting the new image and the
+// one instruction that matters is "do NOT re-flash it". Re-flashing a unit
+// whose firmware is fine is the most dangerous operation this tool has
+// (SPEC.md §10, §13.6), and a generic failure exit is exactly what sends
+// someone to do it.
+//
+// Everything the user needs survives two exit paths that would otherwise
+// swallow it: Flush runs only on success, so the buffered crc-verified line
+// would be discarded, and Execute prints nothing but "gflex: interrupted" for
+// an error chained to context.Canceled. So the evidence and the guidance go
+// out immediately on stderr through Diag -- what was skipped (the SPEC.md
+// §10.4 settings replay and the version read-back) and how to run each by
+// hand, in the same wording reportReplayIncomplete uses for the same reason.
+// The command still exits non-zero, because it did not finish: the returned
+// error keeps the original chain (sentinels, exit code) and suppresses the
+// generic per-code hint, which would diagnose a "missing" device that merely
+// re-enumerated slowly.
+func (a *App) postFlashFailure(f Formatter, res *bootloader.UpdateResult, what string, err error) error {
+	f.Diag("")
+	f.Diag("the firmware update itself SUCCEEDED -- %s -- and the jump into it was sent.",
+		flashOutcomePhrase(res))
+	if res != nil && res.CRCChecked {
+		// The crc-verified evidence, restated here because the buffered result
+		// block it was recorded in will never be flushed on this path.
+		f.Diag("verified CRC: 0x%02X", res.CRC)
+	}
+	f.Diag("Do NOT re-flash the unit for this. What failed is %s: %v", what, err)
+	f.Diag("")
+	f.Diag("what did not run is the replay of the settings a flash erases (SPEC.md §10.4) and the")
+	f.Diag("version read-back, so the unit is running the new image with those values as the flash")
+	f.Diag("left them. Reconnect and check `gflex info --all`; restore anything missing with")
+	f.Diag("`gflex vlimit set --low <mV> --high <mV>`, `gflex current set <mA>`,")
+	f.Diag("`gflex tolerance set --nominal <mV>`, `gflex calibrate adc --offset <n> --scale <n>`,")
+	f.Diag("`gflex authlock set <level>`, and read the version with `gflex firmware version`.")
+	return &CodedError{
+		Code:   ExitCode(err),
+		Err:    fmt.Errorf("the firmware update SUCCEEDED, but %s failed: %w", what, err),
+		NoHint: true,
+	}
+}
+
 // loadFirmware reads the image from disk, or fetches it for this serial, and
 // applies --crc.
 func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bootloader.Firmware, error) {
@@ -804,7 +908,25 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 			return nil, fmt.Errorf("fetching firmware for serial %s: %w", serial, err)
 		}
 	} else {
-		fw, err = bootloader.LoadFile(o.path)
+		// --page-size only means anything to a raw .bin: the JSON payload
+		// shapes carry their own page split, and the loader ignores
+		// LoadOptions.PageSize for them. Silently ignoring the one flag whose
+		// whole purpose is guarding raw-image geometry -- the path where a
+		// wrong split can flash and verify cleanly (SPEC.md §10.2, §14.12) --
+		// would leave the user believing they had set it, so a JSON image
+		// with the flag is refused instead. A sniff error is deliberately not
+		// acted on here: LoadFileWithOptions reads the same file next and
+		// reports the failure with the path in it.
+		if o.pageSize != 0 {
+			if isJSON, jerr := fileLooksJSON(o.path); jerr == nil && isJSON {
+				return nil, codedf(ExitUsage, "--page-size splits a raw .bin, but %s is a JSON image "+
+					"carrying its own page split; drop the flag", o.path)
+			}
+		}
+		// Page-geometry validation (divisibility by ChunksPerPage, chunk fit)
+		// is the library's alone; its error names the exact rule violated and
+		// is surfaced verbatim inside the wrap below.
+		fw, err = bootloader.LoadFileWithOptions(o.path, bootloader.LoadOptions{PageSize: o.pageSize})
 		if err != nil {
 			return nil, fmt.Errorf("loading %s: %w", o.path, err)
 		}
@@ -821,6 +943,36 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 		fw.CRCKnown = true
 	}
 	return fw, nil
+}
+
+// fileLooksJSON reports whether the image at path is one of the JSON payload
+// shapes rather than a raw binary, by the same rule bootloader.ParseImage
+// detects the format with: the first non-whitespace byte is '{' or '['. The
+// duplication is one switch on one byte, and it exists so that --page-size can
+// be refused on a JSON image *before* the loader silently ignores it; a wholly
+// whitespace or unreadable file is not judged here -- the loader reads the
+// same file next and its error names the path.
+func fileLooksJSON(path string) (bool, error) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer fh.Close()
+	buf := make([]byte, 4096)
+	for {
+		n, rerr := fh.Read(buf)
+		for _, b := range buf[:n] {
+			switch b {
+			case ' ', '\t', '\r', '\n':
+				// The same leading whitespace ParseImage trims.
+			default:
+				return b == '{' || b == '[', nil
+			}
+		}
+		if rerr != nil {
+			return false, nil
+		}
+	}
 }
 
 // openBootloaderInterface opens the vendor-class interface and turns a failure

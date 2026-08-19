@@ -100,29 +100,73 @@ func (a *App) runMonitor(ctx context.Context, duration time.Duration) error {
 	if !a.AsJSON {
 		fmt.Fprintf(a.stdout, "%-12s %-3s %-34s %s\n", "TIME", "DIR", "FRAME", "DECODED")
 	}
-	enc := json.NewEncoder(a.stdout)
+	return a.monitorLoop(ctx, fr.Frames(), fr.Errors(), drops)
+}
 
-	for {
+// monitorLoop services the three receive channels until the framer's have both
+// closed, then reports the terminal transport error, if one arrived.
+//
+// A channel that reports !ok is nil-ed, not returned on. The framer closes
+// frames and errs one after the other when its reader exits, so for a moment
+// one is closed while the other still holds data; a receive from a closed
+// channel is always ready, so a select that returned on the first !ok chose at
+// random between "this channel is exhausted" and "the other still has the
+// goods". That coin flip cost real evidence twice over: on an unplug the
+// terminal ENODEV sat in errs while frames closed first, so about half of
+// unplugs exited 0 printing nothing -- and in the mirror case up to 16
+// buffered decoded frames were abandoned, which on this command are the
+// bring-up observations that would settle SPEC.md §14.13/§14.14. session.go
+// documents the same pattern at its drain sites ("a closed channel is not a
+// reason to stop"); this is that pattern with the drop hook serviced alongside.
+//
+// The terminal error is returned as well as printed: the framer stops reading
+// on it, so the monitor is over whether the user wanted it or not, and a real
+// transport failure must not exit 0. Context ends -- the --for deadline or
+// Ctrl-C -- stay a normal nil end as before, unless an error had already been
+// received by then.
+func (a *App) monitorLoop(ctx context.Context, frames <-chan []byte, errs <-chan error, drops chan monitorDrop) error {
+	enc := json.NewEncoder(a.stdout)
+	var terminal error
+	for frames != nil || errs != nil {
 		select {
 		case <-ctx.Done():
-			// A --for deadline is a normal end, not a failure.
-			if duration > 0 && ctx.Err() == context.DeadlineExceeded {
-				return nil
-			}
-			return nil
-		case frame, ok := <-fr.Frames():
+			a.drainMonitorDrops(enc, drops)
+			return terminal
+		case frame, ok := <-frames:
 			if !ok {
-				return nil
+				frames = nil
+				continue
 			}
 			a.printMonitorFrame(enc, time.Now(), "rx", frame, nil)
-		case err, ok := <-fr.Errors():
+		case err, ok := <-errs:
 			if !ok {
-				return nil
+				errs = nil
+				continue
 			}
 			a.printMonitorFrame(enc, time.Now(), "err", nil, err)
+			terminal = err
 		case d := <-drops:
 			// A frame the decoder refused to dispatch. See SetDropHook above.
 			a.printMonitorFrame(enc, d.at, "drop", d.buffered, errors.New(d.reason))
+		}
+	}
+	// Both framer channels are closed, so the reader has exited and no drop
+	// hook can fire again: whatever sits in drops now is all there will ever
+	// be. Print it rather than abandon it -- a drop notice is exactly the kind
+	// of evidence this command exists to surface.
+	a.drainMonitorDrops(enc, drops)
+	return terminal
+}
+
+// drainMonitorDrops prints every drop notice already buffered, without
+// blocking. See monitorLoop for when this is complete versus best-effort.
+func (a *App) drainMonitorDrops(enc *json.Encoder, drops chan monitorDrop) {
+	for {
+		select {
+		case d := <-drops:
+			a.printMonitorFrame(enc, d.at, "drop", d.buffered, errors.New(d.reason))
+		default:
+			return
 		}
 	}
 }

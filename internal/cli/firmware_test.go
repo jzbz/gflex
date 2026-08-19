@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,16 +149,27 @@ func TestRunUpdateDelegatesAndWaitsForNothing(t *testing.T) {
 	if got.SkipJump {
 		t.Error("SkipJump set: the CLI asks for the jump back to the application")
 	}
+	if got.Force {
+		t.Error("Force set without --force: an unverifiable image would be started without consent")
+	}
 	if !res.CRCChecked || res.CRC != 0x5A {
 		t.Errorf("result not passed through: %+v", res)
 	}
 }
 
-// TestForceNeverSkipsVerification guards the one mapping that must not be made.
-// --force exists to flash an image that carries no CRC (CheckFlash refuses that
-// image otherwise); it must never turn into SkipVerify, which would skip
+// TestForceNeverSkipsVerification guards both directions of the --force
+// mapping at once, because each has failed on its own.
+//
+// It must not become SkipVerify: --force exists to flash an image that carries
+// no CRC (CheckFlash refuses that image otherwise), and SkipVerify would skip
 // verification on an image that does declare one -- the dangerous direction,
 // because an unverified image is then jumped into.
+//
+// It must become Force: the earlier version of this test asserted only the
+// first half, and the missing second assertion is exactly how the flag came to
+// be mapped to nothing at all -- a raw .bin with --force passed CheckFlash,
+// jumped the unit into the bootloader, and was then refused there with
+// ErrUnverifiable telling the user to set the flag they had already passed.
 func TestForceNeverSkipsVerification(t *testing.T) {
 	var got bootloader.UpdateOptions
 	stubUpdate(t, func(_ context.Context, _ *usbfs.Device, _ usbfs.Interface, _ *bootloader.Firmware,
@@ -176,6 +188,60 @@ func TestForceNeverSkipsVerification(t *testing.T) {
 	}
 	if got.SkipVerify {
 		t.Error("--force became SkipVerify: an image that declares a CRC would be flashed unverified")
+	}
+	if !got.Force {
+		t.Error("--force never reached bootloader.UpdateOptions.Force: a raw .bin flash jumps the " +
+			"unit into the bootloader and is then refused there with ErrUnverifiable")
+	}
+}
+
+// TestForcedRawBinReachesTheFlasher is the end-to-end shape of the same fix: a
+// real raw .bin through the real loader, against a stub that reproduces the
+// bootloader's own verification-policy gate (bootloader.update step 1: an
+// image with no CRC that will be jumped into needs Force, SPEC.md §13
+// interlock 6). Before the fix this refused with ErrUnverifiable -- after the
+// jump, so the unit sat stranded in bootloader mode -- and --recover --force
+// dead-ended identically.
+func TestForcedRawBinReachesTheFlasher(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x22}, 2*bootloader.DefaultPageSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var flashed bool
+	stubUpdate(t, func(_ context.Context, _ *usbfs.Device, _ usbfs.Interface, fw *bootloader.Firmware,
+		opts bootloader.UpdateOptions,
+	) (*bootloader.UpdateResult, error) {
+		crcKnown := fw.CRCKnown || opts.CRC != nil
+		if !crcKnown && !opts.SkipJump && !opts.Force {
+			return &bootloader.UpdateResult{}, fmt.Errorf(
+				"%w: the image declares no CRC, so a successful flash cannot be confirmed",
+				bootloader.ErrUnverifiable)
+		}
+		flashed = true
+		return &bootloader.UpdateResult{Serial: "VFX-0001", Unverified: true, JumpedToApp: true}, nil
+	})
+
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = path
+	o.force = true
+	fw, err := app.loadFirmware(context.Background(), o, "")
+	if err != nil {
+		t.Fatalf("loadFirmware: %v", err)
+	}
+	if fw.CRCKnown {
+		t.Fatal("a raw .bin claimed a CRC; the test needs the unverifiable path")
+	}
+	res, err := app.runUpdate(context.Background(), app.newFormatter(), nil, usbfs.Interface{},
+		fw, o, "VFX-0001")
+	if err != nil {
+		t.Fatalf("a raw .bin with --force was refused after the jump: %v", err)
+	}
+	if !flashed {
+		t.Fatal("the flasher was never reached")
+	}
+	if !res.Unverified {
+		t.Errorf("result not passed through: %+v", res)
 	}
 }
 
@@ -314,6 +380,148 @@ func TestCRCOverrideIsAppliedToTheImage(t *testing.T) {
 	if !fw.CRCKnown || fw.CRC != 0x00 {
 		t.Errorf("--crc 0 did not make the image verifiable: CRCKnown=%v CRC=0x%02x", fw.CRCKnown, fw.CRC)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// --page-size
+// ---------------------------------------------------------------------------
+
+// TestPageSizeReachesTheLoader: the flag is half the guard against a wrongly
+// split raw image (the other half is the loader's geometry validation), and a
+// wrong split can flash and even verify cleanly (SPEC.md §10.2, §14.12), so it
+// has to actually arrive in bootloader.LoadOptions.PageSize -- and the default
+// must stay DefaultPageSize when it is unset.
+func TestPageSizeReachesTheLoader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x33}, 256), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = path
+
+	fw, err := app.loadFirmware(context.Background(), o, "")
+	if err != nil {
+		t.Fatalf("loadFirmware: %v", err)
+	}
+	if fw.PageSize() != bootloader.DefaultPageSize || len(fw.Pages) != 1 {
+		t.Errorf("with --page-size unset: %d pages of %d bytes, want 1 of the %d-byte default",
+			len(fw.Pages), fw.PageSize(), bootloader.DefaultPageSize)
+	}
+
+	o.pageSize = 128
+	fw, err = app.loadFirmware(context.Background(), o, "")
+	if err != nil {
+		t.Fatalf("loadFirmware with --page-size 128: %v", err)
+	}
+	if fw.PageSize() != 128 || len(fw.Pages) != 2 {
+		t.Errorf("with --page-size 128: %d pages of %d bytes, want 2 of 128", len(fw.Pages), fw.PageSize())
+	}
+}
+
+// TestPageSizeOnAJSONImageIsAUsageError: a JSON payload carries its own page
+// split and the loader ignores LoadOptions.PageSize for it, so accepting the
+// flag there would silently ignore the one flag whose purpose is geometry
+// safety. It is refused as a usage error instead.
+func TestPageSizeOnAJSONImageIsAUsageError(t *testing.T) {
+	// Leading whitespace on purpose: format detection tolerates it
+	// (bootloader.ParseImage trims before sniffing), so the refusal must too.
+	img := "\n\t {\"app_bin\": [[1, 2, 3, 4, 5, 6, 7, 8]], \"app_version\": \"5.1.0\", \"crc\": 9}"
+	path := filepath.Join(t.TempDir(), "fw.json")
+	if err := os.WriteFile(path, []byte(img), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = path
+
+	// Without the flag the same payload loads normally.
+	if _, err := app.loadFirmware(context.Background(), o, ""); err != nil {
+		t.Fatalf("the JSON payload does not load at all: %v", err)
+	}
+
+	o.pageSize = 128
+	_, err := app.loadFirmware(context.Background(), o, "")
+	if err == nil {
+		t.Fatal("--page-size on a JSON image was silently ignored")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("exit code %d, want ExitUsage (%d)", code, ExitUsage)
+	}
+	if !strings.Contains(err.Error(), "page split") {
+		t.Errorf("the refusal does not say why: %v", err)
+	}
+}
+
+// TestPageSizeInvalidValueSurfacesTheLoadersError: the geometry rules live in
+// the bootloader package alone -- the CLI must not duplicate them -- and its
+// error, which names the exact rule violated, has to reach the user verbatim.
+func TestPageSizeInvalidValueSurfacesTheLoadersError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x44}, 200), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = path
+	o.pageSize = 100 // not divisible by ChunksPerPage
+
+	_, err := app.loadFirmware(context.Background(), o, "")
+	if err == nil {
+		t.Fatal("a page size the bootloader cannot chunk was accepted")
+	}
+	if !errors.Is(err, bootloader.ErrBadPageLength) {
+		t.Errorf("the loader's sentinel was lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not divisible by") {
+		t.Errorf("the loader's own wording was not surfaced verbatim: %v", err)
+	}
+}
+
+// TestPageSizeFlagUsageErrors drives the real cobra command for the two
+// refusals that happen before any file or device is touched: --page-size with
+// --fetch (the fetched payload carries its own split, SPEC.md §10.3), and a
+// negative size (which the library would silently treat as "unset" -- the one
+// direction an explicit geometry instruction must never take).
+func TestPageSizeFlagUsageErrors(t *testing.T) {
+	run := func(t *testing.T, args ...string) error {
+		t.Helper()
+		app, _, _ := newFlashTestApp()
+		cmd := newFirmwareFlashCommand(app)
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(args)
+		return cmd.ExecuteContext(context.Background())
+	}
+
+	t.Run("with --fetch", func(t *testing.T) {
+		err := run(t, "--fetch", "--page-size", "512")
+		if err == nil {
+			t.Fatal("--page-size with --fetch was silently accepted")
+		}
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("exit code %d, want ExitUsage (%d)", code, ExitUsage)
+		}
+		// "own page split" pins the message to the new check rather than to
+		// cobra's unknown-flag complaint, which also exits ExitUsage.
+		if !strings.Contains(err.Error(), "own page split") {
+			t.Errorf("the refusal does not say why: %v", err)
+		}
+	})
+
+	t.Run("negative", func(t *testing.T) {
+		err := run(t, "fw.bin", "--page-size=-8")
+		if err == nil {
+			t.Fatal("a negative --page-size was silently accepted")
+		}
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("exit code %d, want ExitUsage (%d)", code, ExitUsage)
+		}
+		if !strings.Contains(err.Error(), "--page-size must be positive") {
+			t.Errorf("the refusal does not name the flag: %v", err)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +856,105 @@ func TestCompleteReplayReportsNothingExtra(t *testing.T) {
 	reportReplayIncomplete(app.newFormatter(), rep, &bootloader.UpdateResult{CRCChecked: true})
 	if said := errOut.String(); said != "" {
 		t.Errorf("a complete replay printed a partial-success warning: %q", said)
+	}
+}
+
+// TestInterruptionAfterASuccessfulFlashReportsSuccess is the regression test
+// for the two bare returns between CMD_BOOTLOAD_END and the §10.4 replay. A
+// Ctrl-C landing in the post-jump settle used to surface as nothing but
+// "gflex: interrupted" (Execute prints only that line for an error chained to
+// context.Canceled, and Flush -- with the buffered crc line -- runs only on
+// success), which reads as a failed update and sends someone to re-flash
+// firmware that verified. So the succeeded wording, the CRC evidence and the
+// manual §10.4 instructions must reach stderr immediately, before the error is
+// returned.
+func TestInterruptionAfterASuccessfulFlashReportsSuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stubUpdate(t, func(_ context.Context, _ *usbfs.Device, _ usbfs.Interface, _ *bootloader.Firmware,
+		_ bootloader.UpdateOptions,
+	) (*bootloader.UpdateResult, error) {
+		// The update finishes -- CRC verified, CMD_BOOTLOAD_END sent -- and
+		// the user's Ctrl-C lands immediately after, in the post-jump settle.
+		cancel()
+		return &bootloader.UpdateResult{Serial: "VFX-0001", CRC: 0x5A, CRCChecked: true, JumpedToApp: true}, nil
+	})
+
+	app, _, errOut := newFlashTestApp()
+	f := app.newFormatter()
+	res, err := app.runUpdate(ctx, f, nil, usbfs.Interface{}, flashTestImage(), baseOpts(), "VFX-0001")
+	if err != nil {
+		t.Fatalf("runUpdate: %v", err)
+	}
+
+	err = app.awaitApplicationReturn(ctx, f, res)
+	if err == nil {
+		t.Fatal("an interrupted post-jump wait did not report an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the interruption's own error was lost from the chain: %v", err)
+	}
+	if code := ExitCode(err); code == ExitOK {
+		t.Error("an interrupted command must still exit non-zero")
+	}
+	said := errOut.String()
+	for _, want := range []string{
+		"SUCCEEDED",        // (a) the update itself worked
+		"0x5A",             // the crc-verified evidence, since Flush never runs
+		"Do NOT re-flash",  // and the instruction that follows from (a)
+		"§10.4",            // (b) what was skipped: the settings replay...
+		"firmware version", // ...and the version read-back
+		"info --all",       // (b) how to check by hand
+	} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the post-success interruption report is missing %q: %q", want, said)
+		}
+	}
+}
+
+// TestPostFlashFailureKeepsTheFailuresIdentity: the rewording must not eat the
+// original error -- a slow hub still exits ExitNoDevice so scripts can branch
+// on it, the error text itself also names the success (for the paths where
+// Execute prints it), and the generic no-device hint is suppressed, because
+// "check the cable" guidance under a successful update reads as a failed one.
+func TestPostFlashFailureKeepsTheFailuresIdentity(t *testing.T) {
+	app, _, errOut := newFlashTestApp()
+	cause := codedf(ExitNoDevice, "no device with vendor 0x37BF came back on the USB bus within 15s after the jump")
+	err := app.postFlashFailure(app.newFormatter(),
+		&bootloader.UpdateResult{CRC: 0x5A, CRCChecked: true, JumpedToApp: true},
+		"waiting for the unit to come back in application mode", cause)
+
+	if err == nil {
+		t.Fatal("a post-flash failure was not reported as an error")
+	}
+	if code := ExitCode(err); code != ExitNoDevice {
+		t.Errorf("exit code %d, want ExitNoDevice (%d): the failure class must survive the rewording", code, ExitNoDevice)
+	}
+	if !strings.Contains(err.Error(), "SUCCEEDED") {
+		t.Errorf("the returned error does not name the success: %v", err)
+	}
+	if !suppressHint(err) {
+		t.Error("the generic hint was not suppressed; it would diagnose a missing device after a successful update")
+	}
+	if said := errOut.String(); !strings.Contains(said, "CRC verified") && !strings.Contains(said, "verified CRC") {
+		t.Errorf("the crc-verified evidence was not printed before returning: %q", said)
+	}
+}
+
+// TestPostFlashFailureDoesNotClaimAnUnverifiedImageWasVerified: --force
+// flashes an image that carries no CRC, and nothing checked what landed
+// (SPEC.md §10.2, §14.12); the reassurance must not overstate what was
+// established, exactly as reportReplayIncomplete's wording is pinned not to.
+func TestPostFlashFailureDoesNotClaimAnUnverifiedImageWasVerified(t *testing.T) {
+	app, _, errOut := newFlashTestApp()
+	_ = app.postFlashFailure(app.newFormatter(),
+		&bootloader.UpdateResult{Unverified: true, JumpedToApp: true},
+		"reconnecting to the unit", errors.New("no device"))
+	said := errOut.String()
+	if strings.Contains(said, "CRC verified") || strings.Contains(said, "verified CRC") {
+		t.Errorf("an unverified flash was reported as verified: %q", said)
+	}
+	if !strings.Contains(said, "no CRC") {
+		t.Errorf("the report does not say the image was never verified: %q", said)
 	}
 }
 

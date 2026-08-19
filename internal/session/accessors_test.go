@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // TestExactTxFrames pins every typed accessor to the byte sequence it must put
@@ -16,13 +17,13 @@ import (
 func TestExactTxFrames(t *testing.T) {
 	cases := []struct {
 		name   string
-		setup  func(d *fakeDev)
+		setup  func(d *fake.Device)
 		call   func(ctx context.Context, s *Session) error
 		wantTx []string
 	}{
 		{
 			name:  "read serial",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdSerialNumber, []byte("VF001234")) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdSerialNumber, []byte("VF001234")) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.SerialNumber(ctx)
 				return err
@@ -31,7 +32,7 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:  "read chip uuid",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdChipUUID, []byte("UUID0001")) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdChipUUID, []byte("UUID0001")) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.ChipUUID(ctx)
 				return err
@@ -40,7 +41,7 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:  "read hardware id",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdHardwareID, []byte("HW000001")) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdHardwareID, []byte("HW000001")) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.HardwareID(ctx)
 				return err
@@ -48,8 +49,10 @@ func TestExactTxFrames(t *testing.T) {
 			wantTx: []string{"02 0a"},
 		},
 		{
-			name:  "read firmware version",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdFirmwareVersion, []byte("5.0.1\x00\x00\x00\x00\x00\x00\x00")) },
+			name: "read firmware version",
+			setup: func(d *fake.Device) {
+				d.SetResponse(proto.CmdFirmwareVersion, []byte("5.0.1\x00\x00\x00\x00\x00\x00\x00"))
+			},
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.FirmwareVersion(ctx)
 				return err
@@ -58,7 +61,7 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:  "read mfg date",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdMfgDate, []byte("20250101")) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdMfgDate, []byte("20250101")) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.MfgDate(ctx)
 				return err
@@ -67,7 +70,7 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:  "read led setting",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdDisableLEDDuringOp, []byte{0x00}) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdDisableLEDDuringOp, []byte{0x00}) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.LEDAlwaysOn(ctx)
 				return err
@@ -77,25 +80,25 @@ func TestExactTxFrames(t *testing.T) {
 		{
 			// SPEC.md §15: frame 03 8F 00. Always-on is wire value 0.
 			name:   "write led always on",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdDisableLEDDuringOp, []byte{0x00}) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdDisableLEDDuringOp, []byte{0x00}) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetLEDAlwaysOn(ctx, true) },
 			wantTx: []string{"03 8f 00"},
 		},
 		{
 			name:   "write led off when green",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdDisableLEDDuringOp, []byte{0x01}) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdDisableLEDDuringOp, []byte{0x01}) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetLEDAlwaysOn(ctx, false) },
 			wantTx: []string{"03 8f 01"},
 		},
 		{
 			name:   "clear pdo log",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdPDOLog, nil) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdPDOLog, nil) },
 			call:   func(ctx context.Context, s *Session) error { return s.ClearPDOLog(ctx) },
 			wantTx: []string{"02 91"},
 		},
 		{
 			name:  "read pdo chunk",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdPDOLog, []byte{5, 1, 2, 3, 4, 5, 6, 7, 8}) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdPDOLog, []byte{5, 1, 2, 3, 4, 5, 6, 7, 8}) },
 			call: func(ctx context.Context, s *Session) error {
 				_, _, err := s.PDOLogChunk(ctx, 5)
 				return err
@@ -104,7 +107,7 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:  "read voltage",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(5000)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(5000)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.VoltageMv(ctx)
 				return err
@@ -115,7 +118,7 @@ func TestExactTxFrames(t *testing.T) {
 			// SPEC.md §15: 12000 mV = 0x2EE0 -> 04 92 2E E0, then the explicit
 			// read-back the vendor app also performs.
 			name:  "write voltage 12V then read back",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(12000)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(12000)) },
 			call: func(ctx context.Context, s *Session) error {
 				got, err := s.SetVoltageMv(ctx, 12000)
 				if err == nil && got != 12000 {
@@ -127,7 +130,7 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:  "read current limit",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdCurrentLimitMa, proto.EncodeU16(5000)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.CurrentLimitMa(ctx)
 				return err
@@ -137,20 +140,20 @@ func TestExactTxFrames(t *testing.T) {
 		{
 			// SPEC.md §15: 5000 mA = 0x1388 -> 04 93 13 88.
 			name:   "write current limit 5000 mA",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdCurrentLimitMa, proto.EncodeU16(5000)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetCurrentLimitMa(ctx, 5000) },
 			wantTx: []string{"04 93 13 88"},
 		},
 		{
 			// No response is scripted: the jump must not wait for one.
 			name:   "jump to bootloader",
-			setup:  func(d *fakeDev) {},
+			setup:  func(d *fake.Device) {},
 			call:   func(ctx context.Context, s *Session) error { return s.JumpToBootloader(ctx) },
 			wantTx: []string{"02 14"},
 		},
 		{
 			name:  "read authlock",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdAuthLock, []byte{0x01, 0x00}) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdAuthLock, []byte{0x01, 0x00}) },
 			call: func(ctx context.Context, s *Session) error {
 				_, _, err := s.AuthLock(ctx)
 				return err
@@ -159,13 +162,13 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:   "write authlock unlocked",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdAuthLock, []byte{0x00}) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdAuthLock, []byte{0x00}) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetAuthLock(ctx, proto.AuthLockUnlocked) },
 			wantTx: []string{"03 96 00"},
 		},
 		{
 			name:  "read vlimit",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, _, err := s.VLimit(ctx)
 				return err
@@ -176,13 +179,13 @@ func TestExactTxFrames(t *testing.T) {
 			// SPEC.md §15: low=3300 high=48000 -> 06 97 BB 80 0C E4. HIGH goes
 			// on the wire first even though the API takes (low, high).
 			name:   "write vlimit",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetVLimit(ctx, 3300, 48000) },
 			wantTx: []string{"06 97 bb 80 0c e4"},
 		},
 		{
 			name:  "read vtolerance nominal",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.VToleranceNominalMv(ctx)
 				return err
@@ -192,13 +195,13 @@ func TestExactTxFrames(t *testing.T) {
 		{
 			// SPEC.md §6.1: write 750 mV -> 04 98 02 EE.
 			name:   "write vtolerance nominal",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetVToleranceNominalMv(ctx, 750) },
 			wantTx: []string{"04 98 02 ee"},
 		},
 		{
 			name:  "read vtolerance sag",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdVToleranceSagPerMa, proto.EncodeU16(0x1234)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(0x1234)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.VToleranceSagPerMa(ctx)
 				return err
@@ -207,13 +210,13 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:   "write vtolerance sag",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdVToleranceSagPerMa, proto.EncodeU16(0x1234)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(0x1234)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetVToleranceSagPerMa(ctx, 0x1234) },
 			wantTx: []string{"04 99 12 34"},
 		},
 		{
 			name:  "read adc offset",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(0)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.ADCOffset(ctx)
 				return err
@@ -223,20 +226,20 @@ func TestExactTxFrames(t *testing.T) {
 		{
 			// SPEC.md §6.1: write 0 -> 06 9A 00 00 00 00.
 			name:   "write adc offset zero",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(0)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetADCOffset(ctx, 0) },
 			wantTx: []string{"06 9a 00 00 00 00"},
 		},
 		{
 			// Signed: -1 is two's complement FF FF FF FF, not a rejected value.
 			name:   "write adc offset negative",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(-1)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(-1)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetADCOffset(ctx, -1) },
 			wantTx: []string{"06 9a ff ff ff ff"},
 		},
 		{
 			name:  "read adc scale",
-			setup: func(d *fakeDev) { d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(0)) },
+			setup: func(d *fake.Device) { d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0)) },
 			call: func(ctx context.Context, s *Session) error {
 				_, err := s.ADCScale(ctx)
 				return err
@@ -245,14 +248,14 @@ func TestExactTxFrames(t *testing.T) {
 		},
 		{
 			name:   "write adc scale",
-			setup:  func(d *fakeDev) { d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(0)) },
+			setup:  func(d *fake.Device) { d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0)) },
 			call:   func(ctx context.Context, s *Session) error { return s.SetADCScale(ctx, 0) },
 			wantTx: []string{"06 9b 00 00 00 00"},
 		},
 		{
 			name: "read vmeasure",
-			setup: func(d *fakeDev) {
-				d.SetPayload(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x13, 0x88})
+			setup: func(d *fake.Device) {
+				d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x13, 0x88})
 			},
 			call: func(ctx context.Context, s *Session) error {
 				_, _, err := s.Measure(ctx)
@@ -292,15 +295,15 @@ func TestDecodeRoundTrip(t *testing.T) {
 	s, d := newTestSession(t, Options{})
 	ctx := context.Background()
 
-	d.SetPayload(proto.CmdSerialNumber, []byte("VF12345\x00"))
-	d.SetPayload(proto.CmdFirmwareVersion, []byte(" 5.1.2 \x00\x00\x00\x00\x00"))
-	d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(12000))
-	d.SetPayload(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
-	d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
-	d.SetPayload(proto.CmdDisableLEDDuringOp, []byte{0x01}) // 1 = suppressed
-	d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(-12345))
-	d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(2147483647))
-	d.SetPayload(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x2E, 0xE0})
+	d.SetResponse(proto.CmdSerialNumber, []byte("VF12345\x00"))
+	d.SetResponse(proto.CmdFirmwareVersion, []byte(" 5.1.2 \x00\x00\x00\x00\x00"))
+	d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(12000))
+	d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
+	d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
+	d.SetResponse(proto.CmdDisableLEDDuringOp, []byte{0x01}) // 1 = suppressed
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(-12345))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(2147483647))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x2E, 0xE0})
 
 	if got, err := s.SerialNumber(ctx); err != nil || got != "VF12345" {
 		t.Errorf("SerialNumber = %q, %v; want \"VF12345\", nil", got, err)
@@ -342,7 +345,7 @@ func TestDecodeRoundTrip(t *testing.T) {
 func TestAuthLockReadsBothBytes(t *testing.T) {
 	t.Run("two byte payload uses offset 1", func(t *testing.T) {
 		s, d := newTestSession(t, Options{})
-		d.SetPayload(proto.CmdAuthLock, []byte{0x07, 0x02})
+		d.SetResponse(proto.CmdAuthLock, []byte{0x07, 0x02})
 
 		level, raw, err := s.AuthLock(context.Background())
 		if err != nil {
@@ -358,7 +361,7 @@ func TestAuthLockReadsBothBytes(t *testing.T) {
 
 	t.Run("one byte payload falls back to offset 0", func(t *testing.T) {
 		s, d := newTestSession(t, Options{})
-		d.SetPayload(proto.CmdAuthLock, []byte{0x03})
+		d.SetResponse(proto.CmdAuthLock, []byte{0x03})
 
 		level, raw, err := s.AuthLock(context.Background())
 		if err != nil {
@@ -374,7 +377,7 @@ func TestAuthLockReadsBothBytes(t *testing.T) {
 
 	t.Run("empty payload is an error", func(t *testing.T) {
 		s, d := newTestSession(t, Options{})
-		d.SetPayload(proto.CmdAuthLock, nil)
+		d.SetResponse(proto.CmdAuthLock, nil)
 		if _, _, err := s.AuthLock(context.Background()); err == nil {
 			t.Fatal("want an error for an empty authlock payload")
 		}
@@ -390,9 +393,9 @@ func TestVoltageZeroMeansNotReady(t *testing.T) {
 		d.SetHandler(proto.CmdVoltageMv, func(proto.Frame) []byte {
 			calls++
 			if calls < 3 {
-				return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(0), false)
+				return proto.EncodeU16(0)
 			}
-			return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(9000), false)
+			return proto.EncodeU16(9000)
 		})
 
 		start := time.Now()
@@ -416,7 +419,7 @@ func TestVoltageZeroMeansNotReady(t *testing.T) {
 
 	t.Run("always zero fails", func(t *testing.T) {
 		s, d := newTestSession(t, Options{ReadyTimeout: 250 * time.Millisecond})
-		d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(0))
+		d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(0))
 
 		_, err := s.VoltageMv(context.Background())
 		if err == nil {
@@ -435,13 +438,13 @@ func TestVoltageZeroMeansNotReady(t *testing.T) {
 		var reads int
 		d.SetHandler(proto.CmdVoltageMv, func(f proto.Frame) []byte {
 			if f.Write {
-				return mustBuild(proto.CmdVoltageMv, f.Payload, false)
+				return f.Payload // echo the write
 			}
 			reads++
 			if reads == 1 {
-				return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(0), false)
+				return proto.EncodeU16(0)
 			}
-			return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false)
+			return proto.EncodeU16(5000)
 		})
 
 		got, err := s.SetVoltageMv(context.Background(), 5000)
@@ -460,9 +463,9 @@ func TestSetVoltageReturnsReadBackNotEcho(t *testing.T) {
 	s, d := newTestSession(t, Options{})
 	d.SetHandler(proto.CmdVoltageMv, func(f proto.Frame) []byte {
 		if f.Write {
-			return mustBuild(proto.CmdVoltageMv, f.Payload, false) // echo: 20000
+			return f.Payload // echo: 20000
 		}
-		return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(19980), false)
+		return proto.EncodeU16(19980)
 	})
 
 	got, err := s.SetVoltageMv(context.Background(), 20000)
@@ -487,7 +490,7 @@ func TestVoltageReadyPersistence(t *testing.T) {
 		// The fast path is the whole reason there is no upfront settle delay:
 		// a device that answers immediately must cost ZERO extra time.
 		s, d := newTestSession(t, Options{})
-		d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(9000))
+		d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(9000))
 
 		start := time.Now()
 		got, err := s.VoltageMv(context.Background())
@@ -513,9 +516,9 @@ func TestVoltageReadyPersistence(t *testing.T) {
 			calls++
 			// Three not-ready answers: exactly where the old fixed loop gave up.
 			if calls <= 3 {
-				return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(0), false)
+				return proto.EncodeU16(0)
 			}
-			return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(12000), false)
+			return proto.EncodeU16(12000)
 		})
 
 		got, err := s.VoltageMv(context.Background())
@@ -537,13 +540,13 @@ func TestVoltageReadyPersistence(t *testing.T) {
 		var reads int
 		d.SetHandler(proto.CmdVoltageMv, func(f proto.Frame) []byte {
 			if f.Write {
-				return mustBuild(proto.CmdVoltageMv, f.Payload, false)
+				return f.Payload // echo the write
 			}
 			reads++
 			if reads <= 3 {
-				return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(0), false)
+				return proto.EncodeU16(0)
 			}
-			return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(9000), false)
+			return proto.EncodeU16(9000)
 		})
 
 		got, err := s.SetVoltageMv(context.Background(), 9000)
@@ -558,7 +561,7 @@ func TestVoltageReadyPersistence(t *testing.T) {
 	t.Run("budget bounds the persistence", func(t *testing.T) {
 		const budget = 150 * time.Millisecond
 		s, d := newTestSession(t, Options{ReadyTimeout: budget})
-		d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(0))
+		d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(0))
 
 		start := time.Now()
 		_, err := s.VoltageMv(context.Background())
@@ -581,7 +584,7 @@ func TestVoltageReadyPersistence(t *testing.T) {
 
 	t.Run("cancellation is reported as cancellation", func(t *testing.T) {
 		s, d := newTestSession(t, Options{})
-		d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(0))
+		d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(0))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
@@ -596,6 +599,93 @@ func TestVoltageReadyPersistence(t *testing.T) {
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
 			t.Errorf("took %v; cancellation must not wait out the ready budget", elapsed)
+		}
+	})
+}
+
+// TestVoltageReadyRetryClassification pins the ready loop's error
+// classification: only conditions waiting can cure -- the 0 mV not-ready
+// answer and ErrTimeout -- may consume the ReadyTimeout budget. A dead
+// transport or a closed session fails identically on every attempt, because a
+// Session has no reconnect path, so those must return in milliseconds even
+// against the 10 s default budget. The read count is the load-bearing
+// assertion: the fake records frames the host transmits even after the
+// unplug, so a loop that kept retrying would be caught deterministically,
+// with the elapsed-time bound as a coarse backstop.
+func TestVoltageReadyRetryClassification(t *testing.T) {
+	unplugged := errors.New("read /dev/snd/midiC1D0: no such device")
+
+	t.Run("dead transport fails immediately", func(t *testing.T) {
+		// Deliberately the DEFAULT 10 s ReadyTimeout: the budget must not be
+		// consumed at all, not merely bounded.
+		s, d := newTestSession(t, Options{})
+		d.SetHandler(proto.CmdVoltageMv, func(proto.Frame) []byte {
+			d.Unplug(unplugged)
+			return nil
+		})
+
+		start := time.Now()
+		_, err := s.VoltageMv(context.Background())
+		elapsed := time.Since(start)
+		if !errors.Is(err, ErrTransportClosed) {
+			t.Fatalf("error = %v, want ErrTransportClosed", err)
+		}
+		if !errors.Is(err, unplugged) {
+			t.Errorf("error = %v, want the underlying unplug cause carried through", err)
+		}
+		if n := len(d.Sent()); n != 1 {
+			t.Errorf("device saw %d reads, want 1: a dead transport is not retried", n)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("took %v; a dead transport must fail immediately, not burn the ready budget", elapsed)
+		}
+	})
+
+	t.Run("closed session fails immediately", func(t *testing.T) {
+		s, _ := newTestSession(t, Options{})
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		start := time.Now()
+		_, err := s.VoltageMv(context.Background())
+		if !errors.Is(err, ErrNoConnection) {
+			t.Fatalf("error = %v, want ErrNoConnection", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("took %v; a closed session must refuse immediately, not burn the ready budget", elapsed)
+		}
+	})
+
+	t.Run("read-back after unplug reports ErrReadBack immediately", func(t *testing.T) {
+		// The case the classification exists for (SPEC.md §6.5, §13): the
+		// write is acknowledged -- the rail is LIVE at the new value -- and
+		// then the unit vanishes. The user must hear the ErrReadBack verdict
+		// now, not after ~13 doomed retries spread over the whole budget.
+		s, d := newTestSession(t, Options{})
+		d.SetHandler(proto.CmdVoltageMv, func(f proto.Frame) []byte {
+			if f.Write {
+				return f.Payload // acknowledge: the voltage is set
+			}
+			d.Unplug(unplugged) // ...and die on the confirming read
+			return nil
+		})
+
+		start := time.Now()
+		_, err := s.SetVoltageMv(context.Background(), 9000)
+		elapsed := time.Since(start)
+		if !errors.Is(err, ErrReadBack) {
+			t.Fatalf("error = %v, want ErrReadBack: the write WAS acknowledged", err)
+		}
+		if !errors.Is(err, ErrTransportClosed) {
+			t.Errorf("error = %v, want the transport-closed cause visible inside ErrReadBack", err)
+		}
+		// One write plus exactly one read-back attempt.
+		if n := len(d.Sent()); n != 2 {
+			t.Errorf("device saw %d frames, want 2 (write + a single read-back attempt)", n)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("took %v; the ErrReadBack classification must not wait out the ready budget", elapsed)
 		}
 	})
 }
@@ -652,13 +742,15 @@ func TestVLimitPlausible(t *testing.T) {
 func TestWriteEchoWithFlagBitsMatches(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 500 * time.Millisecond})
 	d.SetHandler(proto.CmdCurrentLimitMa, func(f proto.Frame) []byte {
-		// Respond with both flag bits set.
+		// Respond with both flag bits set. The Device never sets the
+		// scratchpad flag on its own replies, so the frame is pushed raw.
 		resp, err := proto.Build(proto.CmdCurrentLimitMa, f.Payload, true, true)
 		if err != nil {
 			t.Error(err)
 			return nil
 		}
-		return resp
+		_ = d.Push(resp)
+		return nil
 	})
 
 	if err := s.SetCurrentLimitMa(context.Background(), 5000); err != nil {

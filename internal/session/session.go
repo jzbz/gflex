@@ -53,6 +53,32 @@ var (
 	ErrReadBack = errors.New("write succeeded but could not be read back")
 )
 
+// PermanentErr reports whether err is a failure no retry within this
+// Session can cure. A Session has no reconnect path -- New builds it over one
+// transport and Close is terminal -- so once the framer's reader has died
+// (ErrTransportClosed: the device was unplugged), the session has been closed
+// (ErrNoConnection), a send hit the already-shut-down framer (framer.ErrClosed),
+// or the caller's context has ended, every further attempt fails instantly the
+// same way. The retry loops in this package (VoltageMv's ready retry,
+// FullPDOLog's chunk retry) must return these immediately rather than spend
+// their budget on attempts that cannot succeed.
+//
+// ErrTimeout is deliberately NOT here: the protocol has no NACK, so a frame
+// lost in either direction surfaces only as a timeout, and re-asking is the
+// designed recovery (SPEC.md §5.2). A timeout is the one failure a healthy
+// link produces routinely; the conditions above are the link itself being gone.
+//
+// Exported because callers driving their own retry loops over a Session (the
+// scan wizard's serial re-read) need the same classification; a second copy of
+// this errors.Is chain in another package is how the two would drift.
+func PermanentErr(err error) bool {
+	return errors.Is(err, ErrTransportClosed) ||
+		errors.Is(err, ErrNoConnection) ||
+		errors.Is(err, framer.ErrClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 // Options configures a Session. The zero value is valid and selects the vendor
 // application's own defaults.
 type Options struct {

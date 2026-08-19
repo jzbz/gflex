@@ -470,8 +470,9 @@ func TestDecodeSPRAVS(t *testing.T) {
 	if !nearly(p.MaxCurrent15VA, 5) {
 		t.Errorf("MaxCurrent15VA = %v, want 5", p.MaxCurrent15VA)
 	}
-	// Every consumer takes the larger of the two, which is why the unverified
-	// 15 V/20 V field order (SPEC.md §9.4) does not change any outcome.
+	// MaxCurrentA is only the summary aggregate for tables and ranking; a
+	// verdict at a specific voltage goes through CurrentAt, which is
+	// band-aware. See TestSPRAVSFieldOrderIsLoadBearing for the ordering.
 	if !nearly(p.MaxCurrentA, 5) {
 		t.Errorf("MaxCurrentA = %v, want 5 (max of the two)", p.MaxCurrentA)
 	}
@@ -480,14 +481,38 @@ func TestDecodeSPRAVS(t *testing.T) {
 	}
 }
 
-func TestSPRAVSFieldOrderIsSwapSafe(t *testing.T) {
-	// Swap the two current fields and confirm MaxCurrentA - the only value the
-	// evaluator uses - is unchanged.
+// TestSPRAVSFieldOrderIsLoadBearing pins the SPR AVS band-to-bit assignment.
+//
+// This test replaces TestSPRAVSFieldOrderIsSwapSafe, which asserted the
+// opposite: that swapping the two current fields "does not change any outcome"
+// because every consumer took max() of the pair. That claim was deliberately
+// abandoned when PDO.CurrentAt became band-aware (SPEC.md §17): reporting the
+// strong band's current in the weak band over-states what the source can
+// deliver, which is the direction that damages hardware. The ordering now
+// matches published USB-PD 3.2 — bits 19:10 bound the 15-20 V band, bits 9:0
+// the 9-15 V band (SPEC.md §17, "Resolved") — and a reorder of the decode
+// WOULD change verdicts, so this test exists to make that reorder fail.
+func TestSPRAVSFieldOrderIsLoadBearing(t *testing.T) {
+	// sprAVS: 3.25 A in bits 19:10 (15-20 V band), 5.00 A in bits 9:0
+	// (9-15 V band).
+	p := decodePDO(0, sprAVS)
+	if !nearly(p.MaxCurrent20VA, 3.25) || !nearly(p.MaxCurrent15VA, 5) {
+		t.Fatalf("decode: 20V band = %v, 15V band = %v; want 3.25 / 5", p.MaxCurrent20VA, p.MaxCurrent15VA)
+	}
+	// The verdict path must use the band the requested voltage falls in.
+	// A swapped decode would invert these two assertions.
+	if got := p.CurrentAt(18); !nearly(got, 3.25) {
+		t.Errorf("CurrentAt(18 V) = %v, want 3.25 (upper band); a field swap over-reports by 54%%", got)
+	}
+	if got := p.CurrentAt(12); !nearly(got, 5) {
+		t.Errorf("CurrentAt(12 V) = %v, want 5.00 (lower band)", got)
+	}
+	// And a genuinely swapped word must produce the mirrored verdicts, so the
+	// decode cannot be "fixed" back to swap-neutrality without failing here.
 	swapped := uint32(3)<<30 | uint32(2)<<28 | 500<<10 | 325
-	a := decodePDO(0, sprAVS)
-	b := decodePDO(0, swapped)
-	if !nearly(a.MaxCurrentA, b.MaxCurrentA) {
-		t.Errorf("MaxCurrentA differs under field swap: %v vs %v", a.MaxCurrentA, b.MaxCurrentA)
+	q := decodePDO(0, swapped)
+	if got := q.CurrentAt(18); !nearly(got, 5) {
+		t.Errorf("swapped word CurrentAt(18 V) = %v, want 5.00", got)
 	}
 }
 

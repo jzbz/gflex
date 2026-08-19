@@ -192,6 +192,16 @@ type Response struct {
 	// Length is the effective frame length after the vendor client's lenient
 	// fallback (SPEC.md §5.2).
 	Length int
+	// DeclaredValid reports that DeclaredLen itself bounded the frame — it was
+	// within [PreambleLen, len(Raw)] and no lenient fallback was applied.
+	//
+	// The distinction is what separates an acknowledgement from noise:
+	// CMD_BOOTLOADER_WRITE_CHUNK is command code 0, so under the fallback an
+	// all-zero bulk packet parses as a well-formed WRITE_CHUNK response
+	// (declared 0 → whole-buffer length, byte[1]&0x3F == 0). awaitACK refuses
+	// to match a frame without this set; the lenient fields above remain for
+	// diagnostics.
+	DeclaredValid bool
 	// Cmd is the command code with the flag bits masked off. The device may or
 	// may not echo the write flag; it is never inspected (SPEC.md §14.13).
 	Cmd proto.Cmd
@@ -209,7 +219,9 @@ type Response struct {
 // that is below the preamble size or longer than what actually arrived is
 // discarded in favour of the real buffer length (SPEC.md §5.2). Bulk reads are
 // commonly padded to the endpoint's packet size, so Raw is usually longer than
-// Length and the declared value is the one that matters.
+// Length and the declared value is the one that matters. DeclaredValid records
+// whether the declared value held or the fallback ran, so callers that must
+// not act on a malformed frame (awaitACK) can tell the two apart.
 //
 // The CRC of a VERIFY response is a *single* byte at offset 2 — not a
 // multi-byte checksum. The algorithm behind it is unknown (SPEC.md §10.2,
@@ -221,20 +233,30 @@ func ParseResponse(raw []byte) (Response, error) {
 	}
 	declared := int(raw[0])
 	length := declared
-	if declared < proto.PreambleLen || declared > len(raw) {
+	valid := declared >= proto.PreambleLen && declared <= len(raw)
+	if !valid {
 		length = len(raw)
 	}
 	r := Response{
-		Raw:         raw,
-		DeclaredLen: declared,
-		Length:      length,
-		Cmd:         proto.Cmd(raw[1] & proto.CmdCodeMask),
-		Payload:     raw[proto.PreambleLen:length],
+		Raw:           raw,
+		DeclaredLen:   declared,
+		Length:        length,
+		DeclaredValid: valid,
+		Cmd:           proto.Cmd(raw[1] & proto.CmdCodeMask),
+		Payload:       raw[proto.PreambleLen:length],
 	}
-	// The CRC test is against the bytes actually received rather than the
-	// effective length, so a device that under-declares its verify response
-	// still yields a usable CRC.
-	if r.Cmd == proto.CmdBootloaderVerify && len(raw) >= proto.PreambleLen+1 {
+	// The CRC is taken only from within the effective frame, never from the
+	// bytes beyond it. Reading raw[2] whenever the buffer was long enough — the
+	// previous behaviour, kept "so a device that under-declares still yields a
+	// usable CRC" — turned a declared-length-2 VERIFY response followed by bus
+	// padding into a present CRC of whatever the padding byte was; and 0x00 is
+	// a legitimate expected CRC (UpdateOptions.CRC is *uint8 precisely because
+	// 0 is valid), so zero padding could wave an unperformed verify through to
+	// CMD_BOOTLOAD_END. Whether a real unit ever under-declares its verify
+	// frame is unknown (SPEC.md §14.12); if one does, verification now times
+	// out instead of fabricating a pass, which is the fail-safe direction —
+	// revisit at hardware bring-up, not here.
+	if r.Cmd == proto.CmdBootloaderVerify && length > proto.PreambleLen {
 		r.CRC = raw[proto.PreambleLen]
 		r.HasCRC = true
 	}

@@ -737,6 +737,153 @@ func TestTypicalPDOLogLayout(t *testing.T) {
 	}
 }
 
+// TestUnplug pins the hot-unplug semantics the doc comment promises, side by
+// side, because dependent packages' tests (session's drains, its ready-retry
+// classification) stage their scenarios on exactly these guarantees.
+func TestUnplug(t *testing.T) {
+	t.Run("drains queued bytes then fails with the given error", func(t *testing.T) {
+		unplugged := errors.New("read /dev/snd/midiC1D0: no such device")
+		d := New()
+		defer d.Close()
+		if err := d.Push([]byte{0x02, 0x08}); err != nil {
+			t.Fatal(err)
+		}
+		d.Unplug(unplugged)
+
+		// The bytes queued before the unplug are still readable, in full and
+		// before any error: this is what makes Push-then-Unplug fixtures
+		// deterministic for a reader that starts later.
+		tr := d.Transport()
+		want := encodeFrameMIDI([]byte{0x02, 0x08})
+		got := make([]byte, 0, len(want))
+		buf := make([]byte, 7) // deliberately smaller than the stream: drain over several reads
+		for len(got) < len(want) {
+			n, err := tr.ReadMIDI(buf)
+			if err != nil {
+				t.Fatalf("read while %d queued bytes remain: %v", len(want)-len(got), err)
+			}
+			got = append(got, buf[:n]...)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("drained % x, want % x", got, want)
+		}
+		// Then the error, on this and every later read.
+		for i := 0; i < 2; i++ {
+			if _, err := tr.ReadMIDI(buf); !errors.Is(err, unplugged) {
+				t.Fatalf("read %d after drain = %v, want the unplug error", i, err)
+			}
+		}
+	})
+
+	t.Run("nil error installs ErrUnplugged", func(t *testing.T) {
+		d := New()
+		defer d.Close()
+		d.Unplug(nil)
+		if _, err := d.Transport().ReadMIDI(make([]byte, 8)); !errors.Is(err, ErrUnplugged) {
+			t.Fatalf("read = %v, want ErrUnplugged", err)
+		}
+	})
+
+	t.Run("unblocks a waiting reader", func(t *testing.T) {
+		unplugged := errors.New("gone")
+		d := New()
+		defer d.Close()
+		done := make(chan error, 1)
+		go func() {
+			_, err := d.Transport().ReadMIDI(make([]byte, 8))
+			done <- err
+		}()
+		time.Sleep(20 * time.Millisecond) // let the reader block
+		d.Unplug(unplugged)
+		select {
+		case err := <-done:
+			if !errors.Is(err, unplugged) {
+				t.Errorf("blocked read returned %v, want the unplug error", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Unplug did not unblock ReadMIDI")
+		}
+	})
+
+	t.Run("writes are recorded but never answered", func(t *testing.T) {
+		d := New() // default responder echoes: any answer would be visible
+		defer d.Close()
+		d.Unplug(nil)
+
+		tr := d.Transport()
+		if err := tr.WriteMIDI(encodeFrameMIDI(proto.Read(proto.CmdSerialNumber))); err != nil {
+			t.Fatalf("write after unplug: %v", err)
+		}
+		// The frame is on the record, so a test can prove the host transmitted...
+		if got := d.SentHex(); len(got) != 1 || got[0] != "02 08" {
+			t.Fatalf("SentHex = %q, want [\"02 08\"]", got)
+		}
+		// ...but nothing answered it: the read reports the unplug, not an echo.
+		if _, err := tr.ReadMIDI(make([]byte, 8)); !errors.Is(err, ErrUnplugged) {
+			t.Errorf("read = %v, want ErrUnplugged (an echo would mean the dead device answered)", err)
+		}
+	})
+
+	t.Run("push fails and pending delayed replies are discarded", func(t *testing.T) {
+		d := New()
+		defer d.Close()
+		h := newHost(t, d)
+
+		// Schedule a delayed reply, then unplug before it becomes readable.
+		d.SetFault(proto.CmdVoltageMv, Fault{Delay: 50 * time.Millisecond})
+		h.send(t, proto.Read(proto.CmdVoltageMv))
+		d.Unplug(nil)
+
+		if err := d.Push([]byte{0x02, 0x08}); !errors.Is(err, ErrClosed) {
+			t.Errorf("Push after unplug = %v, want ErrClosed", err)
+		}
+		// Past the delay, the reply must not have surfaced.
+		if f, ok := h.recv(t, 150*time.Millisecond); ok {
+			t.Errorf("delayed reply surfaced after unplug: %x", f)
+		}
+	})
+
+	t.Run("close after unplug keeps the unplug cause", func(t *testing.T) {
+		unplugged := errors.New("gone")
+		d := New()
+		d.Unplug(unplugged)
+		if err := d.Close(); err != nil {
+			t.Fatalf("Close after Unplug: %v", err)
+		}
+		// A session tearing down closes the transport after the reader already
+		// died; that must not rewrite the error a late read reports.
+		if _, err := d.Transport().ReadMIDI(make([]byte, 8)); !errors.Is(err, unplugged) {
+			t.Errorf("read = %v, want the unplug error to survive Close", err)
+		}
+		if err := d.Transport().WriteMIDI([]byte{0x80, 0, 0}); !errors.Is(err, ErrClosed) {
+			t.Errorf("write after Close = %v, want ErrClosed", err)
+		}
+	})
+}
+
+// TestSentHex pins the rendering: proto.Hex form, one string per frame, in
+// arrival order.
+func TestSentHex(t *testing.T) {
+	d := New()
+	defer d.Close()
+	h := newHost(t, d)
+
+	for _, f := range [][]byte{proto.Read(proto.CmdSerialNumber), {0x04, 0x92, 0x2E, 0xE0}} {
+		h.send(t, f)
+		h.mustRecv(t)
+	}
+	got := d.SentHex()
+	want := []string{"02 08", "04 92 2e e0"}
+	if len(got) != len(want) {
+		t.Fatalf("SentHex = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("SentHex[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 // TestConcurrentUse is meaningful under -race: a reader goroutine, a writer
 // goroutine and a reconfiguring goroutine all touch the Device at once.
 func TestConcurrentUse(t *testing.T) {

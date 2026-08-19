@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,5 +193,148 @@ func TestScanDryRunListsBothSerialReads(t *testing.T) {
 	}
 	if !erase.Write || len(erase.Payload) != 0 {
 		t.Errorf("erase frame = %s, want a write with an empty payload (02 91)", proto.Hex(frames[2]))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The --no-prompt handover watch
+// ---------------------------------------------------------------------------
+
+// handoverWaiter is a scripted waitForDevice, recording the sequence of
+// presence edges scanAwaitHandover asked for.
+type handoverWaiter struct {
+	calls []struct {
+		want    bool
+		timeout time.Duration
+	}
+	// respond decides call i's outcome; nil means every wait succeeds.
+	respond func(i int, want bool) error
+}
+
+func (w *handoverWaiter) wait(_ context.Context, want bool, timeout time.Duration) error {
+	i := len(w.calls)
+	w.calls = append(w.calls, struct {
+		want    bool
+		timeout time.Duration
+	}{want, timeout})
+	if w.respond != nil {
+		return w.respond(i, want)
+	}
+	return nil
+}
+
+// TestScanNoPromptUSBWaitsForReappearanceFirst is the regression test for the
+// handover watch trusting the rawmidi node under --transport usb.
+//
+// The phase-1 session claims the MIDI interface with a kernel-driver detach
+// (SPEC.md §4.2), so at handover time the node's absence tracks this process,
+// not the device. The old sequence began by waiting for the node to VANISH; it
+// was already gone, so the "unplug" was detected instantly, the settle passed
+// while Close's reattach brought the node back, the serial matched the
+// never-moved unit, and the just-erased log was reported as a completed scan
+// (SPEC.md §9.2's hard invariant defeated without a single check failing).
+// The watch must instead begin by waiting for the node to REAPPEAR, so that a
+// later absence is a genuine departure.
+func TestScanNoPromptUSBWaitsForReappearanceFirst(t *testing.T) {
+	app := &App{Transport: transportUSB}
+	f := newFormatter(false, io.Discard, io.Discard)
+	o := scanOpts{noPrompt: true, wait: time.Minute}
+
+	w := &handoverWaiter{}
+	if err := app.scanAwaitHandover(context.Background(), f, o, w.wait); err != nil {
+		t.Fatalf("a clean handover failed: %v", err)
+	}
+	if len(w.calls) != 3 {
+		t.Fatalf("waited %d times, want 3 (reappear, depart, return): %+v", len(w.calls), w.calls)
+	}
+	if !w.calls[0].want {
+		t.Fatal("the first wait was for departure: the node is absent because THIS process detached " +
+			"the driver, so that reads our own detach as the user's unplug")
+	}
+	if w.calls[0].timeout >= o.wait {
+		t.Errorf("the reappear gate waited %s; it must be bounded well below --wait (%s), rebinding is local",
+			w.calls[0].timeout, o.wait)
+	}
+	if w.calls[1].want || !w.calls[2].want {
+		t.Errorf("after the gate the watch must be depart-then-return, got %+v", w.calls[1:])
+	}
+}
+
+// If the node never reappears, presence proves nothing on this system -- the
+// driver may not be loaded at all -- and the scan must refuse rather than
+// guess: a wrong guess here fabricates a capture. The message points at the
+// interactive mode that still works.
+func TestScanNoPromptUSBRefusesWhenNodeNeverReturns(t *testing.T) {
+	app := &App{Transport: transportUSB}
+	f := newFormatter(false, io.Discard, io.Discard)
+	o := scanOpts{noPrompt: true, wait: time.Minute}
+
+	w := &handoverWaiter{respond: func(i int, _ bool) error {
+		if i == 0 {
+			return codedf(ExitNoDevice, "timed out after %s waiting for the VFLEX to reappear", scanReattachGrace)
+		}
+		return nil
+	}}
+	err := app.scanAwaitHandover(context.Background(), f, o, w.wait)
+	if err == nil {
+		t.Fatal("the reappear gate timed out and the handover proceeded anyway")
+	}
+	if len(w.calls) != 1 {
+		t.Errorf("waited %d times after the gate failed, want 1: presence must not be consulted further", len(w.calls))
+	}
+	for _, want := range []string{"--no-prompt", "--transport usb"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q:\n%v", want, err)
+		}
+	}
+}
+
+// A cancelled context during the gate is Ctrl-C, not a driver problem, and
+// must unwind as itself so Execute reports "interrupted".
+func TestScanNoPromptUSBGatePropagatesCancellation(t *testing.T) {
+	app := &App{Transport: transportUSB}
+	f := newFormatter(false, io.Discard, io.Discard)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	w := &handoverWaiter{respond: func(int, bool) error { return ctx.Err() }}
+	err := app.scanAwaitHandover(ctx, f, scanOpts{noPrompt: true, wait: time.Minute}, w.wait)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled undisguised", err)
+	}
+}
+
+// Under the default rawmidi transport nothing in this process hides the node,
+// so the watch stays exactly what it was: depart, settle, return.
+func TestScanNoPromptRawMIDIUnchanged(t *testing.T) {
+	app := &App{Transport: transportRawMIDI}
+	f := newFormatter(false, io.Discard, io.Discard)
+	o := scanOpts{noPrompt: true, wait: time.Minute}
+
+	w := &handoverWaiter{}
+	if err := app.scanAwaitHandover(context.Background(), f, o, w.wait); err != nil {
+		t.Fatalf("a clean rawmidi handover failed: %v", err)
+	}
+	if len(w.calls) != 2 || w.calls[0].want || !w.calls[1].want {
+		t.Errorf("rawmidi watch = %+v, want exactly [depart, return]: presence is already meaningful there", w.calls)
+	}
+}
+
+// A dead link is not a slow unit. The 6 x 300 ms patience exists for a
+// just-enumerated device answering slowly (SPEC.md §9.2); once the transport
+// itself is gone every attempt fails identically and instantly, so retrying
+// only delays telling the user the scan is over. Same classification as the
+// session's own retry loops (session.PermanentErr).
+func TestReadSerialRetryingFailsFastOnADeadLink(t *testing.T) {
+	r := scripted(
+		[2]any{"", session.ErrTransportClosed},
+		[2]any{"VF001234", nil}, // must never be reached
+	)
+	_, err := readSerialRetrying(context.Background(), r.read, scanSerialAttempts, time.Hour)
+	if !errors.Is(err, session.ErrTransportClosed) {
+		t.Fatalf("error = %v, want ErrTransportClosed", err)
+	}
+	if r.calls != 1 {
+		t.Errorf("read %d times, want 1: a permanent failure earns no retry", r.calls)
 	}
 }

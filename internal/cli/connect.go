@@ -160,16 +160,51 @@ func (a *App) openUSB(ctx context.Context) (proto.Transport, string, error) {
 	if err != nil {
 		return nil, "", a.transportError(ctx, err)
 	}
+	ref, ok, err := selectUSBRef(refs, a.Port)
+	if err != nil {
+		return nil, "", err
+	}
+	if !ok {
+		return nil, "", codedf(ExitNoDevice, "no USB device matching --port %q\n%s", a.Port, a.searchReport(ctx))
+	}
+	t, err := usbmidi.Open(ref)
+	if err != nil {
+		return nil, "", a.transportError(ctx, fmt.Errorf("opening %s: %w", ref.Path, err))
+	}
+	return t, describeUSB(ref), nil
+}
+
+// selectUSBRef applies --port to an enumerated device list: the unique match,
+// or ok=false when nothing matched (the caller owns the not-found report).
+//
+// Every match is collected before anything is opened. matchesUSBPort ends in a
+// suffix match and also takes a bare address, so with two VFLEX units attached
+// an imprecise --port ("3" matching addr 3 on both buses) can designate both --
+// and taking whichever usbfs.Enumerate happens to sort first would silently
+// write the voltage to the wrong unit's rail. rawmidi.Select already refuses
+// its ambiguous case for exactly this reason; this mirrors its wording, and
+// carries ExitNoDevice -- the code rawmidi's ErrAmbiguous ends up with when it
+// passes through transportError.
+func selectUSBRef(refs []usbfs.DeviceRef, port string) (usbfs.DeviceRef, bool, error) {
+	var matches []usbfs.DeviceRef
 	for _, ref := range refs {
-		if matchesUSBPort(ref, a.Port) {
-			t, err := usbmidi.Open(ref)
-			if err != nil {
-				return nil, "", a.transportError(ctx, fmt.Errorf("opening %s: %w", ref.Path, err))
-			}
-			return t, describeUSB(ref), nil
+		if matchesUSBPort(ref, port) {
+			matches = append(matches, ref)
 		}
 	}
-	return nil, "", codedf(ExitNoDevice, "no USB device matching --port %q\n%s", a.Port, a.searchReport(ctx))
+	switch len(matches) {
+	case 0:
+		return usbfs.DeviceRef{}, false, nil
+	case 1:
+		return matches[0], true, nil
+	}
+	parts := make([]string, len(matches))
+	for i, m := range matches {
+		parts[i] = describeUSB(m)
+	}
+	return usbfs.DeviceRef{}, false, codedf(ExitNoDevice,
+		"several USB devices match --port %q: %s. Pass --port with a device path",
+		port, strings.Join(parts, ", "))
 }
 
 // matchesUSBPort reports whether --port designates ref. A path, a "bus:addr"

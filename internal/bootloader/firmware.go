@@ -327,10 +327,23 @@ func decodeByteArray(raw json.RawMessage) ([]byte, error) {
 
 // decodeByteString converts a page (or whole image) carried as text.
 //
-// Hex wins the ambiguity: a string made entirely of hex digits with an even
-// length is treated as hex even though it is also valid base64, because the
-// base64 of real firmware bytes is essentially never all-hex-digits, while hex
-// dumps always are.
+// The discrimination is deterministic: a string made entirely of hex digits IS
+// hex, full stop. Real firmware base64 is essentially never all-hex-digits
+// while hex dumps always are — and because every hex digit is also a valid
+// base64 character, any base64 fallback for an all-hex string turns a damaged
+// hex dump into something that decodes cleanly as unrelated bytes. An
+// even-length gate used to open exactly that trap: a hex image truncated by
+// one character (length 4k+3) or with a corrupt digit fell through to base64
+// and, on the no-CRC --force path, the garbage got flashed — the failure mode
+// the CRC cannot catch and SPEC.md §10.2 warns about. So an odd-length all-hex
+// string is now an error naming the likely truncation, never a base64 attempt.
+//
+// The corollary is accepted deliberately: a genuine base64 string that happens
+// to be entirely hex digits with an odd length is rejected too. Vendor
+// payloads are number arrays or proper hex dumps (SPEC.md §10.3), and refusing
+// an ambiguous image beats flashing garbage. Only strings containing a non-hex
+// character try the base64 alphabets, and a failure there reports both
+// interpretations.
 func decodeByteString(s string) ([]byte, error) {
 	var sb strings.Builder
 	sb.Grow(len(s))
@@ -350,7 +363,12 @@ func decodeByteString(s string) ([]byte, error) {
 	if lower := strings.ToLower(clean); strings.HasPrefix(lower, "0x") {
 		clean = clean[2:]
 	}
-	if len(clean)%2 == 0 && isHex(clean) {
+	nonHex := firstNonHex(clean)
+	if nonHex < 0 {
+		if len(clean)%2 != 0 {
+			return nil, fmt.Errorf("%w: odd-length hex string (%d digits); the image is likely truncated",
+				ErrBadPageLength, len(clean))
+		}
 		b, err := hex.DecodeString(clean)
 		if err != nil {
 			return nil, fmt.Errorf("%w: hex page: %w", ErrBadPageLength, err)
@@ -365,19 +383,24 @@ func decodeByteString(s string) ([]byte, error) {
 			return b, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: page string is neither hex nor base64", ErrBadPageLength)
+	// Both interpretations failed; name them both, with the character that
+	// ruled hex out, so a corrupted hex dump is diagnosable as one.
+	return nil, fmt.Errorf("%w: page string is neither hex (%q at offset %d is not a hex digit) nor base64 in any alphabet",
+		ErrBadPageLength, clean[nonHex], nonHex)
 }
 
-func isHex(s string) bool {
+// firstNonHex reports the offset of the first byte that is not a hex digit, or
+// -1 when the whole string is hex.
+func firstNonHex(s string) int {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
 		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
 		default:
-			return false
+			return i
 		}
 	}
-	return true
+	return -1
 }
 
 // splitFlat imposes a page geometry on an image that arrived without one.

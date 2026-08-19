@@ -149,6 +149,19 @@ func (s *Session) FullPDOLog(ctx context.Context, progress func(chunk int, bytes
 			}
 			id, data, err := s.PDOLogChunk(ctx, uint8(i))
 			if err != nil {
+				// The retry budget is for a chunk the device answered wrongly
+				// or not at all: ErrTimeout (no NACK exists, so a lost frame
+				// surfaces only as a timeout and re-asking is the recovery,
+				// SPEC.md §5.2) and the mismatch/empty/short rejections below.
+				// A permanent failure -- transport dead, session closed,
+				// context ended -- is none of those: the Session has no
+				// reconnect path, so the remaining attempts would fail
+				// identically while adding two retry delays and, on a silent
+				// framer, whole 8 s chunk timeouts before the user hears the
+				// download is over.
+				if PermanentErr(err) {
+					return nil, fmt.Errorf("PDO log chunk %d: %w", i, err)
+				}
 				last = err
 				continue
 			}

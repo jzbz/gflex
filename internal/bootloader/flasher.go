@@ -198,6 +198,10 @@ func (f *Flasher) send(ctx context.Context, frame []byte) error {
 // application protocol's ack_cmd_mismatch behaviour: a mismatch is not a hard
 // error, it just is not the frame we are waiting for (SPEC.md §5.2). There is
 // no NACK in this protocol, so the only failure mode is silence.
+//
+// A match additionally requires a strictly well-formed frame (DeclaredValid):
+// the lenient length fallback exists for diagnostics, not for acknowledgement
+// matching — see the check below.
 func (f *Flasher) awaitACK(ctx context.Context, want proto.Cmd, budget time.Duration) (Response, error) {
 	if f.setup != nil {
 		return Response{}, f.setup
@@ -218,6 +222,22 @@ func (f *Flasher) awaitACK(ctx context.Context, want proto.Cmd, budget time.Dura
 		}
 		n, err := f.dev.Transfer(ctx, f.in.Address, buf, ackPollTimeout)
 		if err != nil {
+			// A device that has left the bus can never answer, so polling on is
+			// pure waste: every further read fails identically, and across the
+			// split verify budgets that used to burn up to a minute in 5 ms
+			// hops. Abort at once, wrapping rather than replacing the error so
+			// callers and ExitCode still see the no-device sentinel.
+			//
+			// Only ErrNoDevice gets this treatment. ErrStall deliberately does
+			// not: whether the bootloader ever stalls its IN endpoint
+			// mid-update is one of the hardware unknowns (SPEC.md §14), the
+			// budget already bounds the wait, and a timeout reports the stall
+			// as the last read error — whereas a transient EPROTO during
+			// re-enumeration genuinely recovers, so a blanket abort on all
+			// errors would be wrong in the other direction.
+			if errors.Is(err, usbfs.ErrNoDevice) {
+				return Response{}, fmt.Errorf("bootloader: device left the bus while waiting for %s: %w", want, err)
+			}
 			// Almost always the poll timing out with nothing to read. Record
 			// it for diagnostics and keep waiting until the real budget ends.
 			lastErr = err
@@ -234,7 +254,16 @@ func (f *Flasher) awaitACK(ctx context.Context, want proto.Cmd, budget time.Dura
 			lastErr = err
 			continue
 		}
-		if resp.Cmd != want {
+		// Match only a strictly well-formed frame: declared length within
+		// [PreambleLen, n], no lenient fallback. CMD_BOOTLOADER_WRITE_CHUNK is
+		// command code 0, so under the fallback an all-zero bulk packet —
+		// classic line noise — parses as a WRITE_CHUNK acknowledgement
+		// (declared 0 → whole-buffer length, byte[1]&0x3F == 0), and the paced
+		// ACK-mode re-flash after a CRC mismatch would silently degrade into
+		// the unpaced streaming whose failure it exists to recover from
+		// (SPEC.md §10.5). Noise matches nothing and the wait continues;
+		// well-formed frames for other commands are discarded per SPEC.md §5.2.
+		if !resp.DeclaredValid || resp.Cmd != want {
 			continue
 		}
 		// Copy out of the reusable read buffer before handing the frame back.
@@ -381,6 +410,13 @@ func (f *Flasher) Verify(ctx context.Context) (crc uint8, err error) {
 		}
 		resp, err := f.awaitACK(ctx, proto.CmdBootloaderVerify, budget)
 		if err != nil {
+			// awaitACK already fails fast when the device leaves the bus;
+			// swallowing that into a retry would spend another round pause and
+			// a doomed send on a unit that is definitively gone. Only a
+			// silent-but-present device earns the next attempt.
+			if errors.Is(err, usbfs.ErrNoDevice) {
+				return 0, fmt.Errorf("bootloader: verify: %w", err)
+			}
 			lastErr = err
 			continue
 		}
@@ -606,14 +642,22 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 // already; the check is repeated here so the rule holds for any Config, and it
 // is skipped when Config.Active is 0, which is the "not known, do not filter"
 // value (see usbfs.Config).
+//
+// An interface whose own ConfigurationValue is 0 is a different case again: it
+// appeared before any configuration descriptor, a malformed blob that
+// usbfs.ParseDescriptors deliberately preserves ("dropping the interface would
+// turn a device we can still drive into one we cannot"). It belongs to no
+// inactive configuration — it is simply unattributed — so the Active filter
+// must not discard it, or this function undoes exactly the salvage the parser
+// performed. Such an orphan is kept as a fallback and an interface that
+// provably belongs to the active configuration is preferred when both exist.
 func PickBootloaderInterface(cfg *usbfs.Config) (usbfs.Interface, bool) {
 	if cfg == nil {
 		return usbfs.Interface{}, false
 	}
+	var orphan usbfs.Interface
+	var haveOrphan bool
 	for _, iface := range cfg.Interfaces {
-		if cfg.Active != 0 && iface.ConfigurationValue != cfg.Active {
-			continue
-		}
 		if iface.Class != VendorClass {
 			continue
 		}
@@ -623,9 +667,18 @@ func PickBootloaderInterface(cfg *usbfs.Config) (usbfs.Interface, bool) {
 		if _, ok := iface.Out(); !ok {
 			continue
 		}
+		if cfg.Active != 0 && iface.ConfigurationValue != cfg.Active {
+			// See the doc comment: 0 marks an orphan from a malformed blob,
+			// not membership of an inactive configuration. Remember the first
+			// one, but keep scanning for an exact match to prefer.
+			if iface.ConfigurationValue == 0 && !haveOrphan {
+				orphan, haveOrphan = iface, true
+			}
+			continue
+		}
 		return iface, true
 	}
-	return usbfs.Interface{}, false
+	return orphan, haveOrphan
 }
 
 // otherConfigurationNote names any *inactive* configuration that does declare a

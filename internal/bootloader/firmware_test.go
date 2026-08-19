@@ -93,6 +93,66 @@ func TestDecodeByteStringHexWinsAmbiguity(t *testing.T) {
 	}
 }
 
+// An all-hex string IS hex, and an odd length then means damage — most likely
+// truncation. It must error, never fall through to base64: hex digits are all
+// valid base64, so a hex image truncated to length 4k+3 used to decode via
+// RawStdEncoding into unrelated garbage, which the no-CRC --force path would
+// then flash.
+func TestDecodeByteStringTruncatedHexErrors(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{
+		"0123456789abcde", // 15 digits: 4k+3, valid raw base64 — the trap
+		"abcde",           // 5 digits: 4k+1, base64 happened to reject it too
+	} {
+		_, err := decodeByteString(s)
+		if err == nil {
+			t.Fatalf("decodeByteString(%q) decoded a truncated hex image", s)
+		}
+		if !strings.Contains(err.Error(), "truncated") || !strings.Contains(err.Error(), "hex") {
+			t.Errorf("decodeByteString(%q) error = %v; want it to name odd-length hex and likely truncation", s, err)
+		}
+	}
+}
+
+// When a string is not hex and not base64 either, the error reports both
+// interpretations — naming the character that ruled hex out, so a corrupted
+// hex dump is diagnosable as one.
+func TestDecodeByteStringCorruptCharNamesBothInterpretations(t *testing.T) {
+	t.Parallel()
+	_, err := decodeByteString("0123%567")
+	if err == nil {
+		t.Fatal("decodeByteString decoded a corrupt string")
+	}
+	for _, want := range []string{"hex", "base64", "'%'"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to mention %q", err, want)
+		}
+	}
+}
+
+// Genuine base64 — anything containing a non-hex character such as padding,
+// '+', or letters past 'f' — still decodes through the base64 alphabets.
+func TestDecodeByteStringBase64StillDecodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in   string
+		want []byte
+	}{
+		{base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}), []byte{1, 2, 3, 4}}, // "AQIDBA==": '=' padding
+		{"+/+/", []byte{0xFB, 0xFF, 0xBF}},                                          // std alphabet specials
+		{"-_-_", []byte{0xFB, 0xFF, 0xBF}},                                          // URL-safe alphabet
+	}
+	for _, tc := range tests {
+		got, err := decodeByteString(tc.in)
+		if err != nil {
+			t.Fatalf("decodeByteString(%q): %v", tc.in, err)
+		}
+		if !bytes.Equal(got, tc.want) {
+			t.Errorf("decodeByteString(%q) = % x, want % x", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestDecodeByteStringWhitespaceAndPrefix(t *testing.T) {
 	t.Parallel()
 	got, err := decodeByteString(" 0x01 02\n03 04 ")

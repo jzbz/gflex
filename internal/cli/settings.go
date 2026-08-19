@@ -739,6 +739,38 @@ func newLEDCommand(app *App) *cobra.Command {
 // authlock
 // ---------------------------------------------------------------------------
 
+// parseAuthLockLevel parses the <level> argument of `authlock set` as plain
+// decimal, and nothing else.
+//
+// This used to be strconv.ParseInt(arg, 0, 32), and base 0 is Go literal
+// syntax: a leading zero means octal, so "010" wrote level 8, and "0x10" and
+// "1_0" were accepted too. Those are exactly the shapes numberProblem in
+// parse.go was built to reject for voltages -- its comment carries the full
+// argument -- and the auth lock is the last place to be more lenient than a
+// voltage: it is the least understood command in the protocol, and a non-zero
+// level may not be reversible (SPEC.md §6.3, §14.8), so the byte written must
+// be beyond doubt the number the user typed. Base 10 makes "010" decimal 10.
+//
+// numberProblem itself is not reused here because its grammar is for scaled
+// quantities -- it admits a decimal point, which a wire byte cannot carry.
+// Range stays out of this function on purpose: CheckAuthLock owns the 0-255
+// bound, so enforcement lives in one place (SPEC.md §13, interlock 4), which
+// is why the sign and out-of-byte values parse here and are refused there.
+// The 32-bit size is not range policy but conversion safety: it makes the
+// int() below exact even where int is 32 bits, so an enormous typo fails the
+// parse rather than wrapping into a plausible-looking level.
+func parseAuthLockLevel(arg string) (int, error) {
+	level64, err := strconv.ParseInt(strings.TrimSpace(arg), 10, 32)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, codedf(ExitUsage, "auth lock level %q is far outside a single byte (0-255)", arg)
+		}
+		return 0, codedf(ExitUsage,
+			"cannot parse auth lock level %q: not a plain decimal number (write 10, not 0x0a or 1_0)", arg)
+	}
+	return int(level64), nil
+}
+
 func newAuthLockCommand(app *App) *cobra.Command {
 	cmd := group(&cobra.Command{
 		Use:   "authlock",
@@ -784,11 +816,10 @@ func newAuthLockCommand(app *App) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return app.run(cmd, func(ctx context.Context, f Formatter) error {
-				level64, err := strconv.ParseInt(strings.TrimSpace(args[0]), 0, 32)
+				level, err := parseAuthLockLevel(args[0])
 				if err != nil {
-					return codedf(ExitUsage, "cannot parse auth lock level %q: %v", args[0], err)
+					return err
 				}
-				level := int(level64)
 				d := CheckAuthLock(level)
 				if app.DryRun {
 					if err := app.applyDryRun(f, d); err != nil {

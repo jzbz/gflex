@@ -4,91 +4,46 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
-// staleThenDeadDev hands the framer one batch of MIDI bytes and then fails every
-// subsequent read, which reproduces the ordering the drains have to survive: the
-// reader publishes its terminal error, closes the error channel and then the
-// frame channel, leaving frames buffered behind an already-closed channel.
-type staleThenDeadDev struct {
-	pending []byte // MIDI bytes still to hand over; touched only by ReadMIDI
-	err     error
-
-	mu   sync.Mutex
-	sent int
-
-	closed    chan struct{}
-	closeOnce sync.Once
-}
-
-func newStaleThenDeadDev(frames [][]byte, err error) *staleThenDeadDev {
-	var midi []byte
-	for _, f := range frames {
-		midi = append(midi, encodeTestMIDI(f)...)
-	}
-	return &staleThenDeadDev{pending: midi, err: err, closed: make(chan struct{})}
-}
-
-func (d *staleThenDeadDev) Name() string { return "stale-then-dead" }
-
-func (d *staleThenDeadDev) WriteMIDI([]byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.sent++
-	return nil
-}
-
-// writes reports how many MIDI messages the host has put on the wire.
-func (d *staleThenDeadDev) writes() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.sent
-}
-
-// ReadMIDI is called from the framer's single reader goroutine only.
-func (d *staleThenDeadDev) ReadMIDI(p []byte) (int, error) {
-	if len(d.pending) > 0 {
-		n := copy(p, d.pending)
-		d.pending = d.pending[n:]
-		return n, nil
-	}
-	return 0, d.err
-}
-
-func (d *staleThenDeadDev) Close() error {
-	d.closeOnce.Do(func() { close(d.closed) })
-	return nil
-}
-
-// staleFrames returns n identical serial-number responses, enough of them that a
-// drain which stops at the first closed channel is caught.
+// deadSession builds a session whose framer has already died with n stale
+// serial-number frames still queued, and waits until that has actually
+// happened -- the ordering the drains have to survive: the reader publishes
+// its terminal error, closes the error channel and then the frame channel,
+// leaving frames buffered behind an already-closed channel.
 //
-// Once the error channel is closed, a receive from it is permanently ready, so a
-// select between it and a queued frame is a coin flip: one buffered frame would
-// expose the bug only half the time. Twelve reduce that to one run in 4096, and
-// the frames channel holds sixteen.
-func staleFrames(n int) [][]byte {
-	out := make([][]byte, n)
-	for i := range out {
-		out[i] = mustBuild(proto.CmdSerialNumber, []byte("STALE001"), false)
-	}
-	return out
-}
-
-// deadSession builds a session whose framer has already died with n stale frames
-// still queued, and waits until that has actually happened. Draining the error
-// channel here is what makes the wait deterministic: it returns only once the
-// reader has published its error and closed the channel, by which point every
-// frame it decoded is sitting in the frame buffer.
-func deadSession(t *testing.T, n int) (*Session, *staleThenDeadDev) {
+// The fixture leans on two documented fake.Device guarantees: an unplugged
+// Device delivers everything Push queued before failing the read, so all n
+// frames deterministically reach the framer ahead of the error; and writes
+// after the unplug still transmit and are recorded by Sent, which is what
+// lets TestStaleFrameCannotAnswerNextCommand prove a command really went out.
+// Draining the error channel here is what makes the wait deterministic: it
+// returns only once the reader has published its error and closed the
+// channel, by which point every frame it decoded is sitting in the frame
+// buffer.
+//
+// n should be large: once the error channel is closed, a receive from it is
+// permanently ready, so a select between it and a queued frame is a coin flip
+// and one buffered frame would expose a stop-at-first-closed-channel bug only
+// half the time. Twelve reduce that to one run in 4096, and the framer's
+// frame channel holds sixteen.
+func deadSession(t *testing.T, n int) (*Session, *fake.Device) {
 	t.Helper()
-	d := newStaleThenDeadDev(staleFrames(n), errors.New("read /dev/snd/midiC1D0: no such device"))
-	s := New(d, Options{ByteDelay: time.Nanosecond, Timeout: 200 * time.Millisecond})
+	d := fake.New()
+	d.SetDefault(nil)
+	for i := 0; i < n; i++ {
+		if err := d.Push(mustBuild(proto.CmdSerialNumber, []byte("STALE001"), false)); err != nil {
+			t.Fatalf("push stale frame %d: %v", i, err)
+		}
+	}
+	d.Unplug(errors.New("read /dev/snd/midiC1D0: no such device"))
+
+	s := New(d.Transport(), Options{ByteDelay: time.Nanosecond, Timeout: 200 * time.Millisecond})
 	t.Cleanup(func() { _ = s.Close() })
 
 	for range s.fr.Errors() { //nolint:revive // drained purely to wait for closure
@@ -147,7 +102,9 @@ func TestStaleFrameCannotAnswerNextCommand(t *testing.T) {
 	got, err := s.SerialNumber(context.Background())
 	// The command really was issued: the drain happens before the send, so this
 	// is the stale frame being discarded rather than the command being skipped.
-	if d.writes() == 0 {
+	// (An unplugged fake.Device still decodes and records what the host
+	// transmits, precisely so this can be asserted.)
+	if len(d.Sent()) == 0 {
 		t.Error("nothing was transmitted; the test is not exercising the drain-then-send path")
 	}
 	if err == nil {

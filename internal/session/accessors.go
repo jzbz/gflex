@@ -139,9 +139,36 @@ func (s *Session) VoltageMv(ctx context.Context) (uint16, error) {
 
 		// A cancelled context is not "not ready": every further attempt would
 		// fail the same way, and the caller wants to hear that it was cancelled
-		// rather than that the device never settled.
+		// rather than that the device never settled. (The classification below
+		// would catch the cancellation too, but only when it surfaced through
+		// the read; this check also catches a context that ended while the
+		// read itself came back errNotReady.)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return 0, fmt.Errorf("read voltage: %w", ctxErr)
+		}
+
+		// Retry only what waiting can cure. That is exactly two conditions:
+		//
+		//   - errNotReady: the unit answered 0 mV because the PD negotiation
+		//     has not settled, and time is precisely the remedy (SPEC.md §6.5).
+		//   - ErrTimeout: the protocol has no NACK, so a frame lost in either
+		//     direction surfaces only as a timeout and re-asking is the
+		//     designed recovery (SPEC.md §5.2) -- a silent still-settling unit
+		//     looks like this too.
+		//
+		// Everything else is structural and returns immediately: the permanent
+		// conditions of PermanentErr (ErrTransportClosed,
+		// ErrNoConnection, framer.ErrClosed, a dead context -- a Session has
+		// no reconnect path, so those fail identically on every attempt), and
+		// likewise a decode failure, which means the device is answering
+		// malformed frames, not settling. Retrying any of those burns the
+		// whole ready budget on attempts that fail instantly -- and on
+		// SetVoltageMv's read-back that delay lands at the worst moment: after
+		// a post-write unplug the caller must hear NOW that the write was
+		// acknowledged but unverifiable (ErrReadBack), because the rail is
+		// already live at the new value (SPEC.md §6.5, §13).
+		if !errors.Is(err, errNotReady) && !errors.Is(err, ErrTimeout) {
+			return 0, fmt.Errorf("read voltage: %w", err)
 		}
 
 		// The budget is a wall-clock deadline, not a sum of pauses: on a silent

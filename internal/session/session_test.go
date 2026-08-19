@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // TestACKMismatchKeepsWaiting: a frame whose command code does not match is not
@@ -18,10 +19,12 @@ import (
 func TestACKMismatchKeepsWaiting(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 2 * time.Second})
 	d.SetHandler(proto.CmdSerialNumber, func(proto.Frame) []byte {
-		// Two decoys carrying other command codes, then the real answer.
-		d.Emit(mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false))
-		d.Emit(mustBuild(proto.CmdCurrentLimitMa, proto.EncodeU16(5000), false))
-		return mustBuild(proto.CmdSerialNumber, []byte("VF999999"), false)
+		// Two decoys carrying other command codes, then the real answer. The
+		// decoys are frames the Device would never build for this request, so
+		// they are pushed raw; Push queues them ahead of the handler's reply.
+		_ = d.Push(mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false))
+		_ = d.Push(mustBuild(proto.CmdCurrentLimitMa, proto.EncodeU16(5000), false))
+		return []byte("VF999999")
 	})
 
 	got, err := s.SerialNumber(context.Background())
@@ -38,9 +41,9 @@ func TestACKMismatchKeepsWaiting(t *testing.T) {
 func TestACKMismatchThenTimeout(t *testing.T) {
 	const timeout = 200 * time.Millisecond
 	s, d := newTestSession(t, Options{Timeout: timeout})
-	d.SetHandler(proto.CmdSerialNumber, func(proto.Frame) []byte {
-		return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false)
-	})
+	// Every answer to the serial read arrives relabelled as a voltage frame.
+	d.SetResponse(proto.CmdSerialNumber, proto.EncodeU16(5000))
+	d.SetFault(proto.CmdSerialNumber, fake.Fault{Mismatch: true, MismatchCmd: proto.CmdVoltageMv})
 
 	start := time.Now()
 	_, err := s.SerialNumber(context.Background())
@@ -83,7 +86,10 @@ func TestNoResponseTimesOut(t *testing.T) {
 func TestShortFrameDoesNotSatisfy(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 200 * time.Millisecond})
 	d.SetHandler(proto.CmdSerialNumber, func(proto.Frame) []byte {
-		return []byte{0x08} // one byte: shorter than the two-byte preamble
+		// One byte: shorter than the two-byte preamble. The Device cannot
+		// build such a frame, so it is injected raw.
+		_ = d.Push([]byte{0x08})
+		return nil
 	})
 
 	if _, err := s.SerialNumber(context.Background()); !errors.Is(err, ErrTimeout) {
@@ -103,7 +109,7 @@ func TestStaleFrameDropped(t *testing.T) {
 			// Answer long after the first command has given up.
 			go func() {
 				time.Sleep(200 * time.Millisecond)
-				d.Emit(mustBuild(proto.CmdSerialNumber, []byte("STALE001"), false))
+				_ = d.Push(mustBuild(proto.CmdSerialNumber, []byte("STALE001"), false))
 			}()
 		})
 		return nil
@@ -131,16 +137,16 @@ func TestStaleFrameDropped(t *testing.T) {
 func TestUnplugMidCommandReportsTheCause(t *testing.T) {
 	unplugged := errors.New("read /dev/snd/midiC1D0: no such device")
 
-	d := newHotplugDev()
-	s := New(d, Options{ByteDelay: time.Nanosecond, Timeout: 5 * time.Second})
-	t.Cleanup(func() { _ = s.Close() })
+	s, d := newTestSession(t, Options{Timeout: 5 * time.Second})
 
 	// Unplug once the command is on the wire: before that, the stale-frame
 	// drain at the head of exchange would legitimately swallow the error.
-	go func() {
-		<-d.wrote
+	// The handler fires only after the Device has decoded the complete
+	// request frame, which pins exactly that point without sleeping.
+	d.SetHandler(proto.CmdSerialNumber, func(proto.Frame) []byte {
 		d.Unplug(unplugged)
-	}()
+		return nil
+	})
 
 	start := time.Now()
 	_, err := s.SerialNumber(context.Background())
@@ -180,8 +186,8 @@ func TestTraceHook(t *testing.T) {
 		},
 	})
 	d.SetHandler(proto.CmdSerialNumber, func(proto.Frame) []byte {
-		d.Emit(mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false)) // mismatched
-		return mustBuild(proto.CmdSerialNumber, []byte("VF000001"), false)
+		_ = d.Push(mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false)) // mismatched
+		return []byte("VF000001")
 	})
 
 	if _, err := s.SerialNumber(context.Background()); err != nil {
@@ -213,7 +219,7 @@ func TestSingleFlight(t *testing.T) {
 
 	var mu sync.Mutex
 	inFlight, maxInFlight := 0, 0
-	respond := func(cmd proto.Cmd, payload []byte) func(proto.Frame) []byte {
+	respond := func(payload []byte) func(proto.Frame) []byte {
 		return func(proto.Frame) []byte {
 			mu.Lock()
 			inFlight++
@@ -225,12 +231,12 @@ func TestSingleFlight(t *testing.T) {
 			mu.Lock()
 			inFlight--
 			mu.Unlock()
-			return mustBuild(cmd, payload, false)
+			return payload
 		}
 	}
-	d.SetHandler(proto.CmdSerialNumber, respond(proto.CmdSerialNumber, []byte("VF000001")))
-	d.SetHandler(proto.CmdCurrentLimitMa, respond(proto.CmdCurrentLimitMa, proto.EncodeU16(5000)))
-	d.SetHandler(proto.CmdUserVLimit, respond(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000)))
+	d.SetHandler(proto.CmdSerialNumber, respond([]byte("VF000001")))
+	d.SetHandler(proto.CmdCurrentLimitMa, respond(proto.EncodeU16(5000)))
+	d.SetHandler(proto.CmdUserVLimit, respond(proto.EncodeVLimit(3300, 48000)))
 
 	ctx := context.Background()
 	var wg sync.WaitGroup
@@ -313,9 +319,7 @@ func TestClosedSessionRefuses(t *testing.T) {
 // but the raw path can reach it. 0x40 | 0x12 = 0x52.
 func TestDoRawScratchpad(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 500 * time.Millisecond})
-	d.SetHandler(proto.CmdVoltageMv, func(proto.Frame) []byte {
-		return mustBuild(proto.CmdVoltageMv, proto.EncodeU16(5000), false)
-	})
+	d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(5000))
 
 	if _, err := s.DoRaw(context.Background(), proto.CmdVoltageMv, nil, false, true); err != nil {
 		t.Fatalf("DoRaw: %v", err)
@@ -327,8 +331,8 @@ func TestDoRawScratchpad(t *testing.T) {
 
 // TestDefaultsApplied checks the zero-value Options substitutions.
 func TestDefaultsApplied(t *testing.T) {
-	d := newFakeDev()
-	s := New(d, Options{})
+	d := fake.New()
+	s := New(d.Transport(), Options{})
 	t.Cleanup(func() { _ = s.Close() })
 	if s.timeout != proto.DefaultTimeout {
 		t.Errorf("timeout = %v, want %v", s.timeout, proto.DefaultTimeout)

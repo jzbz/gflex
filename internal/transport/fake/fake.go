@@ -27,8 +27,14 @@ import (
 	"github.com/jzbz/gflex/internal/proto"
 )
 
-// ErrClosed is returned by writes to a Device that has been closed.
+// ErrClosed is returned by writes to a Device that has been closed, and by
+// Push/PushMIDI once the Device is closed or unplugged.
 var ErrClosed = errors.New("fake: device is closed")
+
+// ErrUnplugged is the read error Unplug installs when it is handed a nil
+// error. Tests that want the host to see a specific cause (an ENODEV string,
+// say) pass their own.
+var ErrUnplugged = errors.New("fake: device unplugged")
 
 // TransportName is what the Device's transport reports from Name().
 const TransportName = "fake:vflex"
@@ -64,9 +70,10 @@ type Fault struct {
 
 // Device is an in-memory VFLEX.
 type Device struct {
-	mu     sync.Mutex
-	cond   *sync.Cond // signals rx or closed
-	closed bool
+	mu        sync.Mutex
+	cond      *sync.Cond // signals rx, closed or unplugged
+	closed    bool
+	unplugErr error // non-nil once Unplug has run; see Unplug for semantics
 
 	rx   []byte   // device -> host bytes waiting to be read
 	sent [][]byte // host -> device frames, in arrival order
@@ -247,6 +254,17 @@ func (d *Device) Sent() [][]byte {
 	return out
 }
 
+// SentHex renders Sent in proto.Hex form ("04 92 2e e0"), one string per
+// frame, for table-driven comparisons against expected wire traffic.
+func (d *Device) SentHex() []string {
+	frames := d.Sent()
+	out := make([]string, len(frames))
+	for i, f := range frames {
+		out[i] = proto.Hex(f)
+	}
+	return out
+}
+
 // ClearSent discards the recorded request frames.
 func (d *Device) ClearSent() {
 	d.mu.Lock()
@@ -270,6 +288,54 @@ func (d *Device) PushMIDI(raw []byte) error {
 		return ErrClosed
 	}
 	return nil
+}
+
+// Unplug models the cable being yanked mid-session: err (ErrUnplugged when
+// nil) becomes the terminal error the host's reader sees, the way a real
+// unplug surfaces as ENODEV out of a blocked read.
+//
+// The semantics are chosen for what hot-unplug tests need, and each side is
+// deliberate:
+//
+//   - Reads first drain any bytes already queued, then fail with err on every
+//     subsequent call. Bytes that left the device before the unplug are the
+//     kernel buffer's to deliver, so a test can Push responses, Unplug, and
+//     know the host will decode all of them and THEN hit the error --
+//     deterministically, with no race against the reader goroutine. (This is
+//     exactly the ordering a session's stale-frame drains have to survive.)
+//   - Writes keep succeeding, and the frames they complete are still decoded
+//     and recorded by Sent -- so a test can assert the host really did
+//     transmit a command after the death -- but nothing is dispatched or
+//     answered: there is no device left to answer. A real unplug may fail the
+//     write as well; that is the transport's own error path, exercised in the
+//     transport's tests, and failing writes here would make the
+//     send-succeeds-then-no-answer shape impossible to stage.
+//   - Push and PushMIDI fail with ErrClosed, and already-scheduled delayed
+//     replies are discarded: nothing new can come FROM a device that is gone.
+//
+// Unplug is idempotent and the first error wins. It is a no-op on a closed
+// Device, and Close still works normally afterwards.
+func (d *Device) Unplug(err error) {
+	if err == nil {
+		err = ErrUnplugged
+	}
+	d.mu.Lock()
+	if d.closed || d.unplugErr != nil {
+		d.mu.Unlock()
+		return
+	}
+	d.unplugErr = err
+	timers := d.timers
+	d.timers = make(map[uint64]*time.Timer)
+	d.cond.Broadcast()
+	d.mu.Unlock()
+
+	// Stop outside the lock, as Close does: a timer callback that has already
+	// started is blocked on d.mu, and will find the Device unplugged when its
+	// enqueue runs, which refuses.
+	for _, t := range timers {
+		t.Stop()
+	}
 }
 
 // Close releases the Device and unblocks any read waiting for data. It is
@@ -324,8 +390,14 @@ func (d *Device) writeMIDI(p []byte) error {
 		// be able to rewrite history.
 		d.sent = append(d.sent, append([]byte(nil), f...))
 	}
+	unplugged := d.unplugErr != nil
 	d.mu.Unlock()
 
+	if unplugged {
+		// Decoded and recorded so a test can see what the host transmitted,
+		// but never answered: the device is gone. See Unplug.
+		return nil
+	}
 	// Dispatch with the lock released so handlers can call back into the
 	// Device, and so a delayed reply never blocks the writer.
 	for _, f := range frames {
@@ -336,17 +408,24 @@ func (d *Device) writeMIDI(p []byte) error {
 
 // readMIDI returns device-to-host bytes, blocking until at least one is
 // available. It returns io.EOF once the Device is closed and drained, so a
-// reader goroutine ends cleanly instead of spinning.
+// reader goroutine ends cleanly instead of spinning; after Unplug it drains
+// what was already queued and then returns the unplug error instead.
 func (d *Device) readMIDI(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for len(d.rx) == 0 && !d.closed {
+	for len(d.rx) == 0 && !d.closed && d.unplugErr == nil {
 		d.cond.Wait()
 	}
 	if len(d.rx) == 0 {
+		// The unplug error takes precedence over the close EOF: the unplug is
+		// what killed the link, and Close arriving later (a session tearing
+		// itself down) must not rewrite the cause the reader reports.
+		if d.unplugErr != nil {
+			return 0, d.unplugErr
+		}
 		return 0, io.EOF
 	}
 	n := copy(p, d.rx)
@@ -447,11 +526,12 @@ func (d *Device) sendAfter(midi []byte, delay time.Duration) {
 }
 
 // enqueue appends bytes to the host-readable buffer and wakes any reader.
-// It reports false if the Device is closed.
+// It reports false if the Device is closed or unplugged: nothing more can come
+// FROM a device in either state.
 func (d *Device) enqueue(midi []byte) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed {
+	if d.closed || d.unplugErr != nil {
 		return false
 	}
 	d.rx = append(d.rx, midi...)

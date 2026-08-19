@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,12 @@ type fakeBulk struct {
 	// readable in reply. nil means the device stays silent, which is what
 	// stream mode expects.
 	respond func(out []byte) [][]byte
+	// inErr, when set, fails every IN read with that error, standing in for a
+	// transport-level failure such as the device leaving the bus.
+	inErr error
+	// inReads counts IN transfer attempts, so a test can assert that a fatal
+	// error aborted the wait instead of being polled through.
+	inReads int
 }
 
 var errNothingToRead = errors.New("fake: no data")
@@ -34,6 +41,10 @@ func (f *fakeBulk) Transfer(ctx context.Context, endpoint uint8, data []byte, _ 
 			f.inQueue = append(f.inQueue, f.respond(frame)...)
 		}
 		return len(data), nil
+	}
+	f.inReads++
+	if f.inErr != nil {
+		return 0, f.inErr
 	}
 	if len(f.inQueue) == 0 {
 		return 0, errNothingToRead
@@ -239,6 +250,80 @@ func TestAwaitACKSkipsMismatchedCommand(t *testing.T) {
 	}
 	if !resp.HasCRC || resp.CRC != 0x5A {
 		t.Errorf("CRC = 0x%02x has=%v, want 0x5A true", resp.CRC, resp.HasCRC)
+	}
+}
+
+// A device that has left the bus can never answer, so the wait must abort on
+// the first ErrNoDevice instead of polling out the whole budget in 5 ms hops
+// (up to ~60 s across the split verify attempts). The sentinel has to survive
+// the wrapping so ExitCode can classify the failure.
+func TestAwaitACKFailsFastWhenDeviceGone(t *testing.T) {
+	t.Parallel()
+	dev := &fakeBulk{inErr: fmt.Errorf("fake transport: %w", usbfs.ErrNoDevice)}
+	f := newTestFlasher(dev)
+	_, err := f.awaitACK(t.Context(), proto.CmdBootloaderWriteChunk, time.Minute)
+	if !errors.Is(err, usbfs.ErrNoDevice) {
+		t.Fatalf("error = %v, want it to unwrap to usbfs.ErrNoDevice", err)
+	}
+	// The old code recorded the error as lastErr and kept polling, so the
+	// budget-expiry message wrapped both sentinels: the errors.Is above would
+	// pass either way. What distinguishes fail-fast is a single read and no
+	// timeout dressing.
+	if errors.Is(err, ErrACKTimeout) {
+		t.Errorf("error = %v; a vanished device is not an ACK timeout", err)
+	}
+	if dev.inReads != 1 {
+		t.Errorf("device polled %d times after ErrNoDevice, want exactly 1", dev.inReads)
+	}
+}
+
+// An all-zero bulk packet — classic noise — leniently parses as command code
+// 0, which is CMD_BOOTLOADER_WRITE_CHUNK; it must not satisfy the wait for a
+// WRITE_CHUNK acknowledgement, or the paced ACK-mode re-flash after a CRC
+// mismatch silently degrades to the unpaced streaming it exists to recover
+// from (SPEC.md §10.5).
+func TestAwaitACKIgnoresAllZeroNoise(t *testing.T) {
+	t.Parallel()
+	dev := &fakeBulk{inQueue: [][]byte{make([]byte, 64)}}
+	f := newTestFlasher(dev)
+	if _, err := f.awaitACK(t.Context(), proto.CmdBootloaderWriteChunk, 50*time.Millisecond); !errors.Is(err, ErrACKTimeout) {
+		t.Fatalf("error = %v, want an ACK timeout: noise must match nothing", err)
+	}
+
+	// A well-formed code-0 acknowledgement after the noise still matches.
+	dev = &fakeBulk{inQueue: [][]byte{make([]byte, 64), {0x02, 0x80}}}
+	f = newTestFlasher(dev)
+	resp, err := f.awaitACK(t.Context(), proto.CmdBootloaderWriteChunk, time.Second)
+	if err != nil {
+		t.Fatalf("awaitACK: %v", err)
+	}
+	if resp.Cmd != proto.CmdBootloaderWriteChunk || !resp.DeclaredValid {
+		t.Errorf("resp = %+v, want a strictly valid WRITE_CHUNK ack", resp)
+	}
+}
+
+// A verify response that declares only the preamble, padded out by the bus,
+// must not verify anything: the padding byte used to be handed back as the
+// CRC, and with zero padding that fabricated 0x00 could match a legitimate
+// expected CRC of 0 and walk an unperformed verify through to
+// CMD_BOOTLOAD_END. Timing out instead is the fail-safe direction.
+func TestVerifyRejectsUnderDeclaredResponse(t *testing.T) {
+	t.Parallel()
+	dev := &fakeBulk{respond: func(out []byte) [][]byte {
+		if proto.Cmd(out[1]&proto.CmdCodeMask) != proto.CmdBootloaderVerify {
+			return nil
+		}
+		// Declared length 2: no CRC inside the frame; zeros after it are
+		// endpoint padding.
+		return [][]byte{{0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}
+	}}
+	f := newTestFlasher(dev)
+	_, err := f.Verify(t.Context())
+	if err == nil {
+		t.Fatal("Verify returned a CRC fabricated from bus padding")
+	}
+	if !strings.Contains(err.Error(), "no CRC") {
+		t.Errorf("error = %v, want it to say the response carried no CRC", err)
 	}
 }
 
@@ -767,6 +852,69 @@ func TestPickBootloaderInterfaceIgnoresInactiveConfigurations(t *testing.T) {
 	}
 }
 
+// An interface with ConfigurationValue 0 appeared before any configuration
+// descriptor: a malformed blob that usbfs.ParseDescriptors deliberately keeps
+// so the device stays drivable. The active-configuration filter must not throw
+// it away — it belongs to no inactive configuration, it is unattributed — or
+// the salvage is undone and a device we could still flash reports "no
+// vendor-class interface".
+func TestPickBootloaderInterfaceKeepsOrphanInterfaces(t *testing.T) {
+	t.Parallel()
+	orphan := usbfs.Interface{
+		Number: 3, Class: 0xFF, ConfigurationValue: 0,
+		Endpoints: []usbfs.Endpoint{
+			{Address: 0x01, Attributes: 0x02}, {Address: 0x81, Attributes: 0x02},
+		},
+	}
+	audio := usbfs.Interface{
+		Number: 0, Class: 0x01, SubClass: 0x03, ConfigurationValue: 1,
+		Endpoints: []usbfs.Endpoint{
+			{Address: 0x02, Attributes: 0x02}, {Address: 0x82, Attributes: 0x02},
+		},
+	}
+	cfg := &usbfs.Config{Active: 1, Interfaces: []usbfs.Interface{orphan, audio}}
+	iface, ok := PickBootloaderInterface(cfg)
+	if !ok {
+		t.Fatal("the orphan vendor-class interface was filtered out with the inactive configurations")
+	}
+	if iface.Number != 3 || iface.ConfigurationValue != 0 {
+		t.Errorf("picked interface %d of configuration %d, want the orphan 3 of 0",
+			iface.Number, iface.ConfigurationValue)
+	}
+
+	// When an interface provably in the active configuration also qualifies,
+	// it wins over the orphan — even when the orphan comes first in
+	// descriptor order.
+	exact := usbfs.Interface{
+		Number: 2, Class: 0xFF, ConfigurationValue: 1,
+		Endpoints: []usbfs.Endpoint{
+			{Address: 0x03, Attributes: 0x02}, {Address: 0x83, Attributes: 0x02},
+		},
+	}
+	cfg = &usbfs.Config{Active: 1, Interfaces: []usbfs.Interface{orphan, exact}}
+	iface, ok = PickBootloaderInterface(cfg)
+	if !ok {
+		t.Fatal("expected a match")
+	}
+	if iface.Number != 2 || iface.ConfigurationValue != 1 {
+		t.Errorf("picked interface %d of configuration %d, want the exact match 2 of 1",
+			iface.Number, iface.ConfigurationValue)
+	}
+
+	// An interface genuinely in an inactive configuration is still rejected:
+	// the orphan exemption is only for ConfigurationValue 0.
+	inactive := usbfs.Interface{
+		Number: 1, Class: 0xFF, ConfigurationValue: 2,
+		Endpoints: []usbfs.Endpoint{
+			{Address: 0x04, Attributes: 0x02}, {Address: 0x84, Attributes: 0x02},
+		},
+	}
+	cfg = &usbfs.Config{Active: 1, Interfaces: []usbfs.Interface{inactive, audio}}
+	if iface, ok := PickBootloaderInterface(cfg); ok {
+		t.Errorf("picked %+v from an inactive configuration; want no match", iface)
+	}
+}
+
 // The error for "no bootloader interface here" has to distinguish a unit still
 // in application mode from a unit whose bootloader interface is in a
 // configuration it is not currently in -- the second is invisible otherwise,
@@ -808,5 +956,23 @@ func TestOtherConfigurationNote(t *testing.T) {
 	multi.Active = 0
 	if got := otherConfigurationNote(multi); got != "" {
 		t.Errorf("undetermined-configuration note = %q, want empty", got)
+	}
+}
+
+// A device that leaves the bus mid-verify fails the whole Verify at once.
+// Before this was pinned, awaitACK's ErrNoDevice was swallowed into lastErr
+// and the loop spent another round pause plus a doomed send on a unit that
+// was definitively gone.
+func TestVerifyAbortsWhenTheDeviceLeavesTheBus(t *testing.T) {
+	dev := &fakeBulk{inErr: usbfs.ErrNoDevice}
+	f := newTestFlasher(dev)
+	_, err := f.Verify(context.Background())
+	if !errors.Is(err, usbfs.ErrNoDevice) {
+		t.Fatalf("error = %v, want usbfs.ErrNoDevice", err)
+	}
+	// One verify round only: the write form and the read form, no second
+	// attempt against a vanished device.
+	if n := len(dev.sent); n != 2 {
+		t.Errorf("sent %d frames, want 2 (one round); a gone device earns no retry round", n)
 	}
 }

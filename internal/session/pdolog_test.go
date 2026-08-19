@@ -7,18 +7,18 @@ import (
 	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // pdoResponder answers chunk reads. data(idx) supplies the bytes after the
 // echoed chunk id; id(idx) supplies the echoed id itself.
-func pdoResponder(d *fakeDev, id func(int) uint8, data func(int) []byte) {
+func pdoResponder(d *fake.Device, id func(int) uint8, data func(int) []byte) {
 	d.SetHandler(proto.CmdPDOLog, func(f proto.Frame) []byte {
 		if f.Write || len(f.Payload) != 1 {
-			return mustBuild(proto.CmdPDOLog, nil, false)
+			return []byte{} // bare acknowledgement
 		}
 		idx := int(f.Payload[0])
-		payload := append([]byte{id(idx)}, data(idx)...)
-		return mustBuild(proto.CmdPDOLog, payload, false)
+		return append([]byte{id(idx)}, data(idx)...)
 	})
 }
 
@@ -132,7 +132,7 @@ func TestFullPDOLogRetrySucceeds(t *testing.T) {
 				id = 9 // first attempt comes back mislabelled
 			}
 		}
-		return mustBuild(proto.CmdPDOLog, append([]byte{id}, fullChunk(idx)...), false)
+		return append([]byte{id}, fullChunk(idx)...)
 	})
 
 	blob, err := s.FullPDOLog(context.Background(), nil)
@@ -170,6 +170,42 @@ func TestPDOChunkRetryBudget(t *testing.T) {
 	// Two retries, each preceded by the 250 ms pause.
 	if want := 2 * pdoChunkRetryDelay; elapsed < want {
 		t.Errorf("the three attempts took %v, want at least %v of retry delay between them", elapsed, want)
+	}
+}
+
+// TestFullPDOLogAbortsOnDeadTransport pins the chunk retry classification:
+// the three-attempt budget is for a chunk the device answered wrongly or not
+// at all (mismatch, empty, short, ErrTimeout -- SPEC.md §9.1, §5.2), never
+// for a transport that died. A Session has no reconnect path, so retrying a
+// dead link adds two 250 ms delays -- and, on a link that dies less tidily,
+// whole 8 s chunk timeouts -- before the user hears the download failed. The
+// request count is the load-bearing assertion: the fake records frames the
+// host transmits even after the unplug, so a loop that retried the dead
+// chunk would show 5 requests instead of 3.
+func TestFullPDOLogAbortsOnDeadTransport(t *testing.T) {
+	s, d := newTestSession(t, Options{Timeout: time.Second})
+	d.SetHandler(proto.CmdPDOLog, func(f proto.Frame) []byte {
+		idx := int(f.Payload[0])
+		if idx < 2 {
+			return append([]byte{byte(idx)}, fullChunk(idx)...)
+		}
+		// The unit vanishes while chunk 2 is being served.
+		d.Unplug(errors.New("read /dev/snd/midiC1D0: no such device"))
+		return nil
+	})
+
+	start := time.Now()
+	_, err := s.FullPDOLog(context.Background(), nil)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrTransportClosed) {
+		t.Fatalf("error = %v, want ErrTransportClosed", err)
+	}
+	// Two good chunks plus a single request against the dead transport.
+	if n := len(d.Sent()); n != 3 {
+		t.Errorf("sent %d chunk requests, want 3 (a dead transport is not retried)", n)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("took %v; the abort must not sit out retry delays against a dead transport", elapsed)
 	}
 }
 
@@ -221,7 +257,7 @@ func TestPDOLogChunkCapsData(t *testing.T) {
 		for i := range payload[1:] {
 			payload[1+i] = byte(i + 1)
 		}
-		return mustBuild(proto.CmdPDOLog, payload, false)
+		return payload
 	})
 
 	id, data, err := s.PDOLogChunk(context.Background(), 2)
@@ -244,7 +280,7 @@ func TestPDOLogChunkCapsData(t *testing.T) {
 // TestClearPDOLogFrame pins the erase frame: a write with an empty payload.
 func TestClearPDOLogFrame(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: time.Second})
-	d.SetPayload(proto.CmdPDOLog, nil)
+	d.SetResponse(proto.CmdPDOLog, nil)
 
 	if err := s.ClearPDOLog(context.Background()); err != nil {
 		t.Fatalf("ClearPDOLog: %v", err)

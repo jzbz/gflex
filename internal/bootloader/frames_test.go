@@ -123,6 +123,7 @@ func TestParseResponse(t *testing.T) {
 		wantErr     bool
 		wantCmd     proto.Cmd
 		wantLen     int
+		wantValid   bool
 		wantPayload []byte
 		wantCRC     uint8
 		wantHasCRC  bool
@@ -137,6 +138,7 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x03, 0x02, 0x5A},
 			wantCmd:     proto.CmdBootloaderVerify,
 			wantLen:     3,
+			wantValid:   true,
 			wantPayload: []byte{0x5A},
 			wantCRC:     0x5A,
 			wantHasCRC:  true,
@@ -148,16 +150,19 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x03, 0x02, 0x5A, 0, 0, 0, 0, 0},
 			wantCmd:     proto.CmdBootloaderVerify,
 			wantLen:     3,
+			wantValid:   true,
 			wantPayload: []byte{0x5A},
 			wantCRC:     0x5A,
 			wantHasCRC:  true,
 		},
 		{
-			// declaredLen below the preamble falls back to the real length.
+			// declaredLen below the preamble falls back to the real length,
+			// and the fallback is flagged as such.
 			name:        "declared length zero",
 			raw:         []byte{0x00, 0x02, 0x5A},
 			wantCmd:     proto.CmdBootloaderVerify,
 			wantLen:     3,
+			wantValid:   false,
 			wantPayload: []byte{0x5A},
 			wantCRC:     0x5A,
 			wantHasCRC:  true,
@@ -168,20 +173,38 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x40, 0x02, 0x5A},
 			wantCmd:     proto.CmdBootloaderVerify,
 			wantLen:     3,
+			wantValid:   false,
 			wantPayload: []byte{0x5A},
 			wantCRC:     0x5A,
 			wantHasCRC:  true,
 		},
 		{
-			// A device that under-declares still yields a usable CRC, because
-			// the CRC test is against the bytes actually received.
-			name:        "under-declared verify still gives a CRC",
+			// A verify response that declares only the preamble carries no
+			// CRC, even when more bytes arrived in the same read: the CRC is
+			// taken from within the effective frame only. The old behaviour
+			// read raw[2] regardless and handed the padding byte back as a
+			// CRC.
+			name:        "under-declared verify carries no CRC",
 			raw:         []byte{0x02, 0x02, 0x5A},
 			wantCmd:     proto.CmdBootloaderVerify,
 			wantLen:     2,
+			wantValid:   true,
 			wantPayload: []byte{},
-			wantCRC:     0x5A,
-			wantHasCRC:  true,
+			wantHasCRC:  false,
+		},
+		{
+			// The dangerous shape of the same bug: zero padding after a
+			// declared-length-2 verify. 0x00 is a legitimate expected CRC
+			// (UpdateOptions.CRC is *uint8 because 0 is valid), so a
+			// fabricated CRC of 0x00 could pass an unperformed verify and
+			// reach CMD_BOOTLOAD_END.
+			name:        "zero padding is not a CRC of zero",
+			raw:         []byte{0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			wantCmd:     proto.CmdBootloaderVerify,
+			wantLen:     2,
+			wantValid:   true,
+			wantPayload: []byte{},
+			wantHasCRC:  false,
 		},
 		{
 			// The write flag is masked off and never inspected.
@@ -189,6 +212,7 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x03, 0x82, 0x77},
 			wantCmd:     proto.CmdBootloaderVerify,
 			wantLen:     3,
+			wantValid:   true,
 			wantPayload: []byte{0x77},
 			wantCRC:     0x77,
 			wantHasCRC:  true,
@@ -198,6 +222,7 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x02, 0x81},
 			wantCmd:     proto.CmdBootloaderCommitPage,
 			wantLen:     2,
+			wantValid:   true,
 			wantPayload: []byte{},
 		},
 		{
@@ -205,7 +230,19 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x02, 0x80},
 			wantCmd:     proto.CmdBootloaderWriteChunk,
 			wantLen:     2,
+			wantValid:   true,
 			wantPayload: []byte{},
+		},
+		{
+			// An all-zero packet parses (leniently) as command 0, which is
+			// CMD_BOOTLOADER_WRITE_CHUNK — but is flagged as not strictly
+			// valid, which is what stops awaitACK matching it as an ack.
+			name:        "all-zero noise is not strictly valid",
+			raw:         make([]byte, 8),
+			wantCmd:     proto.CmdBootloaderWriteChunk,
+			wantLen:     8,
+			wantValid:   false,
+			wantPayload: []byte{0, 0, 0, 0, 0, 0},
 		},
 		{
 			// A three-byte non-verify frame must not be mistaken for a CRC.
@@ -213,6 +250,7 @@ func TestParseResponse(t *testing.T) {
 			raw:         []byte{0x04, 0x08, 'A', 'B'},
 			wantCmd:     proto.CmdSerialNumber,
 			wantLen:     4,
+			wantValid:   true,
 			wantPayload: []byte{'A', 'B'},
 		},
 	}
@@ -233,6 +271,9 @@ func TestParseResponse(t *testing.T) {
 			}
 			if got.Length != tc.wantLen {
 				t.Errorf("Length = %d, want %d", got.Length, tc.wantLen)
+			}
+			if got.DeclaredValid != tc.wantValid {
+				t.Errorf("DeclaredValid = %v, want %v", got.DeclaredValid, tc.wantValid)
 			}
 			if !bytes.Equal(got.Payload, tc.wantPayload) {
 				t.Errorf("Payload = % x, want % x", got.Payload, tc.wantPayload)

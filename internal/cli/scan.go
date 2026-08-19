@@ -9,6 +9,7 @@ import (
 
 	"github.com/jzbz/gflex/internal/pdo"
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/session"
 )
 
 // The vendor's own strings. Users will search for these verbatim, so they are
@@ -166,6 +167,14 @@ func readSerialRetrying(ctx context.Context, read func(context.Context) (string,
 		}
 		serial, err := read(ctx)
 		switch {
+		case err != nil && session.PermanentErr(err):
+			// The link itself is gone (unplug, closed session, dead context).
+			// Every further attempt fails identically and instantly, so the
+			// 6 x 300 ms patience budget -- which exists for a slow-answering
+			// just-enumerated unit (SPEC.md §9.2), not a dead one -- would
+			// only delay telling the user the scan is over. Same
+			// classification as the session's own retry loops.
+			return "", fmt.Errorf("no usable serial number: %w", err)
 		case err != nil:
 			last = err
 		case !proto.SerialUsable(serial):
@@ -283,15 +292,7 @@ func (a *App) scanHandover(ctx context.Context, f Formatter, o scanOpts) error {
 	f.Diag("")
 
 	if o.noPrompt {
-		f.Diag("waiting up to %s for the VFLEX to disconnect...", o.wait)
-		if err := waitForDevice(ctx, false, o.wait); err != nil {
-			return err
-		}
-		if err := sleepCtx(ctx, o.settle); err != nil {
-			return err
-		}
-		f.Diag("waiting up to %s for the VFLEX to come back...", o.wait)
-		return waitForDevice(ctx, true, o.wait)
+		return a.scanAwaitHandover(ctx, f, o, waitForDevice)
 	}
 
 	if err := a.pause(ctx, "Press Enter once the VFLEX is plugged back into this computer..."); err != nil {
@@ -303,6 +304,64 @@ func (a *App) scanHandover(ctx context.Context, f Formatter, o scanOpts) error {
 		return fmt.Errorf("the VFLEX is not visible again: %w", err)
 	}
 	return nil
+}
+
+// scanReattachGrace bounds the wait for the rawmidi node to reappear after a
+// --transport usb session releases the MIDI interface (see scanAwaitHandover).
+// Rebinding snd-usb-audio is a local kernel/udev operation, not a device
+// action, so a healthy system is done in well under a second; the bound only
+// has to be generous relative to that, not to the user's walk to the charger.
+const scanReattachGrace = 5 * time.Second
+
+// scanAwaitHandover is the --no-prompt half of scanHandover: watch the rawmidi
+// node's presence for the unplug and the replug. waitDev abstracts
+// waitForDevice so the sequencing is testable without hardware.
+//
+// The presence checks here are exactly what midiPresenceMeaningful (see
+// firmware.go) warns about. Under --transport usb the phase-1 session claimed
+// the MIDI interface with a kernel-driver detach (SPEC.md §4.2), so at this
+// point the node's absence tracks THIS PROCESS, not the device: reading it as
+// "the user unplugged" would sail through the settle while c.Close's reattach
+// brings the node back, reconnect to the never-moved unit, match its serial,
+// and report the just-erased log as a completed scan of the charger -- wrong
+// data the user then acts on. The interactive path has no such problem, since
+// the user tells us when each physical step has happened.
+//
+// So when presence is not currently meaningful, first wait -- bounded by
+// scanReattachGrace -- for the node to REAPPEAR: Close handed the interface
+// back to snd-usb-audio, and the node returning is the proof that presence
+// tracks the device again, which makes the subsequent departure watch
+// trustworthy. If it does not return, presence cannot distinguish anything on
+// this system (snd-usb-audio may simply not be loaded -- the headless case in
+// midiPresenceMeaningful's comment -- or the unit left the bus before the
+// rebind finished) and the scan refuses rather than guesses: the §9.2 workflow
+// exists to keep the decoded capture honest, and a wrong guess here fabricates
+// one. The message points at interactive mode, which stays available.
+func (a *App) scanAwaitHandover(ctx context.Context, f Formatter, o scanOpts,
+	waitDev func(context.Context, bool, time.Duration) error) error {
+	if !a.midiPresenceMeaningful() {
+		f.Diag("waiting up to %s for the MIDI port to reappear before watching the handover...", scanReattachGrace)
+		if err := waitDev(ctx, true, scanReattachGrace); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			return codedf(ExitFailure,
+				"the VFLEX's MIDI port did not reappear within %s of releasing the USB interface, so "+
+					"its presence cannot be used to watch the unplug/replug on --transport %s (the "+
+					"snd-usb-audio driver may not be loaded on this system). Run the scan without "+
+					"--no-prompt to sequence the handover interactively.",
+				scanReattachGrace, a.Transport)
+		}
+	}
+	f.Diag("waiting up to %s for the VFLEX to disconnect...", o.wait)
+	if err := waitDev(ctx, false, o.wait); err != nil {
+		return err
+	}
+	if err := sleepCtx(ctx, o.settle); err != nil {
+		return err
+	}
+	f.Diag("waiting up to %s for the VFLEX to come back...", o.wait)
+	return waitDev(ctx, true, o.wait)
 }
 
 // emitMatch renders the compatibility verdict from pdo.Evaluate.

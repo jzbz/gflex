@@ -9,16 +9,17 @@ import (
 	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // scriptCore installs answers for the commands the vendor app actually issues.
-func scriptCore(d *fakeDev) {
-	d.SetPayload(proto.CmdSerialNumber, []byte("VF000042"))
-	d.SetPayload(proto.CmdFirmwareVersion, []byte("5.0.0\x00\x00\x00\x00\x00\x00\x00"))
-	d.SetPayload(proto.CmdVoltageMv, proto.EncodeU16(9000))
-	d.SetPayload(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
-	d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
-	d.SetPayload(proto.CmdDisableLEDDuringOp, []byte{0x00})
+func scriptCore(d *fake.Device) {
+	d.SetResponse(proto.CmdSerialNumber, []byte("VF000042"))
+	d.SetResponse(proto.CmdFirmwareVersion, []byte("5.0.0\x00\x00\x00\x00\x00\x00\x00"))
+	d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(9000))
+	d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
+	d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
+	d.SetResponse(proto.CmdDisableLEDDuringOp, []byte{0x00})
 }
 
 func TestInfoCoreOnly(t *testing.T) {
@@ -65,7 +66,7 @@ func TestInfoIncludeUnusedToleratesFailure(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 	scriptCore(d)
 	// Answer just one of the extras, to prove the others' failure is isolated.
-	d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
 
 	info, err := s.Info(context.Background(), true)
 	if err != nil {
@@ -90,15 +91,15 @@ func TestInfoIncludeUnusedToleratesFailure(t *testing.T) {
 func TestInfoIncludeUnusedFull(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: time.Second})
 	scriptCore(d)
-	d.SetPayload(proto.CmdChipUUID, []byte("CHIP0001"))
-	d.SetPayload(proto.CmdHardwareID, []byte("HW000001"))
-	d.SetPayload(proto.CmdMfgDate, []byte("20250101"))
-	d.SetPayload(proto.CmdAuthLock, []byte{0x01, 0x00})
-	d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
-	d.SetPayload(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
-	d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(-3))
-	d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(1024))
-	d.SetPayload(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+	d.SetResponse(proto.CmdChipUUID, []byte("CHIP0001"))
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{0x01, 0x00})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(-3))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(1024))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
 
 	info, err := s.Info(context.Background(), true)
 	if err != nil {
@@ -127,15 +128,15 @@ func TestInfoCancellationAbortsTheCall(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 	scriptCore(d)
 	// The extras are answered, so nothing but the cancellation can stop the run.
-	d.SetPayload(proto.CmdChipUUID, []byte("CHIP0001"))
-	d.SetPayload(proto.CmdHardwareID, []byte("HW000001"))
-	d.SetPayload(proto.CmdMfgDate, []byte("20250101"))
-	d.SetPayload(proto.CmdAuthLock, []byte{0x01, 0x00})
-	d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
-	d.SetPayload(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
-	d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
-	d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
-	d.SetPayload(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+	d.SetResponse(proto.CmdChipUUID, []byte("CHIP0001"))
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{0x01, 0x00})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
 
 	// Cancel as soon as the first best-effort read goes out, so the remaining
 	// reads are the ones that must not be silently skipped.
@@ -193,15 +194,15 @@ func TestInfoCancellationBetweenReadsAbortsTheCall(t *testing.T) {
 	})
 	scriptCore(d)
 	// Every optional command answers, so only the cancellation can stop the run.
-	d.SetPayload(proto.CmdChipUUID, []byte("CHIP0001"))
-	d.SetPayload(proto.CmdHardwareID, []byte("HW000001"))
-	d.SetPayload(proto.CmdMfgDate, []byte("20250101"))
-	d.SetPayload(proto.CmdAuthLock, []byte{0x01, 0x00})
-	d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
-	d.SetPayload(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
-	d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
-	d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
-	d.SetPayload(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+	d.SetResponse(proto.CmdChipUUID, []byte("CHIP0001"))
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{0x01, 0x00})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
 
 	info, err := s.Info(ctx, true)
 	if err == nil {
@@ -239,12 +240,12 @@ func TestInfoFailsOnCoreCommand(t *testing.T) {
 func TestPostUpdateInitOrder(t *testing.T) {
 	t.Run("plausible vlimit is left alone", func(t *testing.T) {
 		s, d := newTestSession(t, Options{Timeout: time.Second})
-		d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
-		d.SetPayload(proto.CmdAuthLock, []byte{0x00})
-		d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
-		d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
-		d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
-		d.SetPayload(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
+		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
+		d.SetResponse(proto.CmdAuthLock, []byte{0x00})
+		d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+		d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
 
 		var logged []string
 		if err := s.PostUpdateInit(context.Background(), func(m string) { logged = append(logged, m) }); err != nil {
@@ -275,12 +276,12 @@ func TestPostUpdateInitOrder(t *testing.T) {
 	t.Run("implausible vlimit is rewritten", func(t *testing.T) {
 		s, d := newTestSession(t, Options{Timeout: time.Second})
 		// A flash left the window at 0/0.
-		d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(0, 0))
-		d.SetPayload(proto.CmdAuthLock, []byte{0x00})
-		d.SetPayload(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
-		d.SetPayload(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
-		d.SetPayload(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
-		d.SetPayload(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
+		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(0, 0))
+		d.SetResponse(proto.CmdAuthLock, []byte{0x00})
+		d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+		d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
 
 		if err := s.PostUpdateInit(context.Background(), nil); err != nil {
 			t.Fatalf("PostUpdateInit: %v", err)
@@ -307,7 +308,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 
 	t.Run("write failures are tolerated and reported", func(t *testing.T) {
 		s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
-		d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
+		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
 		// Nothing else answers: every write times out.
 
 		var logged []string
@@ -329,7 +330,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 
 	t.Run("force rewrites the vlimit", func(t *testing.T) {
 		s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
-		d.SetPayload(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
+		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
 
 		if err := s.PostUpdateInitForce(context.Background(), true, nil); err != nil {
 			t.Fatalf("PostUpdateInitForce: %v", err)
@@ -342,7 +343,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 
 func TestFirmwareAtLeast(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: time.Second})
-	d.SetPayload(proto.CmdFirmwareVersion, []byte("5.0.0\x00\x00\x00\x00\x00\x00\x00"))
+	d.SetResponse(proto.CmdFirmwareVersion, []byte("5.0.0\x00\x00\x00\x00\x00\x00\x00"))
 
 	ok, version, err := s.FirmwareAtLeast(context.Background(), 5, 0, 0)
 	if err != nil {
@@ -356,7 +357,7 @@ func TestFirmwareAtLeast(t *testing.T) {
 	}
 
 	s2, d2 := newTestSession(t, Options{Timeout: time.Second})
-	d2.SetPayload(proto.CmdFirmwareVersion, []byte("4.9.9\x00\x00\x00\x00\x00\x00\x00"))
+	d2.SetResponse(proto.CmdFirmwareVersion, []byte("4.9.9\x00\x00\x00\x00\x00\x00\x00"))
 	ok, _, err = s2.FirmwareAtLeast(context.Background(), 5, 0, 0)
 	if err != nil {
 		t.Fatalf("FirmwareAtLeast: %v", err)
