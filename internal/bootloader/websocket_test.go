@@ -1,11 +1,16 @@
 package bootloader
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // cycleReader is a deterministic stand-in for crypto/rand so that masking keys
@@ -297,4 +302,205 @@ func TestFetchRejectsEmptySerial(t *testing.T) {
 	if _, err := Fetch(t.Context(), "ws://127.0.0.1:1/bootloader", "  ", 0); err == nil {
 		t.Fatal("expected an error for an empty serial")
 	}
+}
+
+// A Close frame's reason is server-controlled text that goes straight into an
+// error and on to a terminal. Stripping only invalid UTF-8 -- what this used to
+// do -- leaves ESC and every other C0 byte intact, which is enough to repaint
+// the operator's screen from a Close frame.
+func TestCloseErrorSanitisesReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		reason  string
+		want    string
+		absent  string
+		present string
+	}{
+		{name: "ansi sequence", reason: "\x1b[2Jgone", want: "[2Jgone"},
+		{name: "control bytes", reason: "no\x00pe\x07", want: "nope"},
+		{name: "invalid utf-8", reason: "bad\xff\xfe", want: "bad"},
+		{name: "plain text survives", reason: "server busy", want: "server busy"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			payload := append([]byte{0x03, 0xF3}, tc.reason...)
+			err := closeError(payload)
+			if err == nil {
+				t.Fatal("closeError returned nil")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("error = %q, want it to contain %q", msg, tc.want)
+			}
+			for i := 0; i < len(msg); i++ {
+				if b := msg[i]; b < 0x20 || b > 0x7E {
+					t.Fatalf("error contains byte 0x%02x at offset %d: %q", b, i, msg)
+				}
+			}
+		})
+	}
+
+	// The reason is bounded independently of the frame reader's 125-byte
+	// control-frame rule, for a payload that reaches closeError from elsewhere.
+	long := append([]byte{0x03, 0xF3}, strings.Repeat("x", 400)...)
+	if n := len(closeError(long).Error()); n > 200 {
+		t.Errorf("error is %d bytes for a 400-byte reason; the reason is not bounded", n)
+	}
+}
+
+// wsUpgradeServer runs a one-shot listener that completes the opening handshake
+// and then hands the accepted connection to serve. It returns the ws:// URL.
+func wsUpgradeServer(t *testing.T, serve func(conn net.Conn, req *http.Request, accept string)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		ln.Close()
+		<-done
+	})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		serve(conn, req, wsAcceptKey(req.Header.Get("Sec-WebSocket-Key")))
+	}()
+	return "ws://" + ln.Addr().String() + "/bootloader"
+}
+
+// http.ReadResponse imposes no limit of its own on the status line or the
+// headers -- net/textproto passes math.MaxInt64 as its bound -- so before the
+// cap the only thing between us and a server flooding headers at line rate was
+// the 15 s fetch deadline. The flood here stops after 4 MiB precisely so that a
+// regression fails on the assertion instead of exhausting the machine.
+func TestWSDialBoundsUpgradeResponseHeaders(t *testing.T) {
+	t.Parallel()
+	url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, _ string) {
+		if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
+			return
+		}
+		line := "X-Flood: " + strings.Repeat("a", 1024) + "\r\n"
+		for written := 0; written < 4<<20; written += len(line) {
+			if _, err := io.WriteString(conn, line); err != nil {
+				return
+			}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	c, err := wsDial(ctx, url)
+	elapsed := time.Since(start)
+	if err == nil {
+		c.Close()
+		t.Fatal("an endless header stream completed the handshake")
+	}
+	if !strings.Contains(err.Error(), "exceed") {
+		t.Errorf("error = %q, want it to name the header limit", err.Error())
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took %s: the read is not bounded by anything but the deadline", elapsed)
+	}
+}
+
+// The header limit must not survive the handshake. A server is free to pipeline
+// the first frame into the same packet as the 101 response, so those bytes are
+// already inside the bufio.Reader; the reader therefore has to be kept, with its
+// limit lifted rather than replaced. The message here is deliberately larger
+// than maxUpgradeResponseBytes: a limit left in place would fail this.
+func TestWSDialKeepsPipelinedFrameAndLiftsHeaderLimit(t *testing.T) {
+	t.Parallel()
+	payload := bytes.Repeat([]byte{0x5A}, 60000)
+	if len(payload) <= maxUpgradeResponseBytes {
+		t.Fatalf("payload of %d bytes does not exceed the %d-byte header limit", len(payload), maxUpgradeResponseBytes)
+	}
+	url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, accept string) {
+		var out bytes.Buffer
+		out.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+		header := []byte{0x82, 126, 0, 0}
+		binary.BigEndian.PutUint16(header[2:], uint16(len(payload)))
+		out.Write(header)
+		// The headers, the frame header and the first slice of the payload
+		// leave in one write, so bufio reads past the header terminator.
+		out.Write(payload[:100])
+		if _, err := conn.Write(out.Bytes()); err != nil {
+			return
+		}
+		if _, err := conn.Write(payload[100:]); err != nil {
+			return
+		}
+		// Stay open until the client is done, then drain its close frame.
+		io.Copy(io.Discard, conn)
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	c, err := wsDial(ctx, url)
+	if err != nil {
+		t.Fatalf("wsDial: %v", err)
+	}
+	defer c.Close()
+	op, msg, err := c.readMessage()
+	if err != nil {
+		t.Fatalf("readMessage: %v", err)
+	}
+	if op != opBinary {
+		t.Errorf("opcode = 0x%x, want 0x%x", op, opBinary)
+	}
+	if !bytes.Equal(msg, payload) {
+		t.Errorf("message is %d bytes, want %d (and equal)", len(msg), len(payload))
+	}
+}
+
+// A response that is not 101, and a wrong accept key, must still be refused with
+// the limit in place -- the bound is a read cap, not a replacement for the
+// handshake checks.
+func TestWSDialStillChecksTheHandshake(t *testing.T) {
+	t.Parallel()
+	t.Run("wrong accept key", func(t *testing.T) {
+		t.Parallel()
+		url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, _ string) {
+			io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
+				"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+				"Sec-WebSocket-Accept: not-the-right-key\r\n\r\n")
+			io.Copy(io.Discard, conn)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		if c, err := wsDial(ctx, url); err == nil {
+			c.Close()
+			t.Fatal("a wrong Sec-WebSocket-Accept was accepted")
+		} else if !strings.Contains(err.Error(), "Accept mismatch") {
+			t.Errorf("error = %q, want an accept-key mismatch", err.Error())
+		}
+	})
+	t.Run("not 101", func(t *testing.T) {
+		t.Parallel()
+		url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, _ string) {
+			io.WriteString(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+			io.Copy(io.Discard, conn)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		if c, err := wsDial(ctx, url); err == nil {
+			c.Close()
+			t.Fatal("a 404 completed the handshake")
+		} else if !strings.Contains(err.Error(), "expected 101") {
+			t.Errorf("error = %q, want it to name the expected status", err.Error())
+		}
+	})
 }

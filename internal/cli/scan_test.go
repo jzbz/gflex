@@ -320,6 +320,97 @@ func TestScanNoPromptRawMIDIUnchanged(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The interactive handover
+// ---------------------------------------------------------------------------
+
+// interactiveApp returns an App whose stdin is a real terminal with a keypress
+// already waiting, so scanHandover's pause returns as if the user had answered.
+// Interlock 7 (SPEC.md §13.7) refuses on a non-TTY before reading anything, so
+// a pty is the only honest way to reach the code after the prompt.
+func interactiveApp(t *testing.T, transport string) *App {
+	t.Helper()
+	master, slave := openPTY(t)
+	if _, err := master.WriteString("\n"); err != nil {
+		t.Fatalf("writing the keypress to the terminal: %v", err)
+	}
+	return &App{Transport: transport, stdout: io.Discard, stderr: io.Discard, stdin: slave}
+}
+
+// TestScanInteractiveUSBDoesNotWaitOnThePort is the regression test for the
+// interactive handover consulting the rawmidi node under --transport usb.
+//
+// The --no-prompt path was gated on midiPresenceMeaningful; this one was not,
+// and waited on the node unconditionally after the keypress. Under that
+// transport the node cannot be trusted to appear at all -- this process
+// detached snd-usb-audio to claim the interface (SPEC.md §4.2), and on a
+// headless box the driver may never be loaded -- so the wait aborted the scan
+// at its final step, after the log had been erased and the trip to the charger
+// made. The --no-prompt refusal even sends the user here. The keypress IS the
+// handover signal in this mode; the serial match after the reconnect is what
+// keeps the capture honest (SPEC.md §9.2).
+func TestScanInteractiveUSBDoesNotWaitOnThePort(t *testing.T) {
+	app := interactiveApp(t, transportUSB)
+	f := newFormatter(false, io.Discard, io.Discard)
+
+	// Any consultation of the node fails, as it does on the host this bug was
+	// found on: if the handover asks, the scan dies.
+	w := &handoverWaiter{respond: func(int, bool) error {
+		return codedf(ExitNoDevice, "timed out after %s waiting for the VFLEX to reappear", scanReplugGrace)
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := app.scanHandover(ctx, f, scanOpts{}, w.wait); err != nil {
+		t.Fatalf("the interactive handover failed on a signal that cannot arrive here: %v", err)
+	}
+	if len(w.calls) != 0 {
+		t.Errorf("presence was consulted %d time(s) on --transport usb: %+v", len(w.calls), w.calls)
+	}
+}
+
+// Under rawmidi presence does track the device, so the grace period for ALSA to
+// publish the node after the user's replug stays exactly as it was.
+func TestScanInteractiveRawMIDIStillWaitsForTheNode(t *testing.T) {
+	app := interactiveApp(t, transportRawMIDI)
+	f := newFormatter(false, io.Discard, io.Discard)
+
+	w := &handoverWaiter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := app.scanHandover(ctx, f, scanOpts{}, w.wait); err != nil {
+		t.Fatalf("a clean interactive handover failed: %v", err)
+	}
+	if len(w.calls) != 1 || !w.calls[0].want {
+		t.Fatalf("rawmidi handover = %+v, want exactly one wait for the node to appear", w.calls)
+	}
+	if w.calls[0].timeout != scanReplugGrace {
+		t.Errorf("grace = %s, want scanReplugGrace (%s)", w.calls[0].timeout, scanReplugGrace)
+	}
+}
+
+// And on rawmidi a node that never appears still stops the scan before the
+// reconnect, with the wording that says what was actually observed.
+func TestScanInteractiveRawMIDIReportsAMissingNode(t *testing.T) {
+	app := interactiveApp(t, transportRawMIDI)
+	f := newFormatter(false, io.Discard, io.Discard)
+
+	w := &handoverWaiter{respond: func(int, bool) error {
+		return codedf(ExitNoDevice, "timed out after %s waiting for the VFLEX to reappear", scanReplugGrace)
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := app.scanHandover(ctx, f, scanOpts{}, w.wait)
+	if err == nil {
+		t.Fatal("the node never came back and the handover reported success")
+	}
+	if !strings.Contains(err.Error(), "not visible again") {
+		t.Errorf("error %q does not say the unit was not seen again", err)
+	}
+}
+
 // A dead link is not a slow unit. The 6 x 300 ms patience exists for a
 // just-enumerated device answering slowly (SPEC.md §9.2); once the transport
 // itself is gone every attempt fails identically and instantly, so retrying

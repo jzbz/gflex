@@ -217,8 +217,11 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 				// negative: silently substituting 512 for a stated geometry,
 				// on the one path where wrong geometry can flash and even
 				// verify cleanly (SPEC.md §10.2, §14.12), is not a fallback
-				// anyone asked for. This is not a duplicate of the library's
-				// validation -- the library never rejects a negative at all.
+				// anyone asked for. The library refuses a negative too, on its
+				// own behalf; catching it here as well is deliberate defence in
+				// depth -- this check runs before any device is opened, and it
+				// answers with a usage exit code and the flag's own name rather
+				// than a load error surfaced from three layers down.
 				if pageSize < 0 {
 					return codedf(ExitUsage, "--page-size must be positive, got %d (0 or unset means the "+
 						"%d-byte default)", pageSize, bootloader.DefaultPageSize)
@@ -613,8 +616,12 @@ func decideForcedVLimit(f Formatter, before, after string) bool {
 //   - Forcing when we should not have replaces a window the user chose with the
 //     3300/48000 default, which is the widest window there is. Widening the
 //     guard rail is the direction that ends with 20 V on a 5 V pedal, and it is
-//     why `vlimit set` needs --force at all (SPEC.md §13.3, §17). Doing it
-//     silently, on a guess about a version string, is not defensible.
+//     why SPEC.md §13.3 has `vlimit set` confirm a widening at all --
+//     interactively, or with --yes when there is no terminal. (There is no
+//     global --force flag: SPEC.md §11, §13's preamble. The forcing named in
+//     this comment is session.PostUpdateInitForce's forceVLimit argument to the
+//     §10.4 replay, decided here rather than by the user.) Doing it silently,
+//     on a guess about a version string, is not defensible.
 //   - Not forcing when we should have is bounded by the check that is always
 //     applied: PostUpdateInitForce reads the window back first and rewrites the
 //     defaults anyway whenever the pair is missing or implausible

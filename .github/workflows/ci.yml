@@ -14,6 +14,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are pinned by commit SHA, not by tag: a major tag like @v7 is mutable,
+# so whoever controls the action repository can change what runs here after the
+# fact. The blast radius is small (this repo is public, the token is read-only,
+# nothing is published) but the pin costs nothing. Dependabot keeps the SHAs
+# current -- see .github/dependabot.yml -- so they cannot go quietly stale.
+#
+# The runner image is deliberately NOT pinned: images are meant to float so they
+# keep receiving security updates, and a pinned one is eventually retired out
+# from under the workflow. ubuntu-24.04-arm below is a label choice, not a pin --
+# it is the only one offering arm64.
+
 env:
   # Pinned rather than @latest: a new staticcheck release can add checks, and a
   # green tree turning red because a tool moved is a failure that teaches
@@ -25,9 +36,9 @@ jobs:
     name: build, lint and test (amd64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Tracks the toolchain in go.mod, so this file needs no edit when Go
           # is bumped there.
@@ -93,9 +104,9 @@ jobs:
     # is exactly this tool's use case.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           check-latest: true

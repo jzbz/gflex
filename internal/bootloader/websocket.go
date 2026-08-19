@@ -236,6 +236,12 @@ func (c *wsConn) readMessage() (byte, []byte, error) {
 	}
 }
 
+// maxCloseReasonLen is the RFC 6455 §5.5.1 ceiling on the reason text: a Close
+// payload is a control frame (125 bytes) minus the two-byte status code. The
+// frame reader already enforces the 125, so this is belt and braces for a
+// caller that hands closeError a payload from somewhere else.
+const maxCloseReasonLen = 123
+
 // closeError renders a received Close frame as an error. A close before we have
 // a message is always a failure for our single-request use.
 func closeError(payload []byte) error {
@@ -243,7 +249,13 @@ func closeError(payload []byte) error {
 		return fmt.Errorf("%w: server closed the connection", errWebsocket)
 	}
 	code := binary.BigEndian.Uint16(payload[:2])
-	reason := strings.ToValidUTF8(string(payload[2:]), "")
+	// The reason is server-controlled text that goes straight into an error and
+	// on to a terminal. RFC 6455 §5.5.1 bounds it at 123 bytes but says nothing
+	// about it being printable, and stripping only invalid UTF-8 (what this used
+	// to do) leaves ESC and every other C0 control byte intact — enough to
+	// repaint the operator's screen from a Close frame. Same discipline as the
+	// firmware version string, same helper.
+	reason := printableASCII(string(payload[2:]), maxCloseReasonLen)
 	if reason == "" {
 		return fmt.Errorf("%w: server closed the connection (code %d)", errWebsocket, code)
 	}
@@ -278,6 +290,51 @@ func wsAcceptKey(key string) string {
 	io.WriteString(h, wsGUID)
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
+
+// maxUpgradeResponseBytes caps what the HTTP upgrade parse may read. A 101
+// response is a status line and a handful of headers — a few hundred bytes —
+// so 32 KiB is generous for anything legitimate, including a server that piles
+// on cookies or proxy headers, while still being a rounding error next to an
+// unbounded read.
+const maxUpgradeResponseBytes = 32 << 10
+
+// errUpgradeTooLarge is returned to the HTTP parser when the cap is hit. The
+// parser wraps or replaces it freely, which is why headerLimitReader also
+// records the fact in a field the caller can consult.
+var errUpgradeTooLarge = errors.New("upgrade response too large")
+
+// headerLimitReader bounds a stream until it is explicitly unbounded.
+//
+// io.LimitReader is not usable here: it reports EOF at the limit, which the HTTP
+// parser reports as a truncated response rather than as a flood, and it offers
+// no way to lift the limit afterwards — and lifting it is required, because the
+// same bufio.Reader must go on to carry the frame stream with any pipelined
+// first-frame bytes it has already buffered.
+type headerLimitReader struct {
+	r         io.Reader
+	remaining int64
+	unlimited bool
+	exceeded  bool
+}
+
+func (h *headerLimitReader) Read(p []byte) (int, error) {
+	if h.unlimited {
+		return h.r.Read(p)
+	}
+	if h.remaining <= 0 {
+		h.exceeded = true
+		return 0, errUpgradeTooLarge
+	}
+	if int64(len(p)) > h.remaining {
+		p = p[:h.remaining]
+	}
+	n, err := h.r.Read(p)
+	h.remaining -= int64(n)
+	return n, err
+}
+
+// unbound lifts the limit once the handshake has been accepted.
+func (h *headerLimitReader) unbound() { h.unlimited = true }
 
 // wsDial opens a WebSocket connection and completes the opening handshake.
 func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
@@ -346,10 +403,24 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 		return nil, fmt.Errorf("%w: sending upgrade request: %w", errWebsocket, err)
 	}
 
-	br := bufio.NewReader(conn)
+	// http.ReadResponse imposes no size limit of its own: net/textproto reads the
+	// status line and headers with math.MaxInt64 as its bound, so without this
+	// the only thing standing between us and a server that emits headers forever
+	// is the 15 s fetch deadline — during which it can hand us as much memory as
+	// the link will carry. Every other read in this client is bounded
+	// (MaxMessageBytes, the 64-bit length check, the 125-byte control rule); this
+	// was the exception.
+	lr := &headerLimitReader{r: conn, remaining: maxUpgradeResponseBytes}
+	br := bufio.NewReader(lr)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
 	if err != nil {
 		conn.Close()
+		if lr.exceeded {
+			// Name the real cause: the parse error a truncated read produces
+			// ("malformed HTTP response") describes the symptom, not the flood.
+			return nil, fmt.Errorf("%w: upgrade response headers exceed the %d-byte limit",
+				errWebsocket, maxUpgradeResponseBytes)
+		}
 		return nil, fmt.Errorf("%w: reading upgrade response: %w", errWebsocket, err)
 	}
 	defer resp.Body.Close()
@@ -367,8 +438,13 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 		return nil, fmt.Errorf("%w: Sec-WebSocket-Accept mismatch", errWebsocket)
 	}
 
-	// br may already hold the first frame bytes, so it has to be the reader
-	// the connection keeps using.
+	// The handshake is over, so the header budget is spent and must not apply to
+	// the frame stream — an image is far larger than it. Lifting the limit in
+	// place, rather than building a fresh reader over conn, is deliberate: br may
+	// already hold bytes past the header terminator, and those bytes are the
+	// start of the first WebSocket frame. They exist only inside br, so br has to
+	// be the reader the connection keeps using.
+	lr.unbound()
 	c := newWSConn(br, conn, rand.Reader, MaxMessageBytes)
 	c.conn = conn
 	return c, nil

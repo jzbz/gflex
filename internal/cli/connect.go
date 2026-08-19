@@ -85,6 +85,13 @@ func traceLine(at time.Time, dir string, frame []byte) string {
 
 // openTransport opens the byte-level link selected by --transport and --port.
 func (a *App) openTransport(ctx context.Context) (proto.Transport, string, error) {
+	// The test seam (see App.testTransport). Consulted here rather than in
+	// connect so that everything above the byte link -- the session, its
+	// timeouts, the tracer, the interlocks the commands run first -- is the
+	// real thing under test.
+	if a.testTransport != nil {
+		return a.testTransport(ctx)
+	}
 	switch a.Transport {
 	case transportUSB:
 		return a.openUSB(ctx)

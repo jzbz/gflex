@@ -229,7 +229,10 @@ func (s *Session) readVoltageOnce(ctx context.Context) (uint16, error) {
 // No range checking happens here. The vendor app applies none at all, and the
 // safety interlocks of SPEC.md §13 (clamp to the user vlimit window and to the
 // 3300-48000 mV hardware envelope, confirm above 5 V, warn above 20 V) belong
-// to the CLI layer, which owns the terminal and the --force flags.
+// to the CLI layer, which owns the terminal and the confirmation prompts.
+// (The gate is a confirmation or --yes, plus the self-describing
+// --ignore-device-limits where a second key is genuinely needed; there is no
+// global --force flag -- SPEC.md §11, §13's preamble.)
 func (s *Session) SetVoltageMv(ctx context.Context, mv uint16) (uint16, error) {
 	if _, err := s.Do(ctx, proto.CmdVoltageMv, proto.EncodeU16(mv), true); err != nil {
 		return 0, fmt.Errorf("write voltage %d mV: %w", mv, err)
@@ -302,7 +305,9 @@ func (s *Session) VLimit(ctx context.Context) (lowMv, highMv uint16, err error) 
 // producing e.g. 06 97 BB 80 0C E4 for low=3300 high=48000.
 //
 // Widening this window removes the guard rail that voltage writes are checked
-// against, which is why SPEC.md §13.3 requires --force for it at the CLI layer.
+// against, which is why SPEC.md §13.3 has the CLI confirm it -- interactively,
+// or with --yes when there is no terminal. Narrowing needs no confirmation.
+// (There is no global --force flag: SPEC.md §11, §13's preamble.)
 func (s *Session) SetVLimit(ctx context.Context, lowMv, highMv uint16) error {
 	if _, err := s.Do(ctx, proto.CmdUserVLimit, proto.EncodeVLimit(lowMv, highMv), true); err != nil {
 		return fmt.Errorf("write vlimit low=%d high=%d: %w", lowMv, highMv, err)
@@ -402,8 +407,9 @@ func (s *Session) ADCOffset(ctx context.Context) (int32, error) {
 // SetADCOffset writes the signed ADC count offset (command 26).
 //
 // A wrong offset makes every subsequent voltage reading silently wrong, which
-// defeats the vlimit interlock that voltage writes depend on; SPEC.md §13.5
-// requires --force and a printed before-value at the CLI layer.
+// defeats the vlimit interlock that voltage writes depend on; SPEC.md §13.5 has
+// the CLI confirm the write and print the previous values first, so the
+// operator can put them back. (Confirmation, not a --force flag: §11, §13.)
 func (s *Session) SetADCOffset(ctx context.Context, v int32) error {
 	return s.writeI32(ctx, proto.CmdVMeasureADCOffset, v, "adc offset")
 }
@@ -538,7 +544,8 @@ func (s *Session) AuthLock(ctx context.Context) (level uint8, raw []byte, err er
 //
 // Note the asymmetry with AuthLock. Only level 0 (proto.AuthLockUnlocked) has a
 // documented meaning; the effect of any other value is unknown, which is why
-// SPEC.md §13.4 requires --force for non-zero levels at the CLI layer. The
+// SPEC.md §13.4 has the CLI confirm a non-zero level and say outright that its
+// effect is undocumented and possibly irreversible. The
 // post-firmware-update sequence writes 0 before every other parameter, which
 // suggests the lock gates the other writes -- inference, not proof.
 func (s *Session) SetAuthLock(ctx context.Context, level uint8) error {

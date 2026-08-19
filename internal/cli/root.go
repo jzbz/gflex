@@ -48,6 +48,22 @@ type App struct {
 	stderr io.Writer
 	stdin  io.Reader
 
+	// testTransport, when non-nil, replaces the link openTransport would have
+	// opened. It is a test seam and nothing in the shipped tree ever sets it:
+	// Execute builds the App with the field zero, and it is unexported so no
+	// embedder can reach it either.
+	//
+	// It exists because the SPEC.md §13 interlocks are wired in, not just
+	// implemented. Every Check* function is table-tested, but the tests could
+	// only reach them directly; deleting an `app.apply(...)` call from a
+	// command -- the line that turns a Decision into a refusal -- failed
+	// nothing, so the safety contract for attached hardware rested on review
+	// alone. With this seam a test drives the real cobra tree against
+	// transport/fake and asserts on the frames the device did or did not
+	// receive, which is the only evidence that says the interlock is armed.
+	// Same seam pattern the bootloader package uses for updateFirmware.
+	testTransport func(ctx context.Context) (proto.Transport, string, error)
+
 	// prompt is created lazily and reused so that a wizard asking two
 	// questions does not lose input buffered by the first read.
 	prompt *bufio.Reader

@@ -233,7 +233,7 @@ func (a *App) runScan(ctx context.Context, f Formatter, o scanOpts) error {
 	}
 
 	// --- phase 2: the user attaches the unit to the source under test --------
-	if err := a.scanHandover(ctx, f, o); err != nil {
+	if err := a.scanHandover(ctx, f, o, waitForDevice); err != nil {
 		return err
 	}
 
@@ -281,8 +281,10 @@ func (a *App) runScan(ctx context.Context, f Formatter, o scanOpts) error {
 }
 
 // scanHandover covers the part of the workflow that happens off-host: the user
-// takes the unit to the charger under test and brings it back.
-func (a *App) scanHandover(ctx context.Context, f Formatter, o scanOpts) error {
+// takes the unit to the charger under test and brings it back. waitDev
+// abstracts waitForDevice so both halves are testable without hardware.
+func (a *App) scanHandover(ctx context.Context, f Formatter, o scanOpts,
+	waitDev func(context.Context, bool, time.Duration) error) error {
 	f.Diag("")
 	f.Diag("Now, on the VFLEX:")
 	f.Diag("  1. unplug it from this computer")
@@ -292,19 +294,46 @@ func (a *App) scanHandover(ctx context.Context, f Formatter, o scanOpts) error {
 	f.Diag("")
 
 	if o.noPrompt {
-		return a.scanAwaitHandover(ctx, f, o, waitForDevice)
+		return a.scanAwaitHandover(ctx, f, o, waitDev)
 	}
 
 	if err := a.pause(ctx, "Press Enter once the VFLEX is plugged back into this computer..."); err != nil {
 		return err
 	}
-	// ALSA needs a moment to publish the rawmidi node after enumeration, so
-	// give it a short grace period rather than failing on a race.
-	if err := waitForDevice(ctx, true, 10*time.Second); err != nil {
+	// Interactive mode takes the user's Enter as the handover signal, and the
+	// rawmidi node is consulted only where it can corroborate that. Under
+	// --transport usb it cannot: midiPresenceMeaningful (firmware.go) records
+	// why -- usbmidi.Open detached snd-usb-audio to claim the MIDI interface
+	// (SPEC.md §4.2), and on a headless box the driver may never have been
+	// loaded at all -- so the node may be absent no matter what the user just
+	// plugged in. Waiting on it there aborts a scan at its very last step,
+	// after the log has already been erased and the trip to the charger made,
+	// for a signal that was never going to arrive. What actually protects the
+	// result is phase 3: the reconnect, and the serial that must match the
+	// unit whose log was erased (SPEC.md §9.2's hard invariant). Node presence
+	// was never that check, so skipping it costs no integrity -- a device that
+	// is not back simply fails the reconnect a moment later, with the
+	// transport's own error rather than a misleading one about visibility.
+	if !a.midiPresenceMeaningful() {
+		f.Diag("note: on --transport %s the MIDI port is not a usable presence signal, so the "+
+			"reconnect and serial check below are what establish the unit is back.", a.Transport)
+		return nil
+	}
+	// On rawmidi presence does track the device, and ALSA needs a moment to
+	// publish the node after enumeration, so wait out that race rather than
+	// letting the reconnect fail on it. This is the sibling of
+	// scanReattachGrace and deliberately longer: that one bounds a local
+	// driver rebind, this one a fresh USB enumeration the user has just
+	// initiated by hand.
+	if err := waitDev(ctx, true, scanReplugGrace); err != nil {
 		return fmt.Errorf("the VFLEX is not visible again: %w", err)
 	}
 	return nil
 }
+
+// scanReplugGrace bounds the interactive wait for the rawmidi node to appear
+// after the user says they have plugged the unit back in (see scanHandover).
+const scanReplugGrace = 10 * time.Second
 
 // scanReattachGrace bounds the wait for the rawmidi node to reappear after a
 // --transport usb session releases the MIDI interface (see scanAwaitHandover).
@@ -336,7 +365,10 @@ const scanReattachGrace = 5 * time.Second
 // midiPresenceMeaningful's comment -- or the unit left the bus before the
 // rebind finished) and the scan refuses rather than guesses: the §9.2 workflow
 // exists to keep the decoded capture honest, and a wrong guess here fabricates
-// one. The message points at interactive mode, which stays available.
+// one. The message points at interactive mode, which stays available and, by
+// the same reasoning, does not consult the node on this transport at all (see
+// scanHandover) -- so the advice leads somewhere that works rather than back
+// into the same dead end.
 func (a *App) scanAwaitHandover(ctx context.Context, f Formatter, o scanOpts,
 	waitDev func(context.Context, bool, time.Duration) error) error {
 	if !a.midiPresenceMeaningful() {
@@ -349,7 +381,8 @@ func (a *App) scanAwaitHandover(ctx context.Context, f Formatter, o scanOpts,
 				"the VFLEX's MIDI port did not reappear within %s of releasing the USB interface, so "+
 					"its presence cannot be used to watch the unplug/replug on --transport %s (the "+
 					"snd-usb-audio driver may not be loaded on this system). Run the scan without "+
-					"--no-prompt to sequence the handover interactively.",
+					"--no-prompt: interactive mode sequences the handover from your keypress and "+
+					"does not consult the MIDI port on this transport, so it works here.",
 				scanReattachGrace, a.Transport)
 		}
 	}

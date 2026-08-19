@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // page builds a deterministic 8*n byte page.
@@ -411,5 +415,164 @@ func TestFirmwareValidateRejectsMorePagesThanTheIDField(t *testing.T) {
 	// The boundary itself is legal.
 	if err := (&Firmware{Pages: pages[:MaxPages]}).Validate(); err != nil {
 		t.Errorf("Validate(%d pages): %v", MaxPages, err)
+	}
+}
+
+// A page size from an image's JSON reaches make() long before newFirmware's
+// geometry checks run, so it has to be judged on its own. It used to be checked
+// only for divisibility by ChunksPerPage: page_size 1<<40 was a fatal
+// "runtime: out of memory" -- fatal, so recover() could not catch it and the
+// process simply died -- and MaxInt64-7 (divisible by 8, so it passed) was a
+// "makeslice: cap out of range" panic. Both are reachable from a crafted local
+// image file and from --fetch, whose 8 MiB message cap bounds the JSON document
+// and not the integer inside it.
+//
+// Every case must come back as an error, promptly. The timing assertion is the
+// point: an implementation that allocates first cannot be fast, so a regression
+// shows up as a hang or a dead process rather than a quiet pass.
+func TestParseJSONPayloadBoundsPageSizeBeforeAllocating(t *testing.T) {
+	t.Parallel()
+	const ceiling = MaxChunkSize * ChunksPerPage
+
+	tests := []struct {
+		name     string
+		pageSize string
+		wantOK   bool
+		// wantPages is checked when wantOK; wantErr is a substring of the
+		// message, checked when it is not empty.
+		wantPages int
+		wantErr   string
+	}{
+		{name: "unset means the default", pageSize: "0", wantOK: true, wantPages: 1},
+		{name: "not divisible by ChunksPerPage", pageSize: "7", wantErr: "not divisible by 8"},
+		{name: "negative", pageSize: "-8", wantErr: "not positive"},
+		{
+			// Divisible by 8 -- MaxInt64 is 8k+7 -- so the old divisibility
+			// check waved it through into (len+pageSize-1)/pageSize and
+			// make([]byte, pageSize). No substring is asserted because on a
+			// 32-bit build the JSON decode rejects it first, for a different
+			// and equally acceptable reason.
+			name:     "MaxInt64 rounded down to a multiple of ChunksPerPage",
+			pageSize: fmt.Sprint(int64(math.MaxInt64) - 7),
+		},
+		{name: "a terabyte", pageSize: fmt.Sprint(int64(1) << 40), wantErr: "maximum"},
+		{name: "the exact ceiling", pageSize: fmt.Sprint(ceiling), wantOK: true, wantPages: 1},
+		{name: "one chunk over the ceiling", pageSize: fmt.Sprint(ceiling + ChunksPerPage), wantErr: "maximum"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := fmt.Sprintf(`{"app_bin":%s,"page_size":%s,"crc":1}`,
+				numberArray(page(0, 16)), tc.pageSize)
+
+			start := time.Now()
+			fw, err := ParseJSONPayload([]byte(body))
+			elapsed := time.Since(start)
+
+			if elapsed > 2*time.Second {
+				t.Errorf("took %s; nothing here should allocate, so this implies a page-sized allocation", elapsed)
+			}
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("ParseJSONPayload: %v", err)
+				}
+				if len(fw.Pages) != tc.wantPages {
+					t.Errorf("got %d pages, want %d", len(fw.Pages), tc.wantPages)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("page_size %s was accepted, giving %d pages of %d bytes",
+					tc.pageSize, len(fw.Pages), fw.PageSize())
+			}
+			if !errors.Is(err, ErrBadPageLength) {
+				t.Errorf("error %v does not wrap ErrBadPageLength, so the CLI will not classify it", err)
+			}
+			if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// The same ceiling applies to a page size the caller states, on every entry
+// point that takes LoadOptions: the CLI validates --page-size, but the CLI is
+// not the only caller of an exported API.
+func TestLoadOptionsPageSizeIsValidated(t *testing.T) {
+	t.Parallel()
+	const ceiling = MaxChunkSize * ChunksPerPage
+	raw := page(0, 16)
+
+	for _, bad := range []int{-8, 7, ceiling + ChunksPerPage, 1 << 40} {
+		if _, err := ParseImage(raw, LoadOptions{PageSize: bad}); err == nil {
+			t.Errorf("ParseImage with PageSize %d was accepted", bad)
+		} else if !errors.Is(err, ErrBadPageLength) {
+			t.Errorf("ParseImage with PageSize %d: %v does not wrap ErrBadPageLength", bad, err)
+		}
+		// A JSON image ignores the option's value, but an unrepresentable one
+		// still says the caller is confused about the geometry, and the flash
+		// path is the wrong place to be confused (SPEC.md §10.2).
+		body := fmt.Sprintf(`{"app_bin":%s,"crc":1}`, numberArray(raw))
+		if _, err := ParseImage([]byte(body), LoadOptions{PageSize: bad}); err == nil {
+			t.Errorf("ParseImage(JSON) with PageSize %d was accepted", bad)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "image.bin")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: 1 << 40}); err == nil {
+		t.Error("LoadFileWithOptions with a terabyte page size was accepted")
+	}
+	// The ceiling itself stays usable from every entry point.
+	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: ceiling}); err != nil {
+		t.Errorf("LoadFileWithOptions(PageSize %d): %v", ceiling, err)
+	}
+}
+
+// The version string is untrusted -- a local file or whatever the vendor's
+// service returned -- and it is printed to a terminal. It must arrive inert:
+// stripped to printable ASCII, the same discipline proto.DecodeString applies to
+// device identity strings, and bounded in length.
+func TestFirmwareVersionIsSanitised(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"ansi clear screen", "\x1b[2J5.2.0", "[2J5.2.0"},
+		{"control bytes", "5.\x00\x072.0\r\n", "5.2.0"},
+		{"invalid utf-8", "5.2.0\xff\xfe", "5.2.0"},
+		{"kept intact", " 5.2.0 ", "5.2.0"},
+		{"at the length limit", strings.Repeat("v", maxVersionLen), strings.Repeat("v", maxVersionLen)},
+		{"over the length limit", strings.Repeat("v", maxVersionLen+1), strings.Repeat("v", maxVersionLen) + "..."},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Only the version is marshalled, so that the pages stay a plain
+			// number array and the encoding of the payload is not part of what
+			// this test exercises.
+			version, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := fmt.Sprintf(`{"app_bin":%s,"app_version":%s,"crc":1}`,
+				numberArray(page(0, 16)), version)
+			fw, err := ParseJSONPayload([]byte(body))
+			if err != nil {
+				t.Fatalf("ParseJSONPayload: %v", err)
+			}
+			if fw.Version != tc.want {
+				t.Errorf("Version = %q, want %q", fw.Version, tc.want)
+			}
+			for i := 0; i < len(fw.Version); i++ {
+				if b := fw.Version[i]; b < 0x20 || b > 0x7E {
+					t.Fatalf("Version contains byte 0x%02x at offset %d: an escape sequence reached the terminal", b, i)
+				}
+			}
+		})
 	}
 }

@@ -1,0 +1,22 @@
+version: 2
+
+# Scoped to GitHub Actions only, and deliberately so.
+#
+# ci.yml pins its actions by commit SHA, which is what makes them immutable --
+# and also what makes them go stale silently, security fixes included, since
+# nothing about a SHA tells you it is out of date. Dependabot is the other half
+# of that decision: it raises the bump as a PR with the release notes attached.
+#
+# Go modules are not watched. There are two direct dependencies, both stable,
+# both pinned with hashes in go.sum, and a CLI that vendors nothing and runs no
+# server has little to gain from a steady trickle of patch bumps. Add a
+# gomod entry here if that balance ever changes.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+    labels:
+      - ci

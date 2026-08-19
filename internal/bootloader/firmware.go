@@ -75,11 +75,56 @@ func (f *Firmware) ChunkSize() int { return f.PageSize() / ChunksPerPage }
 // TotalBytes reports the size of the image across all pages.
 func (f *Firmware) TotalBytes() int { return len(f.Pages) * f.PageSize() }
 
+// maxPageSize is the largest page geometry the wire format can express.
+//
+// A page is always split into exactly ChunksPerPage WRITE_CHUNK frames, and
+// each chunk has to fit one frame whose length lives in a single byte
+// (MaxChunkSize, see frames.go). So MaxChunkSize*ChunksPerPage is not a policy
+// ceiling but an arithmetic one: a larger page could never be transmitted.
+// Derived rather than written out so that a change to the frame layout moves it
+// automatically.
+const maxPageSize = MaxChunkSize * ChunksPerPage
+
+// validatePageSize checks a page geometry *before* it is used to size an
+// allocation.
+//
+// newFirmware applies the same three rules, but it runs on the finished pages —
+// far too late for a page size that arrives from outside. A page_size taken
+// verbatim from a JSON image (file- or server-supplied, and only the JSON
+// *document* is bounded by MaxMessageBytes, never the integer inside it) used
+// to reach make([]byte, pageSize) unchecked: 1<<40 was a fatal
+// "runtime: out of memory" that recover cannot catch, and MaxInt64-7 — divisible
+// by ChunksPerPage, so the one existing check passed it — a "makeslice: cap out
+// of range" panic. A malformed image must be an error, never a dead process
+// (SPEC.md §10.3).
+//
+// The wording of each rule is deliberately identical to the corresponding
+// message in newFirmware: the same violation reads the same way whether it is
+// caught here or there, and the CLI surfaces either verbatim.
+func validatePageSize(pageSize int) error {
+	if pageSize <= 0 {
+		return fmt.Errorf("%w: page size %d is not positive", ErrBadPageLength, pageSize)
+	}
+	if pageSize%ChunksPerPage != 0 {
+		return fmt.Errorf("%w: data length %d not divisible by %d",
+			ErrBadPageLength, pageSize, ChunksPerPage)
+	}
+	if pageSize > maxPageSize {
+		return fmt.Errorf("%w: page of %d bytes yields %d-byte chunks, maximum %d",
+			ErrBadPageLength, pageSize, pageSize/ChunksPerPage, MaxChunkSize)
+	}
+	return nil
+}
+
 // LoadOptions tunes how an image file is interpreted.
 type LoadOptions struct {
-	// PageSize is the page geometry imposed on a raw binary image. Ignored for
-	// JSON payloads, which carry their own page split. Zero means
+	// PageSize is the page geometry imposed on a raw binary image. Zero means
 	// DefaultPageSize. Exposed so the CLI can offer --page-size.
+	//
+	// A JSON payload that carries its own page split ignores this value, but a
+	// non-zero value is still validated on every path: a caller asking for a
+	// geometry the wire format cannot express has made a mistake worth naming,
+	// and silently ignoring it is how that mistake survives to the next image.
 	PageSize int
 }
 
@@ -113,6 +158,16 @@ func LoadFileWithOptions(path string, opts LoadOptions) (*Firmware, error) {
 // The format is detected from the first non-whitespace byte: '{' or '[' means
 // the vendor's JSON payload, anything else is treated as a raw binary image.
 func ParseImage(data []byte, opts LoadOptions) (*Firmware, error) {
+	// An explicit page size is refused here, on every path, rather than only
+	// where it is consumed: this is the one place LoadOptions enters the
+	// package, so LoadFile, LoadFileWithOptions and ParseImage all inherit the
+	// check. Zero is not "invalid", it is "unset" — the zero value of
+	// LoadOptions has to keep working — so only a stated geometry is judged.
+	if opts.PageSize != 0 {
+		if err := validatePageSize(opts.PageSize); err != nil {
+			return nil, err
+		}
+	}
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: file is empty", ErrBadPageLength)
 	}
@@ -136,12 +191,18 @@ func ParseImage(data []byte, opts LoadOptions) (*Firmware, error) {
 // parseRawImage splits a flat binary image into equal pages, padding the last
 // one out to a whole page with RawImagePad.
 func parseRawImage(data []byte, pageSize int) (*Firmware, error) {
-	if pageSize <= 0 {
+	// Zero means "unset"; anything else is validated, including a negative,
+	// which used to be silently replaced by the default. Substituting 512 for a
+	// stated geometry is wrong on the one path where a wrong split can flash and
+	// even verify cleanly (SPEC.md §10.2, §14.12).
+	if pageSize == 0 {
 		pageSize = DefaultPageSize
 	}
-	if pageSize%ChunksPerPage != 0 {
-		return nil, fmt.Errorf("%w: data length %d not divisible by %d",
-			ErrBadPageLength, pageSize, ChunksPerPage)
+	// Every rule has to hold *before* the two expressions below: the capacity
+	// arithmetic (len(data)+pageSize-1) overflows on a huge pageSize, and the
+	// per-page make() is the unbounded allocation itself.
+	if err := validatePageSize(pageSize); err != nil {
+		return nil, err
 	}
 	pages := make([][]byte, 0, (len(data)+pageSize-1)/pageSize)
 	for off := 0; off < len(data); off += pageSize {
@@ -404,10 +465,11 @@ func firstNonHex(s string) int {
 }
 
 // splitFlat imposes a page geometry on an image that arrived without one.
+//
+// The page size here comes straight out of the payload's page_size field, so it
+// is untrusted; the defaulting and the validation both live in parseRawImage so
+// that this path cannot diverge from the raw-.bin one.
 func splitFlat(data []byte, pageSize int) ([][]byte, error) {
-	if pageSize <= 0 {
-		pageSize = DefaultPageSize
-	}
 	fw, err := parseRawImage(data, pageSize)
 	if err != nil {
 		return nil, err
@@ -453,11 +515,66 @@ func newFirmware(pages [][]byte, version string, crc uint8, crcKnown bool) (*Fir
 			ErrBadPageLength, size, size/ChunksPerPage, MaxChunkSize)
 	}
 	return &Firmware{
-		Pages:    pages,
-		Version:  strings.TrimSpace(version),
+		Pages: pages,
+		// The version string is untrusted: it comes from the image's JSON, which
+		// is either a local file or whatever the vendor's WebSocket service
+		// returned, and it is printed to a terminal and interpolated into CLI
+		// output. Sanitising it at the point it enters the package is the
+		// durable fix — every consumer of Firmware.Version inherits it, rather
+		// than each print site having to remember.
+		Version:  printableASCII(version, maxVersionLen),
 		CRC:      crc,
 		CRCKnown: crcKnown,
 	}, nil
+}
+
+// maxVersionLen bounds a sanitised version string. Real ones are "5.2.0"; the
+// field is free-form JSON and could be megabytes, and a value that long is not
+// a version whatever else it is.
+const maxVersionLen = 64
+
+// printableASCII reduces an untrusted string to the printable-ASCII discipline
+// proto.DecodeString applies to device identity strings, and bounds its length.
+//
+// Everything outside 0x20-0x7E is dropped, which covers the case that matters:
+// an ESC introducing an ANSI control sequence, so that a hostile version string
+// or close reason cannot repaint or clear the operator's terminal when it is
+// printed. Dropping rather than escaping matches proto.DecodeString, and it is
+// also what keeps invalid UTF-8 out.
+//
+// The rule is deliberately duplicated rather than imported. proto.DecodeString
+// takes the []byte of a wire payload already bounded by the one-byte frame
+// length, so it needs no ceiling and returns nothing to bound; the strings here
+// arrive from JSON and from a close frame, are bounded by nothing useful, and
+// converting one to []byte just to reuse eight lines would copy a value that
+// may be megabytes long. internal/proto is also the protocol layer: the tail
+// that trims and truncates *host-side* text belongs on this side of that line.
+func printableASCII(s string, max int) string {
+	var sb strings.Builder
+	grow := len(s)
+	if max > 0 && max < grow {
+		grow = max
+	}
+	sb.Grow(grow)
+	truncated := false
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b > 0x7E {
+			continue
+		}
+		if max > 0 && sb.Len() >= max {
+			truncated = true
+			break
+		}
+		sb.WriteByte(b)
+	}
+	out := strings.TrimSpace(sb.String())
+	if truncated {
+		// Say so rather than silently presenting a prefix as the whole value:
+		// this is text an operator compares against what they expected.
+		out += "..."
+	}
+	return out
 }
 
 // Validate re-checks an externally constructed Firmware. Flash calls it before
