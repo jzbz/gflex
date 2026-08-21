@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -147,6 +148,71 @@ func numberProblem(num string) string {
 		return "no digits"
 	}
 	return ""
+}
+
+// parseDecimalInt parses a user-supplied integer as plain decimal, and nothing
+// else. what names the quantity in the message, and bound describes the limit
+// the caller cares about for the one failure strconv can diagnose by itself.
+//
+// It exists because the obvious alternative is strconv.ParseInt(s, 0, …), and
+// that is exactly what pflag's IntVar and Int32Var call for a flag: base 0 is
+// Go literal syntax, so a leading zero means octal, "0x…" means hex and "_" is
+// a digit separator. `authlock set` shipped with that spelling and "010" wrote
+// level 8; the flags that write the tolerance and the ADC calibration shipped
+// with it too, reached through pflag rather than through a conversion written
+// here, so the same defect was invisible in this file. Every one of those
+// values lands in non-volatile memory, and the reinterpreted number sits well
+// inside every bound the interlocks of SPEC.md §13 check -- 0750 is 488, which
+// is a perfectly ordinary millivolt count -- so nothing downstream can catch
+// it. numberProblem above carries the full argument for why the accepted
+// grammar is this narrow; it is not reused here only because it admits a
+// decimal point, which none of these wire fields can carry.
+//
+// Range policy stays with the callers. bits is conversion safety rather than a
+// bound: it makes the caller's conversion to int or int32 exact, so an enormous
+// typo fails the parse instead of wrapping into a plausible-looking value.
+func parseDecimalInt(arg, what, bound string, bits int) (int64, error) {
+	v, err := strconv.ParseInt(strings.TrimSpace(arg), 10, bits)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, codedf(ExitUsage, "%s %q is far outside %s", what, arg, bound)
+		}
+		return 0, codedf(ExitUsage,
+			"cannot parse %s %q: not a plain decimal number (write 10, not 0x0a or 1_0)", what, arg)
+	}
+	return v, nil
+}
+
+// parseCRCByte parses --crc, the one numeric flag in the tool where hex is the
+// natural spelling: the value is the byte an image ships alongside itself, and
+// every artifact that carries one prints it as hex.
+//
+// So unlike parseDecimalInt this accepts a base prefix -- but only an explicit
+// one. A bare leading zero is refused rather than read as octal, which is what
+// pflag's base-0 integer flag did here: `--crc 017` meant 15. That matters more
+// on this flag than the arithmetic suggests. A CRC is not applied, it is
+// compared, so a value that quietly means a different number than the one typed
+// does not fail loudly -- it can match what the device answers, for a reason the
+// user never intended, and walk an image they meant to reject through to
+// CMD_BOOTLOAD_END (SPEC.md §10.4). The device's CRC algorithm is unknown
+// (SPEC.md §14.12), so nothing downstream can recompute the value and notice.
+func parseCRCByte(arg string) (int, error) {
+	s := strings.TrimSpace(arg)
+	base := 10
+	switch {
+	case strings.HasPrefix(s, "0x"), strings.HasPrefix(s, "0X"):
+		base, s = 16, s[2:]
+	case len(s) > 1 && s[0] == '0':
+		bare := strings.TrimLeft(s, "0")
+		return 0, codedf(ExitUsage, "cannot parse --crc %q: a leading zero is not octal here; "+
+			"write %s for decimal or 0x%s for hex", arg, bare, bare)
+	}
+	v, err := strconv.ParseUint(s, base, 8)
+	if err != nil {
+		return 0, codedf(ExitUsage,
+			"cannot parse --crc %q: want a byte value 0..255, as decimal or with an explicit 0x prefix", arg)
+	}
+	return int(v), nil
 }
 
 // parseHexBytes parses the arguments of `gflex raw` into a byte slice.

@@ -79,7 +79,7 @@ const (
 // It never calls os.Exit itself, so that main stays a one-liner and tests can
 // drive the whole tree in-process.
 func Execute() int {
-	app := &App{stdout: os.Stdout, stderr: os.Stderr, stdin: os.Stdin}
+	app := newApp()
 	root := NewRootCommand(app)
 
 	// Ctrl-C during a firmware flash or a PDO download must unwind through the
@@ -101,6 +101,19 @@ func Execute() int {
 		fmt.Fprintf(os.Stderr, "\n%s\n", hint)
 	}
 	return code
+}
+
+// newApp builds the App the shipped binary runs on: the process's own streams
+// and nothing else.
+//
+// It is its own function so that a test can assert on the object Execute
+// actually builds. A test that constructs its own &App{...} literal instead
+// proves only that Go zeroes an omitted field, which it does by language rule
+// whatever this package looks like -- and the property worth holding is that
+// the testTransport seam stays unset on the production path (see the field's
+// comment above).
+func newApp() *App {
+	return &App{stdout: os.Stdout, stderr: os.Stderr, stdin: os.Stdin}
 }
 
 // NewRootCommand builds the command tree against app. Exported so that tests
@@ -158,7 +171,8 @@ func NewRootCommand(app *App) *cobra.Command {
 	pf.BoolVar(&app.AsJSON, "json", false, "emit a single JSON object on stdout; diagnostics go to stderr")
 	pf.DurationVar(&app.Timeout, "timeout", proto.DefaultTimeout, "per-command response timeout")
 	pf.DurationVar(&app.ByteDelay, "byte-delay", proto.ByteDelay,
-		"delay between MIDI messages; the vendor app uses 20ms, whether the device needs it is unknown")
+		"delay between MIDI messages; the vendor app's 20ms is the default, and one unit measured "+
+			"clean at 1ms (SPEC.md §14.15)")
 	pf.BoolVarP(&app.Verbose, "verbose", "v", false, "trace TX/RX frames as hex on stderr")
 	pf.BoolVar(&app.DryRun, "dry-run", false, "print the frames and MIDI bytes that would be sent, and send nothing")
 	pf.BoolVarP(&app.Yes, "yes", "y", false, "assume yes for every safety confirmation (SPEC.md §13)")
@@ -249,11 +263,17 @@ func (a *App) applyEnv(cmd *cobra.Command) error {
 	if a.ByteDelay == 0 {
 		// session.Options treats a zero ByteDelay as "unset" and substitutes the
 		// vendor's 20 ms, so accepting 0 here would silently do the opposite of
-		// what the user asked. Whether the device needs the delay at all is an
-		// open question (SPEC.md §14.15), so this is a setting people will
-		// genuinely want to drive to nothing -- point them at how.
+		// what the user asked. The bisection recorded in SPEC.md §14.15 makes
+		// this a setting people will genuinely want to drive down -- 1 ms and
+		// 100 µs were clean over 120 reads and 30 writes, and `info` went from
+		// 0.38 s to 0.04 s -- so point them at the fastest value that was
+		// actually clean rather than at the fastest value there is. 1 ns was
+		// the one setting in that bisection that dropped frames, so naming it
+		// here as "as fast as possible" would steer the user at the only
+		// measured-lossy pace in the table.
 		return codedf(ExitUsage, "--byte-delay 0 is indistinguishable from unset and would be "+
-			"treated as the %s default; use a small positive value such as 1ns to pace as fast as possible",
+			"treated as the %s default; use a small positive value such as 1ms, which was measured "+
+			"clean -- 1ns dropped about 2.5%% of responses (SPEC.md §14.15)",
 			proto.ByteDelay)
 	}
 	return nil
@@ -316,6 +336,13 @@ func (a *App) confirm(ctx context.Context, question string) error {
 	fmt.Fprintf(a.stderr, "%s [y/N] ", question)
 	line, err := a.readLine(ctx)
 	if err != nil {
+		// A prompt that hit end of input got no answer, and an unanswered
+		// confirmation is a refusal. The "nothing was written to the device"
+		// that refused() appends is true here by construction: every §13
+		// confirmation is evaluated before the write it guards.
+		if errors.Is(err, errNoAnswer) {
+			return refused(errNoAnswer.Error())
+		}
 		return err
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
@@ -324,6 +351,20 @@ func (a *App) confirm(ctx context.Context, question string) error {
 	}
 	return refused("declined at the prompt")
 }
+
+// errNoAnswer reports that a prompt reached end of input before a line arrived:
+// a Ctrl-D, or a reader that was already exhausted.
+//
+// readLine deliberately leaves it unclassified, because its two callers are not
+// the same kind of thing. confirm IS an interlock, so it turns this into a
+// refusal, and refused()'s fixed "nothing was written to the device" holds
+// there. pause is not: SPEC.md §9.2's handover has nothing to refuse, and by
+// the time it runs `scan` has already erased the capture log, so the identical
+// sentence would be a flat falsehood printed at the one moment the user most
+// needs to know their capture is gone. readLine returning a ready-made refusal
+// made that wording the caller's problem to notice rather than the caller's
+// decision to make.
+var errNoAnswer = errors.New("no answer read from stdin")
 
 // readLine reads one line from stdin, abandoning the wait if ctx is cancelled.
 //
@@ -355,7 +396,7 @@ func (a *App) readLine(ctx context.Context) (string, error) {
 		return "", ctx.Err()
 	case r := <-ch:
 		if r.err != nil && r.line == "" {
-			return "", refused("no answer read from stdin")
+			return "", errNoAnswer
 		}
 		return r.line, nil
 	}
@@ -373,6 +414,14 @@ func (a *App) pause(ctx context.Context, question string) error {
 	}
 	fmt.Fprintf(a.stderr, "%s ", question)
 	if _, err := a.readLine(ctx); err != nil {
+		// Ctrl-D at the handover prompt. It is the same event as starting with
+		// no terminal at all -- nobody is going to answer -- so it gets the
+		// same answer the branch above gives, rather than a §13-shaped refusal
+		// claiming nothing was written when `scan` has already erased the log.
+		if errors.Is(err, errNoAnswer) {
+			return codedf(ExitUsage, "%s\n  no answer read from stdin; use --no-prompt (optionally "+
+				"with --wait) to run this unattended", question)
+		}
 		return err
 	}
 	return nil

@@ -52,17 +52,6 @@ func NewDecoder() *Decoder {
 // Framer, or before any concurrent Feed; the hook is not guarded by a lock.
 func (d *Decoder) SetDropHook(fn DropFunc) { d.onDrop = fn }
 
-// Reset discards all parser and frame state, as after a disconnect. The drop
-// hook is retained.
-func (d *Decoder) Reset() {
-	d.status = 0
-	d.data = [2]byte{}
-	d.nData = 0
-	d.want = 0
-	d.sysex = false
-	d.acc = d.acc[:0]
-}
-
 // Feed consumes a chunk of the inbound MIDI byte stream and returns every
 // protocol frame completed by it, in order. The chunk may begin or end
 // mid-message; leftover state is carried to the next call. The returned frames
@@ -164,6 +153,13 @@ func (d *Decoder) message(status, d1, d2 byte) []byte {
 		var frame []byte
 		if len(d.acc) >= proto.PreambleLen {
 			n := int(d.acc[0])
+			// n <= len(d.acc) is the clause that does the work here: the
+			// accumulator is capped at MaxFrameLen above, so it already
+			// subsumes ValidResponseLen's own upper bound. That upper bound is
+			// kept regardless -- it mirrors the receive check of SPEC.md §3.3
+			// verbatim and is what still rejects an over-long frame if the cap
+			// is ever raised. TestDecoderDeclaredLengthAboveMaxIsRejected pins
+			// it, since no stream can reach it while the cap stands.
 			if proto.ValidResponseLen(n) && n <= len(d.acc) {
 				frame = make([]byte, n)
 				copy(frame, d.acc)

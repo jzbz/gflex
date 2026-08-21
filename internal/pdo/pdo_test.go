@@ -278,8 +278,11 @@ func TestDecodeFixed(t *testing.T) {
 }
 
 func TestRoundingToTwoDecimals(t *testing.T) {
-	// 0.05*180 is 9.000000000000002 in binary floating point; without round2
-	// this fails an exact comparison and prints as noise.
+	// 0.05*66 is 3.3000000000000003 in binary floating point; without round2
+	// that is the figure the PPS APDO below hands out, and it prints and
+	// serialises as noise. The fixed PDO is the control: 0.05*180 happens to be
+	// exactly 9, so that assertion holds with or without the rounding and only
+	// the PPS one below can fail.
 	p := decodePDO(0, fixed9V3A)
 	if p.VoltageV != 9.0 {
 		t.Errorf("VoltageV = %.20g, want exactly 9", p.VoltageV)
@@ -673,7 +676,7 @@ func TestBoundCurrentUnaffectedBelowCeiling(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Kind and rendering
+// Kind naming
 // ---------------------------------------------------------------------------
 
 func TestKindString(t *testing.T) {
@@ -691,91 +694,5 @@ func TestKindString(t *testing.T) {
 	}
 	if got := Kind(99).String(); got != "kind(99)" {
 		t.Errorf("Kind(99).String() = %q", got)
-	}
-}
-
-func TestSummaryGrouping(t *testing.T) {
-	l := simpleLog(t, fixed5V3A, fixed9V3A, fixed28V5A, pps3311V3A, eprAVS140W, sprAVS, battery, augReserved)
-	s := l.Summary()
-	for _, want := range []string{
-		"SPR fixed", "SPR variable", "EPR fixed", "EPR variable", "Unrecognised",
-		"target 9000 mV", "0x0002D12C", "3.30-11.00 V", "140 W",
-		// The SPR AVS range is an assumption, not wire data, and is marked "?".
-		"9.0-20.0 V?",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("Summary() missing %q:\n%s", want, s)
-		}
-	}
-	// The 28 V fixed PDO must land under EPR fixed, after the EPR fixed heading
-	// and before EPR variable.
-	iEPRFixed := strings.Index(s, "EPR fixed")
-	iEPRVar := strings.Index(s, "EPR variable")
-	i28 := strings.Index(s, "28.00 V")
-	if !(iEPRFixed < i28 && i28 < iEPRVar) {
-		t.Errorf("28 V fixed PDO is not in the EPR fixed section:\n%s", s)
-	}
-}
-
-func TestSummaryEmptySections(t *testing.T) {
-	// The four SPR/EPR x fixed/variable sections always render, so the table
-	// shape is constant; "Unrecognised" only appears when it has content.
-	l := simpleLog(t, fixed5V3A)
-	s := l.Summary()
-	if strings.Count(s, "(none)") != 3 {
-		t.Errorf("want 3 empty sections, got:\n%s", s)
-	}
-	if strings.Contains(s, "Unrecognised") {
-		t.Errorf("empty Unrecognised section rendered:\n%s", s)
-	}
-	var nilLog *Log
-	if nilLog.Summary() == "" {
-		t.Error("nil Log Summary() is empty")
-	}
-}
-
-func TestRawHex(t *testing.T) {
-	if got := decodePDO(0, fixed9V3A).RawHex(); got != "0x0002D12C" {
-		t.Errorf("RawHex() = %q, want 0x0002D12C", got)
-	}
-}
-
-func TestSummaryReportsCableFault(t *testing.T) {
-	l, err := Parse(buildLog(28000, 0, 2, 1, 0, 0, fixed5V3A, eprAVSBad))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	s := l.Summary()
-	if !strings.Contains(s, "EPR cable fail: yes") {
-		t.Errorf("Summary() does not report the cable fault:\n%s", s)
-	}
-	if !strings.Contains(s, "EPR cable fault]") {
-		t.Errorf("Summary() does not mark the invalid APDO:\n%s", s)
-	}
-}
-
-func TestSummaryDisclosesCableBound(t *testing.T) {
-	// The table must show what can be drawn, not what the source claims, and
-	// must say that it did so.
-	l := simpleLog(t, fixed9V1023A, sprAVS1023A)
-	s := l.Summary()
-	if strings.Contains(s, "10.23 A\n") {
-		t.Errorf("Summary() presents the unbounded 10.23 A as available:\n%s", s)
-	}
-	for _, want := range []string{"5.00 A", "source declares 10.23 A", "no cable carries over 5.00 A"} {
-		if !strings.Contains(s, want) {
-			t.Errorf("Summary() missing %q:\n%s", want, s)
-		}
-	}
-	// A source within the ceiling gets no note.
-	if s := simpleLog(t, fixed9V3A).Summary(); strings.Contains(s, "source declares") {
-		t.Errorf("Summary() annotated a PDO that was never bounded:\n%s", s)
-	}
-}
-
-func TestPDOString(t *testing.T) {
-	p := decodePDO(2, fixed9V3A)
-	if got := p.String(); !strings.Contains(got, "fixed") || !strings.Contains(got, "9.00 V") {
-		t.Errorf("PDO.String() = %q", got)
 	}
 }

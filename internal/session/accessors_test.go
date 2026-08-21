@@ -339,9 +339,10 @@ func TestDecodeRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAuthLockReadsBothBytes covers the one asymmetric command: the vendor
-// parser takes the level from payload offset 1, and that path has never run
-// against hardware, so the raw payload must come back too (SPEC.md §6.3).
+// TestAuthLockReadsBothBytes covers the one asymmetric command: the level comes
+// from payload offset 1, as the vendor parser and then hardware both have it,
+// and the raw payload comes back too because byte 0 is an undocumented echo
+// (SPEC.md §6.3, §14.8).
 func TestAuthLockReadsBothBytes(t *testing.T) {
 	t.Run("two byte payload uses offset 1", func(t *testing.T) {
 		s, d := newTestSession(t, Options{})
@@ -359,27 +360,51 @@ func TestAuthLockReadsBothBytes(t *testing.T) {
 		}
 	})
 
-	t.Run("one byte payload falls back to offset 0", func(t *testing.T) {
+	// The frame a real unit sent (SPEC.md §14.8): byte 0 is the command code
+	// echoed a second time, byte 1 the level. Pinned literally so that a future
+	// reader who suspects the offset again has the measurement in the test file
+	// rather than only in the spec.
+	t.Run("the measured hardware payload reads level 0", func(t *testing.T) {
 		s, d := newTestSession(t, Options{})
-		d.SetResponse(proto.CmdAuthLock, []byte{0x03})
+		d.SetResponse(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), proto.AuthLockUnlocked})
 
 		level, raw, err := s.AuthLock(context.Background())
 		if err != nil {
 			t.Fatalf("AuthLock: %v", err)
 		}
-		if level != 0x03 {
-			t.Errorf("level = %d, want 3", level)
+		if level != proto.AuthLockUnlocked {
+			t.Errorf("level = %d, want 0; reading offset 0 would report the echoed command code 22", level)
 		}
-		if len(raw) != 1 {
-			t.Errorf("raw = % x, want one byte", raw)
+		if len(raw) != 2 || raw[0] != byte(proto.CmdAuthLock) {
+			t.Errorf("raw = % x, want 16 00", raw)
 		}
 	})
 
-	t.Run("empty payload is an error", func(t *testing.T) {
-		s, d := newTestSession(t, Options{})
-		d.SetResponse(proto.CmdAuthLock, nil)
-		if _, _, err := s.AuthLock(context.Background()); err == nil {
-			t.Fatal("want an error for an empty authlock payload")
+	// A payload too short to hold the level used to be read as [level] on the
+	// theory that a one-byte answer could only be the symmetric write layout.
+	// The measured layout refutes that: one byte is the echo alone, so guessing
+	// would report 22 as the lock level. Error instead -- Info leaves the field
+	// nil, which is the honest "not read".
+	t.Run("a payload too short for the level is an error", func(t *testing.T) {
+		for _, payload := range [][]byte{nil, {byte(proto.CmdAuthLock)}} {
+			s, d := newTestSession(t, Options{})
+			d.SetResponse(proto.CmdAuthLock, payload)
+
+			level, raw, err := s.AuthLock(context.Background())
+			if err == nil {
+				t.Fatalf("AuthLock(% x) = level %d, want an error rather than a fabricated level", payload, level)
+			}
+			// The device did answer -- this is the decode refusing the shape,
+			// not the command going unanswered. Without this the empty-payload
+			// case would pass on a timeout alone.
+			if !strings.Contains(err.Error(), "decode authlock") {
+				t.Errorf("error = %v, want the authlock decode to name the short payload", err)
+			}
+			// The payload still comes back, so an operator can see what the
+			// device actually said.
+			if len(raw) != len(payload) {
+				t.Errorf("raw = % x, want the %d-byte payload returned alongside the error", raw, len(payload))
+			}
 		}
 	})
 }

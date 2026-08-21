@@ -280,9 +280,13 @@ func VLimitUsable(lowMv, highMv uint16) bool { return highMv > lowMv }
 //
 // The lock is the least understood command in the protocol: the write puts the
 // level in the first payload byte while the vendor's reader takes the second,
-// only level 0 ("unlocked") is named anywhere, and the read path has zero
-// callers so it was never exercised (SPEC.md §6.3, §14.8). Writing a non-zero
-// level is therefore an experiment, and is labelled as one.
+// and only level 0 ("unlocked") is named anywhere. Bring-up settled the layout
+// and nothing else -- `tx 02 16` answered `rx 04 16 16 00`, a [0x16, level]
+// payload, so the vendor's payload[1] was never an off-by-one (SPEC.md §14.8).
+// The read still has zero callers in the vendor client, and no level above 0
+// has ever been written to a unit, so what the other levels gate and how to get
+// back out of one remain open (SPEC.md §6.3, §14.8). Writing a non-zero level
+// is therefore an experiment, and is labelled as one.
 func CheckAuthLock(level int) Decision {
 	var d Decision
 	if level < 0 || level > 255 {
@@ -361,8 +365,10 @@ func CheckFlash(pages int, version string, crcKnown, force bool) Decision {
 // Reads of documented commands are harmless. A write frame stores something in
 // non-volatile memory with no range checking whatsoever, an undocumented
 // command code does something nobody has characterised (SPEC.md §14.5), and the
-// scratchpad flag is never set by the vendor app so its volatile-versus-
-// committed meaning is unknown (SPEC.md §5.1).
+// scratchpad flag is never set by the vendor app: on the one unit measured it
+// makes a write validate and then vanish -- acknowledged, echoed back, never
+// committed (SPEC.md §14.4). That last one still warrants a prompt precisely
+// because it succeeds: the user gets a clean response and no stored value.
 func CheckRawFrame(f proto.Frame) Decision {
 	var d Decision
 	var reasons []string
@@ -376,8 +382,9 @@ func CheckRawFrame(f proto.Frame) Decision {
 		reasons = append(reasons, fmt.Sprintf("command code %d is outside the known table", uint8(f.Cmd)))
 	}
 	if f.Scratchpad {
-		reasons = append(reasons, "the scratchpad flag is set; the vendor app never sets it and its "+
-			"volatile-vs-committed meaning is unknown (SPEC.md §5.1)")
+		reasons = append(reasons, "the scratchpad flag is set; the vendor app never sets it, and on the "+
+			"one unit measured such a write is acknowledged and echoed back but never committed, so "+
+			"this frame will look like it succeeded and change nothing (SPEC.md §14.4)")
 	}
 	// Some commands are disruptive with no write flag set, so the checks above
 	// miss them entirely. `raw 02 14` is the clearest case: a plain read frame,

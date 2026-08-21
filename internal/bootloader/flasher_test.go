@@ -26,6 +26,10 @@ type fakeBulk struct {
 	// inErr, when set, fails every IN read with that error, standing in for a
 	// transport-level failure such as the device leaving the bus.
 	inErr error
+	// inZero, when set, completes every IN read with no bytes and no error —
+	// which is what usbfs reports for a zero-length bulk packet, and what a
+	// device emitting them continuously looks like from here.
+	inZero bool
 	// inReads counts IN transfer attempts, so a test can assert that a fatal
 	// error aborted the wait instead of being polled through.
 	inReads int
@@ -45,6 +49,9 @@ func (f *fakeBulk) Transfer(ctx context.Context, endpoint uint8, data []byte, _ 
 	f.inReads++
 	if f.inErr != nil {
 		return 0, f.inErr
+	}
+	if f.inZero {
+		return 0, nil
 	}
 	if len(f.inQueue) == 0 {
 		return 0, errNothingToRead
@@ -277,6 +284,27 @@ func TestAwaitACKFailsFastWhenDeviceGone(t *testing.T) {
 	}
 }
 
+// A read that completes with nothing to show for it is as unproductive as one
+// that fails, and must be paced the same way. usbfs reports a zero-length bulk
+// packet as (0, nil), so a device emitting them continuously used to spin the
+// wait at ioctl rate for the whole budget — one core pinned for up to
+// VerifyTimeout — with none of the backoff the error branch has always applied.
+func TestAwaitACKBacksOffOnEmptyReads(t *testing.T) {
+	t.Parallel()
+	const budget = 50 * time.Millisecond
+	dev := &fakeBulk{inZero: true}
+	f := newTestFlasher(dev)
+	if _, err := f.awaitACK(t.Context(), proto.CmdBootloaderVerify, budget); !errors.Is(err, ErrACKTimeout) {
+		t.Fatalf("error = %v, want an ACK timeout", err)
+	}
+	// One read per ackRetryPause, plus slack for a coarse sleep. Without the
+	// backoff this runs into the tens of thousands.
+	if limit := int(budget/ackRetryPause) + 5; dev.inReads > limit {
+		t.Errorf("device polled %d times in %s, want at most %d: the wait is not backing off",
+			dev.inReads, budget, limit)
+	}
+}
+
 // An all-zero bulk packet — classic noise — leniently parses as command code
 // 0, which is CMD_BOOTLOADER_WRITE_CHUNK; it must not satisfy the wait for a
 // WRITE_CHUNK acknowledgement, or the paced ACK-mode re-flash after a CRC
@@ -359,6 +387,38 @@ func TestVerifySendsWriteThenReadForm(t *testing.T) {
 	}
 }
 
+// Both forms of CMD_BOOTLOADER_VERIFY mask to the same command code, so an
+// acknowledgement of the write form satisfies the wait even though it carries
+// no CRC byte. Whether a real unit answers the write form is unmeasured
+// (SPEC.md §14.16), but a device that does must not be able to spend an attempt
+// on it: with only two attempts, two such frames would report a perfectly
+// flashed unit as unverifiable and leave the operator re-flashing forever.
+func TestVerifyKeepsWaitingAfterAWriteFormAcknowledgement(t *testing.T) {
+	t.Parallel()
+	dev := &fakeBulk{respond: func(out []byte) [][]byte {
+		if proto.Cmd(out[1]&proto.CmdCodeMask) != proto.CmdBootloaderVerify {
+			return nil
+		}
+		if out[1]&proto.FlagWrite != 0 {
+			return [][]byte{{0x02, 0x82}} // acknowledged, but no CRC yet
+		}
+		return [][]byte{{0x03, 0x02, 0x5A}}
+	}}
+	f := newTestFlasher(dev)
+	crc, err := f.Verify(t.Context())
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if crc != 0x5A {
+		t.Errorf("crc = 0x%02x, want 0x5A", crc)
+	}
+	// The CRC arrived inside the first round, so the pair was sent once. Two
+	// pairs would mean the write-form ack had cost an attempt.
+	if len(dev.sent) != 2 {
+		t.Errorf("sent %d frames, want 2: the write-form acknowledgement spent an attempt", len(dev.sent))
+	}
+}
+
 func TestVerifyRetriesThenFails(t *testing.T) {
 	t.Parallel()
 	dev := &fakeBulk{}
@@ -417,8 +477,8 @@ func TestNewFlasherWithoutDevice(t *testing.T) {
 	if err := f.JumpToApp(t.Context()); err == nil {
 		t.Fatal("expected an error with no device")
 	}
-	if _, err := ReadSerial(t.Context(), nil, usbfs.Interface{}); err == nil {
-		t.Fatal("ReadSerial: expected an error with no device")
+	if _, err := f.Serial(t.Context()); err == nil {
+		t.Fatal("Serial: expected an error with no device")
 	}
 }
 

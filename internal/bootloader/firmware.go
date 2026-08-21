@@ -118,11 +118,14 @@ func validatePageSize(pageSize int) error {
 
 // LoadOptions tunes how an image file is interpreted.
 type LoadOptions struct {
-	// PageSize is the page geometry imposed on a raw binary image. Zero means
-	// DefaultPageSize. Exposed so the CLI can offer --page-size.
+	// PageSize is the page geometry imposed on an image that arrives without
+	// one. Zero means DefaultPageSize. Exposed so the CLI can offer
+	// --page-size.
 	//
-	// A JSON payload that carries its own page split ignores this value, but a
-	// non-zero value is still validated on every path: a caller asking for a
+	// Only a payload whose pages arrive already split ignores this value; a
+	// JSON document that is one string or one flat array of bytes carries no
+	// geometry of its own and is split on it exactly like a raw .bin. A
+	// non-zero value is also validated on every path: a caller asking for a
 	// geometry the wire format cannot express has made a mistake worth naming,
 	// and silently ignoring it is how that mistake survives to the next image.
 	PageSize int
@@ -177,8 +180,12 @@ func ParseImage(data []byte, opts LoadOptions) (*Firmware, error) {
 	case trimmed[0] == '{':
 		return ParseJSONPayload(trimmed)
 	case trimmed[0] == '[':
-		// A bare pages array, with no version or CRC alongside it.
-		pages, err := normalisePages(trimmed, 0)
+		// A bare pages array, with no version or CRC alongside it. The stated
+		// geometry is passed through rather than dropped: when the array turns
+		// out to be a flat list of byte values it has no page split of its own,
+		// so this is the same situation as a raw .bin and the caller's
+		// --page-size is the only geometry there is.
+		pages, err := normalisePages(trimmed, opts.PageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -241,13 +248,13 @@ func ParseJSONPayload(data []byte) (*Firmware, error) {
 		return nil, fmt.Errorf("%w: not valid JSON: %w", ErrBadPageLength, err)
 	}
 	raw := p.AppBin
-	if len(raw) == 0 {
+	if !rawPresent(raw) {
 		raw = p.AppBinData
 	}
-	if len(raw) == 0 {
+	if !rawPresent(raw) {
 		raw = p.Firmware
 	}
-	if len(raw) == 0 {
+	if !rawPresent(raw) {
 		return nil, fmt.Errorf("%w: none of app_bin, app_bin_data or firmware is present", ErrBadPageLength)
 	}
 	pages, err := normalisePages(raw, p.PageSize)
@@ -263,6 +270,21 @@ func ParseJSONPayload(data []byte) (*Firmware, error) {
 		return nil, err
 	}
 	return newFirmware(pages, version, crc, crcKnown)
+}
+
+// rawPresent reports whether a payload key holds a value worth looking at.
+//
+// A json.RawMessage is empty only when the key was absent altogether: a key
+// written as null is present, and encoding/json stores the four bytes "null"
+// verbatim. So a length test alone lets {"app_bin":null,"app_bin_data":[...]}
+// — what any serializer that renders unused optional fields rather than
+// omitting them produces — stop the three-key fallback (SPEC.md §10.3) at the
+// first key and report "firmware payload has no pages" about a payload whose
+// pages are right there under the second. decodeCRC has always read null as
+// absent; the pages selection now agrees with it.
+func rawPresent(m json.RawMessage) bool {
+	t := bytes.TrimSpace(m)
+	return len(t) > 0 && !bytes.Equal(t, []byte("null"))
 }
 
 // decodeCRC accepts the crc field as a JSON number, a decimal string, or a
@@ -335,6 +357,26 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 		return splitFlat(b, pageSize)
 	}
 
+	// The page ceiling applies here, before the second slice is sized and
+	// before a single page is decoded — the same before-you-allocate discipline
+	// validatePageSize follows, and for the same reason: the element count
+	// comes from outside, and only the JSON *document* is bounded by
+	// MaxMessageBytes, never the number of things inside it. Three bytes of
+	// "[]," per element buy a 24-byte slice header here plus another 24 in the
+	// decoded slice, so an 8 MiB message of empty pages used to cost a few
+	// hundred megabytes and millions of decodePage calls before newFirmware
+	// rejected it for exactly this. It cannot move above the flat-array branch:
+	// there the elements are bytes, not pages, and an image larger than
+	// MaxPages bytes is perfectly ordinary.
+	//
+	// The wording is deliberately identical to newFirmware's, so the same
+	// violation reads the same way whether it is caught here or there.
+	if len(elems) > MaxPages {
+		return nil, fmt.Errorf("%w: image has %d pages but the WRITE_CHUNK page id is a 16-bit "+
+			"field, so at most %d can be addressed; page %d would wrap onto page 0",
+			ErrBadPageLength, len(elems), MaxPages, MaxPages)
+	}
+
 	pages := make([][]byte, 0, len(elems))
 	for i, e := range elems {
 		page, err := decodePage(e)
@@ -404,7 +446,9 @@ func decodeByteArray(raw json.RawMessage) ([]byte, error) {
 // payloads are number arrays or proper hex dumps (SPEC.md §10.3), and refusing
 // an ambiguous image beats flashing garbage. Only strings containing a non-hex
 // character try the base64 alphabets, and a failure there reports both
-// interpretations.
+// interpretations. A leading "0x" is honoured as a hex marker only when what
+// follows it is hex; otherwise those two characters are payload like any
+// others.
 func decodeByteString(s string) ([]byte, error) {
 	var sb strings.Builder
 	sb.Grow(len(s))
@@ -421,21 +465,32 @@ func decodeByteString(s string) ([]byte, error) {
 	if clean == "" {
 		return nil, fmt.Errorf("%w: page string is empty", ErrBadPageLength)
 	}
-	if lower := strings.ToLower(clean); strings.HasPrefix(lower, "0x") {
-		clean = clean[2:]
+	// A "0x" marker is stripped inside the hex branch, never ahead of the
+	// discrimination. '0' and 'x' are both members of every base64 alphabet
+	// tried below, so stripping first silently truncated any base64 page whose
+	// encoding happens to begin "0x" — roughly one page in 4096 — and returned
+	// bytes offset from the real image by a byte and a half. A flat image has
+	// no per-page equality constraint to trip over it, so on the no-CRC --force
+	// path that is precisely the silent corruption the odd-length gate above
+	// exists to prevent.
+	hexBody := clean
+	if len(clean) >= 2 && clean[0] == '0' && (clean[1] == 'x' || clean[1] == 'X') {
+		hexBody = clean[2:]
 	}
-	nonHex := firstNonHex(clean)
-	if nonHex < 0 {
-		if len(clean)%2 != 0 {
+	if hexBody != "" && firstNonHex(hexBody) < 0 {
+		if len(hexBody)%2 != 0 {
 			return nil, fmt.Errorf("%w: odd-length hex string (%d digits); the image is likely truncated",
-				ErrBadPageLength, len(clean))
+				ErrBadPageLength, len(hexBody))
 		}
-		b, err := hex.DecodeString(clean)
+		b, err := hex.DecodeString(hexBody)
 		if err != nil {
 			return nil, fmt.Errorf("%w: hex page: %w", ErrBadPageLength, err)
 		}
 		return b, nil
 	}
+	// The base64 attempts see the string the caller wrote, prefix included:
+	// what looked like a marker was never a marker if the rest is not hex.
+	nonHex := firstNonHex(clean)
 	for _, enc := range []*base64.Encoding{
 		base64.StdEncoding, base64.RawStdEncoding,
 		base64.URLEncoding, base64.RawURLEncoding,

@@ -2,7 +2,9 @@ package proto
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -118,19 +120,22 @@ func TestBuildLimits(t *testing.T) {
 }
 
 // TestParseLenient reproduces the vendor client's tolerance of a bogus length
-// byte: it falls back to the bytes actually received rather than rejecting.
+// byte (SPEC.md §5.2): it falls back to the bytes actually received rather than
+// rejecting. DeclaredValid is the only record that the fallback fired, so every
+// row pins it alongside the payload.
 func TestParseLenient(t *testing.T) {
 	tests := []struct {
 		name        string
 		raw         []byte
 		wantPayload []byte
+		wantValid   bool
 	}{
-		{"exact", []byte{0x04, 0x12, 0x2E, 0xE0}, []byte{0x2E, 0xE0}},
-		{"declared shorter, truncates", []byte{0x03, 0x12, 0x2E, 0xE0}, []byte{0x2E}},
-		{"declared longer, uses buffer", []byte{0x09, 0x12, 0x2E, 0xE0}, []byte{0x2E, 0xE0}},
-		{"declared zero, uses buffer", []byte{0x00, 0x12, 0x2E, 0xE0}, []byte{0x2E, 0xE0}},
-		{"declared one, uses buffer", []byte{0x01, 0x12, 0x2E}, []byte{0x2E}},
-		{"minimum frame", []byte{0x02, 0x12}, []byte{}},
+		{"exact", []byte{0x04, 0x12, 0x2E, 0xE0}, []byte{0x2E, 0xE0}, true},
+		{"declared shorter, truncates", []byte{0x03, 0x12, 0x2E, 0xE0}, []byte{0x2E}, true},
+		{"declared longer, uses buffer", []byte{0x09, 0x12, 0x2E, 0xE0}, []byte{0x2E, 0xE0}, false},
+		{"declared zero, uses buffer", []byte{0x00, 0x12, 0x2E, 0xE0}, []byte{0x2E, 0xE0}, false},
+		{"declared one, uses buffer", []byte{0x01, 0x12, 0x2E}, []byte{0x2E}, false},
+		{"minimum frame", []byte{0x02, 0x12}, []byte{}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -141,10 +146,56 @@ func TestParseLenient(t *testing.T) {
 			if !bytes.Equal(f.Payload, tc.wantPayload) {
 				t.Errorf("payload = %s, want %s", Hex(f.Payload), Hex(tc.wantPayload))
 			}
+			if f.DeclaredValid != tc.wantValid {
+				t.Errorf("DeclaredValid = %v, want %v", f.DeclaredValid, tc.wantValid)
+			}
+			if f.DeclaredLen != int(tc.raw[0]) {
+				t.Errorf("DeclaredLen = %d, want %d", f.DeclaredLen, tc.raw[0])
+			}
 		})
 	}
 	if _, err := Parse([]byte{0x02}); !errors.Is(err, ErrShortFrame) {
 		t.Errorf("Parse(1 byte) error = %v, want ErrShortFrame", err)
+	}
+}
+
+// TestParseDeclaredValidIsTheOnlySignal pins why Frame carries the flag at all.
+// Parse's doc used to tell callers to compare the buffer length against the
+// returned frame size; that recipe is exactly inverted, and these two frames are
+// the proof. Noise passes it and a good frame fails it, while DeclaredValid gets
+// both right.
+func TestParseDeclaredValidIsTheOnlySignal(t *testing.T) {
+	// Pure line noise. CmdBootloaderWriteChunk is command code 0, so an
+	// all-zero buffer parses as a well-formed WRITE_CHUNK frame whose payload
+	// happens to run to the end of the buffer.
+	noise := make([]byte, 64)
+	f, err := Parse(noise)
+	if err != nil {
+		t.Fatalf("Parse(all zero): %v", err)
+	}
+	if f.Cmd != CmdBootloaderWriteChunk {
+		t.Errorf("all-zero buffer parsed as %v, want CMD_BOOTLOADER_WRITE_CHUNK", f.Cmd)
+	}
+	if len(f.Payload)+PreambleLen != len(noise) {
+		t.Errorf("size check on noise: %d != %d -- the inverted recipe no longer reproduces",
+			len(f.Payload)+PreambleLen, len(noise))
+	}
+	if f.DeclaredValid {
+		t.Error("DeclaredValid = true for an all-zero buffer, want false")
+	}
+
+	// A legitimate 2-byte read response with two bytes of trailing padding,
+	// which is what a bulk read padded to the endpoint packet size looks like.
+	padded := []byte{0x02, 0x12, 0xFF, 0xFF}
+	f, err = Parse(padded)
+	if err != nil {
+		t.Fatalf("Parse(padded): %v", err)
+	}
+	if len(f.Payload)+PreambleLen == len(padded) {
+		t.Error("size check on a padded frame: sizes agree -- the inverted recipe no longer reproduces")
+	}
+	if !f.DeclaredValid {
+		t.Error("DeclaredValid = false for a well-formed padded frame, want true")
 	}
 }
 
@@ -315,7 +366,8 @@ func TestCmdNames(t *testing.T) {
 		}
 	}
 	// The commands whose payload format was never determined must be flagged,
-	// so the CLI can refuse to emit them without an explicit override.
+	// so the raw escape hatch can name the code and confirm before sending it
+	// (SPEC.md §13.10).
 	for _, c := range []Cmd{CmdReserved0, CmdReserved1, CmdReserved2, CmdReserved3,
 		CmdFlashLEDSeqAdvanced, CmdFlashLED, CmdEncryptMsg, CmdIOSHostModeFlag} {
 		if !c.Undocumented() {
@@ -344,6 +396,28 @@ func TestStringLen(t *testing.T) {
 	}
 	if _, ok := StringLen(CmdVoltageMv); ok {
 		t.Error("StringLen(CmdVoltageMv) reported string-valued")
+	}
+}
+
+// TestDeviceInfoLEDJSONName guards the one place --json deliberately departs
+// from SPEC.md §8's field names. The wire field is
+// led_disable_during_operation, a u8 whose sense is inverted; SPEC.md §6.2 warns
+// that naming the user-facing setting after it gets it read backwards, and a
+// JSON key that means the opposite of what it says is the same trap for a
+// machine consumer. Renaming this key back would leave every reader configuring
+// a lit LED while believing it suppressed.
+func TestDeviceInfoLEDJSONName(t *testing.T) {
+	on := true
+	b, err := json.Marshal(DeviceInfo{LEDAlwaysOn: &on})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if !strings.Contains(got, `"led_always_on":true`) {
+		t.Errorf("--json object = %s, want it to carry \"led_always_on\":true", got)
+	}
+	if strings.Contains(got, "led_disable_during_operation") {
+		t.Errorf("--json object = %s, want no inverted wire name", got)
 	}
 }
 
@@ -389,6 +463,12 @@ func FuzzParse(f *testing.F) {
 		}
 		if uint8(fr.Cmd) > CmdCodeMask {
 			t.Fatalf("command code %d exceeds the 6-bit mask", fr.Cmd)
+		}
+		// When the declared length was honoured it must describe the frame
+		// exactly; that is what DeclaredValid asserts.
+		if fr.DeclaredValid && fr.DeclaredLen != len(fr.Payload)+PreambleLen {
+			t.Fatalf("DeclaredValid with declared %d but %d payload bytes",
+				fr.DeclaredLen, len(fr.Payload))
 		}
 	})
 }

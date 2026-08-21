@@ -108,6 +108,13 @@ var (
 	ErrCRCMismatch = errors.New("bootloader: firmware CRC mismatch")
 	// ErrACKTimeout reports that no matching acknowledgement arrived.
 	ErrACKTimeout = errors.New("bootloader: timed out waiting for acknowledgement")
+	// ErrVerifyNoCRC reports a CMD_BOOTLOADER_VERIFY answer that carried no CRC
+	// byte. It is a distinct outcome from ErrACKTimeout and a more useful one:
+	// the device did answer, it just answered the write form. Verify keeps it in
+	// preference to the timeout the round then ends in, because "it replied
+	// without a CRC" and "nothing arrived at all" send a user to different
+	// places.
+	ErrVerifyNoCRC = errors.New("bootloader: verify response carried no CRC byte")
 	// ErrNoEndpoints reports an interface without both an IN and an OUT
 	// endpoint, which cannot carry the bootloader protocol.
 	ErrNoEndpoints = errors.New("bootloader: interface has no IN/OUT endpoint pair")
@@ -246,12 +253,25 @@ func (f *Flasher) awaitACK(ctx context.Context, want proto.Cmd, budget time.Dura
 			}
 			continue
 		}
+		// A read that returns nothing, or bytes too short to be a frame, is as
+		// unproductive as a failed one, so it earns the same backoff. usbfs
+		// reports a zero-length bulk packet as (0, nil), not as an error, so
+		// without this a device emitting them continuously spins one core at
+		// ioctl rate for the whole budget — up to VerifyTimeout across the
+		// verify attempts — which is exactly what ackRetryPause exists to
+		// prevent on the error branch above.
 		if n == 0 {
+			if err := f.pause(ctx, ackRetryPause); err != nil {
+				return Response{}, err
+			}
 			continue
 		}
 		resp, err := ParseResponse(buf[:n])
 		if err != nil {
 			lastErr = err
+			if err := f.pause(ctx, ackRetryPause); err != nil {
+				return Response{}, err
+			}
 			continue
 		}
 		// Match only a strictly well-formed frame: declared length within
@@ -408,23 +428,44 @@ func (f *Flasher) Verify(ctx context.Context) (crc uint8, err error) {
 		if budget <= 0 {
 			break
 		}
-		resp, err := f.awaitACK(ctx, proto.CmdBootloaderVerify, budget)
-		if err != nil {
-			// awaitACK already fails fast when the device leaves the bus;
-			// swallowing that into a retry would spend another round pause and
-			// a doomed send on a unit that is definitively gone. Only a
-			// silent-but-present device earns the next attempt.
-			if errors.Is(err, usbfs.ErrNoDevice) {
-				return 0, fmt.Errorf("bootloader: verify: %w", err)
+		// Both forms of CMD_BOOTLOADER_VERIFY mask to the same command code, so
+		// an acknowledgement of the *write* form — a bare [0x02, 0x82], no CRC
+		// byte — satisfies awaitACK's match. Whether a real unit answers the
+		// write form at all is unmeasured (SPEC.md §14.16: no unit has been put
+		// into its bootloader), so one that does must not be able to spend an
+		// attempt on it: keep listening inside the same round, where the CRC
+		// frame the read form was sent for is still to come. Only a round that
+		// ends without one moves on.
+		roundEnd := time.Now().Add(budget)
+		for {
+			remaining := time.Until(roundEnd)
+			if remaining <= 0 {
+				break
 			}
-			lastErr = err
-			continue
+			resp, err := f.awaitACK(ctx, proto.CmdBootloaderVerify, remaining)
+			if err != nil {
+				// awaitACK already fails fast when the device leaves the bus;
+				// swallowing that into a retry would spend another round pause
+				// and a doomed send on a unit that is definitively gone. Only a
+				// silent-but-present device earns the next attempt.
+				if errors.Is(err, usbfs.ErrNoDevice) {
+					return 0, fmt.Errorf("bootloader: verify: %w", err)
+				}
+				// A round that already saw a CRC-less answer ends in a timeout by
+				// construction -- the loop keeps listening for the CRC frame until
+				// the round's budget runs out -- so overwriting the cause here
+				// would replace the one thing observed about the device with the
+				// silence that necessarily followed it.
+				if !errors.Is(lastErr, ErrVerifyNoCRC) {
+					lastErr = err
+				}
+				break
+			}
+			if resp.HasCRC {
+				return resp.CRC, nil
+			}
+			lastErr = fmt.Errorf("%w (%s)", ErrVerifyNoCRC, proto.Hex(resp.Raw))
 		}
-		if !resp.HasCRC {
-			lastErr = fmt.Errorf("bootloader: verify response carried no CRC byte (%s)", proto.Hex(resp.Raw))
-			continue
-		}
-		return resp.CRC, nil
 	}
 	if lastErr == nil {
 		lastErr = ErrACKTimeout

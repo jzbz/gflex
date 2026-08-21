@@ -19,7 +19,7 @@
     "frame": "0209",
     "midi": "800000 900002 900009 a00000",
     "usbmidi": "08800000 09900002 09900009 0aa00000",
-    "note": "Never issued by the vendor app; the frame is constructible but the firmware's willingness to answer is unverified."
+    "note": "Never issued by the vendor app, but the firmware answers it: a real unit returned a 16-byte payload (SPEC.md §14, \"Corrections this produced\"), not the 8 §6.4's table claims."
   },
   {
     "name": "read hardware id",
@@ -212,7 +212,7 @@
     "frame": "0216",
     "midi": "800000 900002 900106 a00000",
     "usbmidi": "08800000 09900002 09900106 0aa00000",
-    "note": "The read layout is unverified: the vendor client takes the level from the SECOND payload byte while the write puts it in the first (§6.3)."
+    "note": "The read answers [0x16, level] -- the command code echoed a second time, then the level (SPEC.md §14, question 8: tx 02 16 -> rx 04 16 16 00). The vendor client's SECOND payload byte was never an off-by-one; the write still puts the level in the FIRST (§6.3)."
   },
   {
     "name": "write authlock unlocked",

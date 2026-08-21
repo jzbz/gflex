@@ -2,9 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/transport/rawmidi"
 	"github.com/jzbz/gflex/internal/usbfs"
 )
@@ -42,6 +46,70 @@ func TestWarnSolePortFallback(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("warning does not mention %q:\n%s", want, got)
 		}
+	}
+}
+
+// A name-only identification is a weaker claim than a vendor-ID one, and until
+// classify stopped OR-ing the two together they were indistinguishable at the
+// point of use. The warning is what makes the tier visible; without it a port
+// that merely spells "vflex" is opened exactly as silently as a confirmed unit.
+func TestWarnNameOnlyMatch(t *testing.T) {
+	var buf bytes.Buffer
+	app := &App{stderr: &buf}
+	app.warnNameOnlyMatch(rawmidi.PortInfo{
+		Path:    "/dev/snd/midiC1D0",
+		Card:    1,
+		Device:  0,
+		Name:    "vflex clone",
+		IsVFlex: true,
+		// No VendorID: discovery never traced this port to a USB device, so
+		// the name substring is the only thing that identified it.
+	})
+
+	got := buf.String()
+	if got == "" {
+		t.Fatal("a name-only identification produced no warning at all")
+	}
+	for _, want := range []string{
+		"warning",
+		"/dev/snd/midiC1D0",
+		"vflex clone",
+		"name alone",
+		"--port",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning does not mention %q:\n%s", want, got)
+		}
+	}
+}
+
+// The vendor ID is the strong identification, and it is the overwhelmingly
+// common case: warning on it would train the user to ignore the message that
+// matters. A sole-port fallback stays silent here too, because
+// warnSolePortFallback already says strictly more about it.
+func TestWarnNameOnlyMatchSilentWhenConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		port rawmidi.PortInfo
+	}{
+		{"vendor id confirmed it", rawmidi.PortInfo{
+			Path: "/dev/snd/midiC1D0", Name: "Werewolf VFLEX", IsVFlex: true, VendorID: proto.VendorID,
+		}},
+		{"sole-port fallback is another function's message", rawmidi.PortInfo{
+			Path: "/dev/snd/midiC1D0", Name: "Prophet Rev2", Fallback: true,
+		}},
+		{"not a VFLEX at all", rawmidi.PortInfo{
+			Path: "/dev/snd/midiC1D0", Name: "Prophet Rev2",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			app := &App{stderr: &buf}
+			app.warnNameOnlyMatch(tc.port)
+			if got := buf.String(); got != "" {
+				t.Errorf("expected silence, got:\n%s", got)
+			}
+		})
 	}
 }
 
@@ -127,5 +195,50 @@ func TestSelectUSBRefNoMatch(t *testing.T) {
 	}
 	if ok {
 		t.Error("ok=true for a port matching nothing")
+	}
+}
+
+// TestSleepCtxIsACancellationCheckpoint pins the semantics this package's copy
+// of sleepCtx drifted away from.
+//
+// internal/session's copy carries the specification -- a non-positive duration
+// is not a no-op, it returns ctx.Err(), so the call stays a cancellation
+// checkpoint rather than a way to skip one -- and internal/bootloader's copy
+// already agreed. This one returned nil, and the divergence was reachable:
+// --settle takes any duration the user types, `scan` calls sleepCtx with it
+// during the unplug/replug handover, and the guard immediately after
+// (waitForDevice) tests devicePresent() before it consults ctx.Done(). A Ctrl-C
+// landing there was therefore swallowed twice over and the scan carried on.
+func TestSleepCtxIsACancellationCheckpoint(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, d := range []time.Duration{0, -time.Second} {
+		if err := sleepCtx(ctx, d); !errors.Is(err, context.Canceled) {
+			t.Errorf("sleepCtx(cancelled, %v) = %v, want context.Canceled: a non-positive "+
+				"duration must stay a cancellation checkpoint, not skip one", d, err)
+		}
+	}
+}
+
+// The other half: a non-positive duration against a live context still costs
+// nothing and reports no error, so the callers that pass a computed delay of
+// zero on their first iteration are not turned into failures.
+func TestSleepCtxNonPositiveOnALiveContextSucceeds(t *testing.T) {
+	if err := sleepCtx(context.Background(), 0); err != nil {
+		t.Errorf("sleepCtx(live, 0) = %v, want nil", err)
+	}
+}
+
+// And a positive duration is still interruptible rather than slept through.
+func TestSleepCtxPositiveDurationHonoursCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := sleepCtx(ctx, time.Minute); !errors.Is(err, context.Canceled) {
+		t.Errorf("sleepCtx(cancelled, 1m) = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("sleepCtx slept %v on a cancelled context", elapsed)
 	}
 }

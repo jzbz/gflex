@@ -246,15 +246,25 @@ func TestDecoderRunningStatusCancelledBySystemCommon(t *testing.T) {
 	// A system common message cancels running status, so the data bytes that
 	// follow have no status to attach to and must be discarded rather than
 	// appended to the frame.
-	s := []byte{
+	d := NewDecoder()
+	d.Feed([]byte{
 		StatusFrameStart, 0, 0,
 		StatusFrameData, 0x00, 0x02,
-		0xF6,       // tune request: system common, zero data bytes
+		0xF6, // tune request: system common, zero data bytes
+	})
+	// Assert the parser state, not only the frame. message dispatches on
+	// status&0xF0, and every system common byte masks to 0xF0, which matches no
+	// frame status -- so the frame below decodes correctly even with the status
+	// clear removed, and this is the assertion that catches losing it.
+	if d.status != 0 {
+		t.Fatalf("status after tune request = %#02x, want 0 (running status cancelled)", d.status)
+	}
+	frames := d.Feed([]byte{
 		0x0A, 0x0B, // orphaned data bytes
 		StatusFrameData, 0x00, 0x08,
 		StatusFrameEnd, 0, 0,
-	}
-	mustOneFrame(t, feedAll(s), []byte{0x02, 0x08})
+	})
+	mustOneFrame(t, frames, []byte{0x02, 0x08})
 }
 
 func TestDecoderMidFrameStartResetsAccumulator(t *testing.T) {
@@ -327,7 +337,11 @@ func TestDecoderOverlongFrameDispatchesTruncatedPrefix(t *testing.T) {
 
 func TestDecoderOverlongFrameWithOverlongDeclaredLengthIsDropped(t *testing.T) {
 	body := make([]byte, 70)
-	body[0] = 70 // > 64, so the receive path rejects it outright
+	// The accumulator keeps only the first 64 bytes, so the declared length
+	// exceeds what was buffered and that is the clause that rejects the frame;
+	// the MaxFrameLen half of the check cannot fire here, and is pinned by
+	// TestDecoderDeclaredLengthAboveMaxIsRejected instead.
+	body[0] = 70
 	var s []byte
 	s = append(s, StatusFrameStart, 0, 0)
 	for _, b := range body {
@@ -335,6 +349,22 @@ func TestDecoderOverlongFrameWithOverlongDeclaredLengthIsDropped(t *testing.T) {
 	}
 	s = append(s, StatusFrameEnd, 0, 0)
 	if frames := feedAll(s); len(frames) != 0 {
+		t.Fatalf("got %v, want the frame dropped", frames)
+	}
+}
+
+func TestDecoderDeclaredLengthAboveMaxIsRejected(t *testing.T) {
+	// No MIDI stream can produce this state: the accumulator cap keeps
+	// len(acc) <= MaxFrameLen, so the "declared length fits what we buffered"
+	// clause always rejects an over-long declaration first. Reach past the cap
+	// directly -- the test lives in package framer for exactly this -- so that
+	// ValidResponseLen's upper bound is the only guard left. It is the one that
+	// survives if the cap is ever raised (SPEC.md §3.3), and without this it
+	// could be deleted with the whole suite still green.
+	d := NewDecoder()
+	d.acc = make([]byte, proto.MaxFrameLen+1)
+	d.acc[0] = proto.MaxFrameLen + 1
+	if frames := d.Feed([]byte{StatusFrameEnd, 0, 0}); len(frames) != 0 {
 		t.Fatalf("got %v, want the frame dropped", frames)
 	}
 }
@@ -438,14 +468,6 @@ func TestDecoderFramesAreCopies(t *testing.T) {
 	if !bytes.Equal(saved, []byte{0x02, 0x08}) {
 		t.Fatalf("earlier frame was clobbered: %s", proto.Hex(saved))
 	}
-}
-
-func TestDecoderReset(t *testing.T) {
-	d := NewDecoder()
-	d.Feed([]byte{StatusFrameStart, 0, 0, StatusFrameData, 0x0F, 0x0F, StatusFrameData})
-	d.Reset()
-	// A stale partial message and a stale accumulator must both be gone.
-	mustOneFrame(t, d.Feed(EncodeMIDI([]byte{0x02, 0x08})), []byte{0x02, 0x08})
 }
 
 func TestDecoderDropHook(t *testing.T) {

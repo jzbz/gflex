@@ -419,9 +419,13 @@ func allZero(b []byte) bool {
 //
 // usable is what a load may actually draw. declared is the unbounded figure and
 // is non-zero ONLY when the ceiling bit, so callers can test one value to learn
-// both that the verdict was reduced and what the source had claimed. Anything
-// non-finite or non-positive collapses to zero rather than propagating: a
-// corrupt log must not produce a NaN that compares false against every limit.
+// both that the verdict was reduced and what the source had claimed. NaN, zero
+// and negative inputs collapse to zero rather than propagating: a corrupt log
+// must not produce a NaN that compares false against every limit. +Inf is not
+// collapsed — it is over the ceiling, so it takes the clamp like any other
+// over-large figure and the declared half then carries +Inf verbatim. Nothing
+// decoded can reach that: every current Parse produces is a bounded bit-field
+// times a finite scale (SPEC.md §9.4), so only a hand-built PDO can supply one.
 func boundCurrent(a float64) (usable, declared float64) {
 	if math.IsNaN(a) || a <= 0 {
 		return 0, 0
@@ -435,9 +439,13 @@ func boundCurrent(a float64) (usable, declared float64) {
 // round2 rounds to two decimal places.
 //
 // Necessary because none of the wire scale factors (0.05, 0.01, 0.1, 0.25) is
-// exactly representable in binary floating point: 0.05*180 evaluates to
-// 9.000000000000002, which then fails an == comparison against a requested 9 V
-// and prints as noise. Every decoded voltage and current goes through this.
+// exactly representable in binary floating point, so a decoded figure can land
+// beside the value the source meant rather than on it: the 3.3 V floor of a PPS
+// APDO arrives as field 66, and 0.05*66 evaluates to 3.3000000000000003, which
+// prints as noise in the table and serialises as noise in --json. It is not
+// about comparisons — every voltage test in this package carries cmpEps
+// (evaluate.go) — but about the numbers handed out. Every decoded voltage and
+// current goes through this.
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
 // SPRAVSBandSplitV is the boundary between the SPR AVS APDO's two current

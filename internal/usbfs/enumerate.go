@@ -43,11 +43,13 @@ func (r DeviceRef) String() string {
 // of 0 matches every device.
 //
 // Matching on the vendor ID is the authoritative way to find a VFLEX: the
-// vendor app matches MIDI ports by the substring "vflex" in a port name that
-// was never actually observed, whereas 0x37BF appears in the app's own WebUSB
-// filter (SPEC.md §1, §3.4). The product ID is deliberately not matched --
-// it is unknown, and may well differ between application and bootloader mode
-// (SPEC.md §14.1).
+// vendor app matches MIDI ports by the substring "vflex" in the port name,
+// which is an ALSA property a USB device enumeration cannot see at all, whereas
+// 0x37BF appears in the app's own WebUSB filter (SPEC.md §1, §3.4). The product
+// ID is deliberately not matched: it is 0x800F in application mode
+// (SPEC.md §14.1), but what the unit enumerates as in bootloader mode is still
+// unknown (SPEC.md §14.16), and a PID filter would hide exactly the device that
+// firmware recovery has to find.
 func Enumerate(vendorID uint16) ([]DeviceRef, error) {
 	return EnumerateIn(DefaultSysfsRoot, DefaultDevRoot, vendorID)
 }

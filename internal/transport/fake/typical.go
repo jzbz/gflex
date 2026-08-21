@@ -9,8 +9,10 @@ import (
 // Values NewTypical reports, exported so tests can assert against them without
 // repeating string literals.
 const (
-	TypicalSerial     = "VF001234"
-	TypicalChipUUID   = "CU5A1B2C"
+	TypicalSerial = "VF001234"
+	// Sixteen characters, not eight: see the identity-string comment in
+	// NewTypical for why the chip UUID is the one that differs.
+	TypicalChipUUID   = "CU5A1B2C3D4E5F60"
 	TypicalHardwareID = "HW000200"
 	TypicalFirmware   = "5.0.1"
 	TypicalMfgDate    = "20250131"
@@ -36,7 +38,7 @@ const (
 // It reports:
 //
 //	serial number          "VF001234"        (CMD_SERIAL_NUMBER)
-//	chip UUID              "CU5A1B2C"        (CMD_CHIP_UUID)
+//	chip UUID              "CU5A1B2C3D4E5F60" (CMD_CHIP_UUID, 16 bytes)
 //	hardware ID            "HW000200"        (CMD_HARDWARE_ID)
 //	firmware version       "5.0.1"           (CMD_FIRMWARE_VERSION, NUL-padded to 12)
 //	manufacturing date     "20250131"        (CMD_MFG_DATE)
@@ -60,8 +62,10 @@ const (
 //   - CMD_JUMP_APP_TO_BOOTLOADER is answered with silence, because the real
 //     device does not acknowledge it and disconnects instead (SPEC.md §10.1).
 //   - CMD_AUTHLOCK is asymmetric. A write carries the level in the first
-//     payload byte while the vendor's reader takes the second (SPEC.md §6.3),
-//     so a write stores the level in both bytes and either reading agrees.
+//     payload byte, while a read answers with [0x16, level] -- the command code
+//     echoed a second time, then the level (SPEC.md §14, question 8, measured
+//     2026-08-21: tx 02 16 -> rx 04 16 16 00). So the stored register is not
+//     the payload of the write that set it.
 //
 // Erasing the PDO log zeroes it, as it does on hardware, so a scan test that
 // erases first must put a capture back with
@@ -73,10 +77,15 @@ const (
 func NewTypical() *Device {
 	d := New()
 
-	// Identity strings are read-only, NUL-padded to their fixed lengths
-	// (SPEC.md §6.4).
+	// Identity strings are read-only, NUL-padded to their fixed lengths. Those
+	// lengths are proto's stringLen table, which carries the measured ones:
+	// CMD_CHIP_UUID returns 16 bytes ("1732abcd7fc0bcc1" on the unit that was
+	// brought up), not the 8 §6.4's table claims -- see SPEC.md §14,
+	// "Corrections this produced". TypicalChipUUID fills all sixteen so the
+	// fake serves a UUID the shape hardware sends rather than a half-padded
+	// one; the value stays mnemonic so a failing test names itself.
 	d.SetResponse(proto.CmdSerialNumber, padString(TypicalSerial, 8))
-	d.SetResponse(proto.CmdChipUUID, padString(TypicalChipUUID, 8))
+	d.SetResponse(proto.CmdChipUUID, padString(TypicalChipUUID, 16))
 	d.SetResponse(proto.CmdHardwareID, padString(TypicalHardwareID, 8))
 	d.SetResponse(proto.CmdFirmwareVersion, padString(TypicalFirmware, 12))
 	d.SetResponse(proto.CmdMfgDate, padString(TypicalMfgDate, 8))
@@ -100,17 +109,19 @@ func NewTypical() *Device {
 	measure = append(measure, proto.EncodeU16(TypicalMeasuredMv)...)
 	d.SetResponse(proto.CmdVMeasure, measure)
 
-	// AUTHLOCK: store the written level in both payload bytes so that a reader
-	// following the vendor client (payload[1]) and one reading payload[0] both
-	// see the same value while the real layout is unverified.
-	d.StoreRegister(proto.CmdAuthLock, []byte{proto.AuthLockUnlocked, proto.AuthLockUnlocked})
+	// AUTHLOCK: a read answers [0x16, level] -- the command code echoed a
+	// second time, then the level. Measured on hardware (SPEC.md §14, question
+	// 8: tx 02 16 -> rx 04 16 16 00), which also settled that the vendor
+	// client's payload[1] was never an off-by-one. The stored register holds
+	// the read payload verbatim, so byte 0 is the echo and byte 1 the level.
+	d.StoreRegister(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), proto.AuthLockUnlocked})
 	d.SetHandler(proto.CmdAuthLock, func(f proto.Frame) []byte {
 		if f.Write {
 			level := proto.AuthLockUnlocked
 			if len(f.Payload) > 0 {
 				level = f.Payload[0]
 			}
-			d.StoreRegister(proto.CmdAuthLock, []byte{level, level})
+			d.StoreRegister(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), level})
 			return append([]byte{}, f.Payload...) // echo the write, never nil
 		}
 		v, _ := d.Register(proto.CmdAuthLock)

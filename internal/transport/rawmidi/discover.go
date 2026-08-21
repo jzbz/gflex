@@ -17,48 +17,55 @@ import (
 // Card and Device are -1 when they could not be derived from the node name,
 // which only happens for a caller-supplied path that is not a midiC<n>D<m>
 // node (a /dev/snd/by-path alias, say).
+//
+// The fields carry no JSON tags because nothing marshals this type:
+// "gflex devices --json" declares its own struct, since presentation belongs
+// above the transport rather than inside it.
 type PortInfo struct {
-	Path   string `json:"path"`   // /dev/snd/midiC1D0
-	Card   int    `json:"card"`   // ALSA card number, -1 if unknown
-	Device int    `json:"device"` // rawmidi device number on that card, -1 if unknown
-	Name   string `json:"name"`   // ALSA port/card name, best effort
+	Path   string // /dev/snd/midiC1D0
+	Card   int    // ALSA card number, -1 if unknown
+	Device int    // rawmidi device number on that card, -1 if unknown
+	Name   string // ALSA port/card name, best effort
 
 	// VendorID is 0 when the port could not be traced back to a USB device.
-	VendorID uint16 `json:"vendor_id"`
-	// ProductID is the USB product ID. Recording it is the point of the
-	// VID-anchored scan: the VFLEX's PID is not known from any vendor artifact
-	// (SPEC.md §14.1), so whatever a real unit reports here is new information.
-	ProductID uint16 `json:"product_id"`
+	VendorID uint16
+	// ProductID is the USB product ID. A VFLEX in application mode reports
+	// 0x800F (SPEC.md §14.1, measured); the bootloader-mode PID is still
+	// unmeasured, so nothing here matches on it -- the vendor ID is what
+	// identifies the device in both modes.
+	ProductID uint16
 
-	IsVFlex bool `json:"is_vflex"`
+	IsVFlex bool
 
 	// SysPath is the sysfs directory of the owning USB device, when known.
-	SysPath string `json:"sys_path,omitempty"`
+	SysPath string
 
 	// Fallback marks a port that was selected only because it was the single
 	// rawmidi port on the system, with nothing identifying it as a VFLEX. The
 	// vendor app has the same fallback (SPEC.md §3.4); the CLI should warn
 	// rather than silently program an unknown device.
-	Fallback bool `json:"sole_port_fallback,omitempty"`
+	Fallback bool
 }
 
-// USBID renders the USB ids as udev writes them, e.g. "37bf:800f", or "" when
-// the port could not be traced to a USB device.
-func (p PortInfo) USBID() string {
-	if p.VendorID == 0 && p.ProductID == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%04x:%04x", p.VendorID, p.ProductID)
-}
-
-// classify applies the vendor app's identification rule, widened by the USB
-// vendor ID. The app matches only on a lowercase substring of the port name
-// (SPEC.md §3.4) and the name a VFLEX actually advertises is unknown, so the
-// vendor ID -- which is authoritative -- is checked first and the substring is
-// reproduced verbatim as a fallback.
+// classify decides whether a port is a VFLEX.
+//
+// The USB vendor ID is authoritative, so when it is known it is the whole
+// answer: a port whose USB parent is somebody else's is not a VFLEX however it
+// names itself. Only a port with no USB parent at all -- a virtual card, or one
+// whose sysfs walk failed -- falls back to the vendor app's identification
+// rule, a plain lowercase substring of the port name (SPEC.md §3.4).
+//
+// The substring does match a real unit ("Werewolf VFLEX", SPEC.md §14.2), but
+// it is evidence of a different quality: the name is firmware-dependent and
+// anything may call itself a VFLEX. Select therefore also prefers a
+// VID-confirmed port over a name-only one, which is the precedence SPEC.md §3.4
+// prescribes -- vendor ID first, name substring second, sole port last.
 func (p *PortInfo) classify() {
-	p.IsVFlex = p.VendorID == proto.VendorID ||
-		strings.Contains(strings.ToLower(p.Name), proto.PortNameMatch)
+	if p.VendorID != 0 {
+		p.IsVFlex = p.VendorID == proto.VendorID
+		return
+	}
+	p.IsVFlex = strings.Contains(strings.ToLower(p.Name), proto.PortNameMatch)
 }
 
 // scanner holds the filesystem roots discovery reads. Tests point them at a
@@ -97,8 +104,10 @@ const maxSysfsWalk = 8
 //
 // Two passes are merged. The first is anchored on the USB vendor ID: it walks
 // /sys/bus/usb/devices looking for idVendor == 37bf and then finds the rawmidi
-// nodes underneath. This is strictly better than the vendor app's name match,
-// which cannot work reliably because the advertised name is unknown. The second
+// nodes underneath. This is better than the vendor app's name match even now
+// that the advertised name is known ("Werewolf VFLEX", SPEC.md §14.2): that is
+// one unit's firmware, the name is not a protocol constant, and a name match
+// cannot tell a VFLEX from anything else that spells "vflex". The second
 // pass enumerates /dev/snd directly so that non-VFLEX ports (and a VFLEX whose
 // sysfs layout we failed to walk) still appear in "gflex devices".
 //
@@ -222,10 +231,15 @@ func (s *scanner) discoverByVendor() []PortInfo {
 // kernel's rawmidi device name, which /proc/asound/card<N>/midi<D> prints on
 // its first line. The remaining sources name the card rather than the port, so
 // they are only used when that file is absent.
+//
+// Every candidate goes through printableName. The kernel builds these names
+// from the device's own USB string descriptors, so they are device-supplied in
+// exactly the sense the identity strings are (SPEC.md §17) -- this was the one
+// such string in the tree that no filter was applied to.
 func (s *scanner) portName(card, device int) string {
 	if b, err := os.ReadFile(filepath.Join(s.procAsound,
 		fmt.Sprintf("card%d", card), fmt.Sprintf("midi%d", device))); err == nil {
-		if line := firstLine(b); line != "" {
+		if line := printableName(firstLine(b)); line != "" {
 			return line
 		}
 	}
@@ -239,17 +253,39 @@ func (s *scanner) portName(card, device int) string {
 		filepath.Join(fmt.Sprintf("card%d", card), "id"),
 	} {
 		if b, err := os.ReadFile(filepath.Join(s.sysSound, rel)); err == nil {
-			if line := firstLine(b); line != "" {
+			if line := printableName(firstLine(b)); line != "" {
 				return line
 			}
 		}
 	}
 	if b, err := os.ReadFile(filepath.Join(s.procAsound, "cards")); err == nil {
 		if name, ok := parseProcAsoundCards(b)[card]; ok {
-			return name
+			if name := printableName(name); name != "" {
+				return name
+			}
 		}
 	}
 	return ""
+}
+
+// printableName applies the tree's device-string discipline to an ALSA port
+// name: everything outside printable ASCII is dropped, then the result is
+// trimmed.
+//
+// It defers to proto.DecodeString rather than restating the rule, because the
+// rule must not drift between the two: an identity string read over the wire
+// and a port name read out of procfs are the same class of data, both chosen
+// by the device. The objection that kept internal/bootloader from reusing
+// DecodeString -- that converting an unbounded host-side string to []byte to
+// borrow eight lines could copy megabytes -- does not apply here, where the
+// input is one line of a kernel-generated file.
+//
+// What this defends against is an ESC introducing an ANSI control sequence in
+// a USB string descriptor: the name is printed to a terminal by "gflex devices"
+// and by the candidate lists in the errors below, and a device that can clear
+// the screen can hide what discovery actually found.
+func printableName(s string) string {
+	return proto.DecodeString([]byte(s))
 }
 
 // usbIDsForCard walks up from a sound card's sysfs node until it finds the
@@ -284,9 +320,11 @@ func (s *scanner) usbIDsForCard(card int) (vid, pid uint16, sysPath string, ok b
 // A hint beginning with "/" is taken as a device path and used as given.
 // Any other non-empty hint is a case-insensitive substring matched against the
 // port name and the node name. With no hint the single VFLEX-looking port wins;
-// failing that, and only if the system has exactly one rawmidi port at all,
-// that port is used with PortInfo.Fallback set so the caller can warn -- this
-// mirrors the vendor app's sole-port fallback (SPEC.md §3.4).
+// failing that, and only if the system has exactly one rawmidi port at all and
+// that port's USB vendor is unknown, it is used with PortInfo.Fallback set so
+// the caller can warn -- this mirrors the vendor app's sole-port fallback
+// (SPEC.md §3.4), minus the ports sysfs has already identified as somebody
+// else's.
 func OpenAuto(hint string) (proto.Transport, PortInfo, error) {
 	return defaultScanner().openAuto(hint)
 }
@@ -351,11 +389,24 @@ func Select(ports []PortInfo, hint string) (PortInfo, error) {
 		}
 	}
 
-	var vflex []PortInfo
+	// Vendor ID first, name substring second: the precedence SPEC.md §3.4
+	// prescribes and classify records. A port confirmed by the USB vendor ID
+	// outranks one identified only by its name, so a second card that happens
+	// to spell "vflex" -- a loopback given that ALSA id, a sibling product --
+	// cannot turn an unambiguous VFLEX into ErrAmbiguous, and cannot be chosen
+	// over it either.
+	var vflex, confirmed []PortInfo
 	for _, p := range ports {
-		if p.IsVFlex {
-			vflex = append(vflex, p)
+		if !p.IsVFlex {
+			continue
 		}
+		vflex = append(vflex, p)
+		if p.VendorID == proto.VendorID {
+			confirmed = append(confirmed, p)
+		}
+	}
+	if len(confirmed) > 0 {
+		vflex = confirmed
 	}
 	switch {
 	case len(vflex) == 1:
@@ -367,9 +418,21 @@ func Select(ports []PortInfo, hint string) (PortInfo, error) {
 		return PortInfo{}, fmt.Errorf("%w. Check the cable, then \"gflex devices\"; "+
 			"if the unit is in bootloader mode (slow blinking white LED) it exposes no MIDI port", ErrNoPorts)
 	case len(ports) == 1:
-		// Sole-port fallback, as the vendor app does. Flagged, not silent:
-		// nothing here says the device is a VFLEX.
 		p := ports[0]
+		// The sole-port fallback exists for the case where the tool does not
+		// know what the port is, which is not the same as knowing it is not a
+		// VFLEX. Discovery has already walked sysfs for every port, so a
+		// non-zero vendor ID that is not Tundra Labs' is a positive
+		// identification of somebody else's device -- and taking it would open
+		// a synthesizer and start writing protocol frames at it. Refuse; --port
+		// remains the way to say "yes, that one, I mean it".
+		if p.VendorID != 0 && p.VendorID != proto.VendorID {
+			return PortInfo{}, fmt.Errorf("%w: the only MIDI port on this system is %s, whose USB "+
+				"vendor is 0x%04x rather than 0x%04x. Pass --port %s to use it anyway",
+				ErrNotFound, summarise(ports), p.VendorID, proto.VendorID, p.Path)
+		}
+		// Sole-port fallback, as the vendor app does (SPEC.md §3.4). Flagged,
+		// not silent: nothing here says the device is a VFLEX.
 		p.Fallback = true
 		return p, nil
 	default:
@@ -379,6 +442,11 @@ func Select(ports []PortInfo, hint string) (PortInfo, error) {
 }
 
 // summarise renders a candidate list for an error message.
+//
+// The name is quoted, as every other renderer of it quotes it (describePort in
+// internal/cli). portName has already stripped anything unprintable, so this is
+// belt and braces against a Name set by some other route; it also keeps the
+// comma-separated list unambiguous when a device names itself "a, b".
 func summarise(ports []PortInfo) string {
 	if len(ports) == 0 {
 		return "(none)"
@@ -386,7 +454,7 @@ func summarise(ports []PortInfo) string {
 	parts := make([]string, 0, len(ports))
 	for _, p := range ports {
 		if p.Name != "" {
-			parts = append(parts, fmt.Sprintf("%s (%s)", p.Path, p.Name))
+			parts = append(parts, fmt.Sprintf("%s (%q)", p.Path, p.Name))
 			continue
 		}
 		parts = append(parts, p.Path)

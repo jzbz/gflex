@@ -9,5 +9,13 @@
 *.out
 coverage.*
 
-# Fuzz corpora land in GOCACHE; this catches a seed corpus written by hand.
-**/testdata/fuzz/
+# Nothing here ignores testdata/fuzz/, deliberately. An earlier rule did, on the
+# premise that it held generated corpora -- it does not. The corpus `go test
+# -fuzz` generates lives in GOCACHE and never appears in the tree; what Go
+# writes to <pkg>/testdata/fuzz/<Target>/<hash> is the *minimised failing input*
+# from a crash, a few bytes long, which every later plain `go test` replays as a
+# subtest. That file is the regression test for the crash, so it has to be
+# committable: ignoring it would mean a defect found by a fuzz run -- over the
+# usbfs descriptor parser, the USB-MIDI unpacker or the frame decoders, all of
+# which consume bytes from a device the threat model does not trust -- could
+# never be turned into a standing test.

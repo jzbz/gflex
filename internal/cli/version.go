@@ -32,7 +32,12 @@ func newVersionCommand(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return app.run(cmd, func(_ context.Context, f Formatter) error {
 				v, commit, date := buildStamps()
-				f.KV("version", "vflex", v, v)
+				// The label names the program, not the device. These stamps
+				// are gflex's own build identity; the attached unit's firmware
+				// version is a different value read over the wire by
+				// `gflex firmware version` (SPEC.md §6.4), and labelling this
+				// line "vflex" invited the two to be read as one.
+				f.KV("version", "gflex", v, v)
 				if commit != "" {
 					f.KV("commit", "commit", commit, commit)
 				}

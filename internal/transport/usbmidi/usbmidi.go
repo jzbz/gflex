@@ -48,27 +48,34 @@ const (
 	// DefaultWriteTimeout bounds a single OUT transfer. Writes are a handful of
 	// 4-byte packets, so anything short of a wedged device completes at once.
 	DefaultWriteTimeout = 2 * time.Second
-	// defaultPacketSize is the fallback IN buffer size when the endpoint
-	// descriptor reports an implausible wMaxPacketSize. 64 is the full-speed
-	// bulk maximum and what snd-usb-audio uses for USB-MIDI 1.0.
+	// defaultPacketSize is the fallback IN buffer size when the endpoint's
+	// declared maximum packet size cannot hold even one 4-byte event packet.
+	// 64 is the full-speed bulk maximum and what snd-usb-audio uses for
+	// USB-MIDI 1.0.
 	defaultPacketSize = 64
+	// maxPacketSizeMask selects the size bits of wMaxPacketSize; the rest are
+	// the transactions-per-microframe multiplier (USB 2.0 §9.6.6). See bufSize.
+	maxPacketSizeMask = 0x07FF
 	// ctxSlack is added to the transfer timeout when deriving the context
 	// deadline, so the transfer's own timeout fires first and the context
 	// deadline stays a backstop.
 	ctxSlack = 500 * time.Millisecond
 )
 
-// Options tunes an opened transport. The zero value selects the defaults.
+// Options tunes an opened transport. The zero value selects the defaults, which
+// is what both CLI entry points pass; the fields exist so the read and write
+// paths can be tested without waiting out DefaultReadTimeout.
+//
+// There is deliberately no log sink here. One existed to dump the descriptors an
+// unknown unit declared, but nothing ever wired it, and the descriptors have
+// since been recorded from hardware (SPEC.md §14 Q3). What a device declares
+// still reaches the user where it matters: SelectInterface puts Describe's
+// output in the error it returns when nothing matches.
 type Options struct {
 	// ReadTimeout bounds a single IN transfer; zero means DefaultReadTimeout.
 	ReadTimeout time.Duration
 	// WriteTimeout bounds a single OUT transfer; zero means DefaultWriteTimeout.
 	WriteTimeout time.Duration
-	// Log, if non-nil, receives one line per notable open-time decision: the
-	// descriptor summary and the interface that was selected. The VFLEX's real
-	// descriptors are unknown (SPEC.md §14.3), so this is the only way to find
-	// out what a unit actually declares.
-	Log func(string)
 }
 
 func (o Options) withDefaults() Options {
@@ -81,24 +88,26 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-func (o Options) logf(format string, args ...any) {
-	if o.Log != nil {
-		o.Log(fmt.Sprintf(format, args...))
-	}
-}
-
 // SelectInterface picks the interface alt setting to claim for USB-MIDI.
 //
 // The rule from SPEC.md §4.2 is (Class == 0x01 || Class == 0xFF) &&
-// SubClass == 0x03 with both an IN and an OUT endpoint. The vendor class is
-// accepted because the VFLEX's descriptors have never been dumped and the unit
-// is known to expose a vendor-class interface in bootloader mode; a proper
+// SubClass == 0x03 with both an IN and an OUT endpoint. A shipped unit declares
+// MIDIStreaming as audio class 01/03 on interface 1.1, with bulk endpoints 0x83
+// IN and 0x02 OUT and 64-byte packets (SPEC.md §14 Q3, measured on hardware), so
+// that is the interface this rule selects on a healthy device. The vendor class
+// stays accepted as deliberate breadth for firmware that differs, and an
 // audio-class MIDIStreaming interface is preferred when both are present.
+//
+// That unit's vendor-class interface 1.2 is present while the application runs,
+// not only in the bootloader (SPEC.md §14, "Corrections this produced" -- the
+// same mistake the bootloader package had to be fixed for). Its
+// bInterfaceSubClass was not recorded, so whether it is even a candidate here is
+// unknown; it loses to the audio-class interface either way.
 //
 // Endpoint transfer type is deliberately not part of the rule. snd-usb-audio
 // accepts interrupt endpoints for USB-MIDI as readily as bulk ones
 // (midi.c:2006), so hardcoding bulk here would reject a perfectly working
-// device.
+// device, even though the unit measured declares none.
 func SelectInterface(cfg *usbfs.Config) (usbfs.Interface, error) {
 	if cfg == nil {
 		return usbfs.Interface{}, fmt.Errorf("%w: no configuration descriptor", ErrNoMIDIInterface)
@@ -160,7 +169,8 @@ func endpointsFor(iface usbfs.Interface) (in, out usbfs.Endpoint, ok bool) {
 }
 
 // Describe renders a configuration's interfaces and endpoints on one line, for
-// diagnostics and for the error returned when no interface matches.
+// the error returned when no interface matches. That error is how a user reports
+// what a device declared, so it has to carry the whole configuration.
 func Describe(cfg *usbfs.Config) string {
 	if cfg == nil || len(cfg.Interfaces) == 0 {
 		return "(none)"
@@ -191,13 +201,12 @@ func endpointKind(ep usbfs.Endpoint) string {
 }
 
 // Open claims the device's USB-MIDI interface and returns it as a
-// proto.Transport. Use OpenWithOptions to override the transfer timeouts or to
-// see what the descriptors contained.
+// proto.Transport. Use OpenWithOptions to override the transfer timeouts.
 func Open(ref usbfs.DeviceRef) (proto.Transport, error) {
 	return OpenWithOptions(ref, Options{})
 }
 
-// OpenWithOptions is Open with tunable timeouts and an optional log sink.
+// OpenWithOptions is Open with tunable transfer timeouts.
 //
 // It claims the interface with kernel-driver detach, because snd-usb-audio
 // binds to it as soon as the device enumerates. usbfs performs the detach and
@@ -223,17 +232,12 @@ func OpenWithOptions(ref usbfs.DeviceRef, opts Options) (proto.Transport, error)
 	if err != nil {
 		return nil, fmt.Errorf("usbmidi: read descriptors of %s: %w", ref.Path, err)
 	}
-	opts.logf("usbmidi: %s descriptors: %s", ref.Path, Describe(cfg))
 
 	iface, err := SelectInterface(cfg)
 	if err != nil {
 		return nil, err
 	}
 	in, out, _ := endpointsFor(iface) // presence guaranteed by SelectInterface
-	opts.logf("usbmidi: using interface %d alt %d class %02x/%02x, in ep %02x %s mps %d, out ep %02x %s mps %d",
-		iface.Number, iface.Alt, iface.Class, iface.SubClass,
-		in.Address, endpointKind(in), in.MaxPacketSize,
-		out.Address, endpointKind(out), out.MaxPacketSize)
 
 	if err := dev.ClaimInterface(iface.Number, true); err != nil {
 		return nil, fmt.Errorf("usbmidi: claim interface %d on %s: %w", iface.Number, ref.Path, err)
@@ -286,11 +290,22 @@ func OpenAuto() (proto.Transport, usbfs.DeviceRef, error) {
 	return tr, refs[0], nil
 }
 
-// bufSize picks the IN scratch-buffer size: the endpoint's own maximum packet
-// size, or 64 when the descriptor reports something that cannot hold even one
-// 4-byte USB-MIDI event packet.
+// bufSize picks the IN scratch-buffer size from the endpoint's maximum packet
+// size, falling back to 64 when the descriptor reports something that cannot
+// hold even one 4-byte USB-MIDI event packet.
+//
+// Only bits 10:0 of wMaxPacketSize are the size. On a high-speed periodic
+// endpoint bits 12:11 hold the number of additional transactions per microframe
+// (USB 2.0 §9.6.6), so an interrupt endpoint declaring 0x1400 has a 1024-byte
+// maximum, not a 5120-byte one. Interrupt endpoints are accepted deliberately
+// (see SelectInterface), which is what makes the multiplier a live case even
+// though the shipped unit declares bulk endpoints only (SPEC.md §14 Q3).
+// Masking also caps the result at 2047, well under usbfs's 16384-byte transfer
+// ceiling, so no descriptor value can size a buffer that usbfs.Transfer would
+// refuse outright as too large -- which ReadMIDI would report as a hard error
+// rather than as the timeout an idle device produces.
 func bufSize(ep usbfs.Endpoint) int {
-	n := int(ep.MaxPacketSize)
+	n := int(ep.MaxPacketSize & maxPacketSizeMask)
 	if n < 4 {
 		return defaultPacketSize
 	}
@@ -324,8 +339,12 @@ type transport struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 
-	// ctx is cancelled by Close so an in-flight transfer unblocks instead of
-	// waiting out its timeout.
+	// ctx is cancelled by Close so a transfer that has not yet been submitted is
+	// refused rather than started. It does not unblock one already in flight:
+	// usbfs consults the context only when deciding whether to submit and cannot
+	// abort an ioctl the kernel already has (usbfs.Device.Transfer), so an
+	// in-flight transfer still runs out its own timeout. That timeout, not this
+	// cancellation, is what framer.Close sizes its close grace against.
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -438,7 +457,10 @@ func (t *transport) writeAll(b []byte) error {
 // "nothing to read" from "the device fell off the bus". Callers that poll
 // should therefore treat a (0, nil) return as "try again", not as EOF.
 //
-// After Close, ReadMIDI returns ErrClosed.
+// After Close, ReadMIDI first hands back whatever the last transfer left
+// buffered and only then returns ErrClosed. Bytes the device already sent are
+// not thrown away by a Close that races them in; the closed check sits after the
+// drain for exactly that reason.
 func (t *transport) ReadMIDI(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -490,7 +512,7 @@ func (t *transport) ReadMIDI(p []byte) (int, error) {
 func (t *transport) Close() error {
 	t.closeOnce.Do(func() {
 		t.closed.Store(true)
-		t.cancel() // unblock any in-flight transfer
+		t.cancel() // refuse any transfer not yet submitted
 		var errs []error
 		if err := t.dev.ReleaseInterface(t.iface.Number); err != nil {
 			errs = append(errs, fmt.Errorf("usbmidi: release interface %d (the ALSA MIDI port may stay missing until replug): %w", t.iface.Number, err))

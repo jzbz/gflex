@@ -119,7 +119,39 @@ func (a *App) openRawMIDI(ctx context.Context) (proto.Transport, string, error) 
 		return nil, "", a.transportError(ctx, err)
 	}
 	a.warnSolePortFallback(info)
+	a.warnNameOnlyMatch(info)
 	return t, describePort(info), nil
+}
+
+// warnNameOnlyMatch tells the user when the port was identified as a VFLEX by
+// its advertised name alone, with no USB vendor ID behind the claim.
+//
+// classify now trusts the vendor ID exclusively wherever there is one, and
+// reaches for the name substring only when discovery could not trace the port to
+// a USB device at all -- which is SPEC.md §3.4's precedence: vendor ID first,
+// name second, sole port last. Keeping that second tier is right, because a port
+// whose sysfs walk failed is still probably the device. But it is a materially
+// weaker claim than the one the vendor ID makes, and at the point of use the two
+// were indistinguishable: IsVFlex read true either way.
+//
+// The name is evidence, not an identifier. "Werewolf VFLEX" is what one unit's
+// firmware advertised (SPEC.md §14.2); it is not a protocol constant, no
+// document promises a second revision keeps it, and nothing stops an unrelated
+// device from spelling "vflex" in its own port name. So this says which tier the
+// identification came from rather than presenting both as the same fact --
+// exactly the distinction warnSolePortFallback draws one tier further down.
+func (a *App) warnNameOnlyMatch(p rawmidi.PortInfo) {
+	// Fallback ports are warned about by warnSolePortFallback, which says
+	// strictly more; a port cannot need both messages.
+	if !p.IsVFlex || p.VendorID != 0 || p.Fallback || a.stderr == nil {
+		return
+	}
+	fmt.Fprintf(a.stderr,
+		"warning: this port was identified as a VFLEX by its name alone:\n"+
+			"  %s\n"+
+			"  Discovery could not trace it back to a USB device, so the vendor ID never\n"+
+			"  confirmed it. Run `gflex devices` to see what was found, or pass --port.\n",
+		describePort(p))
 }
 
 // warnSolePortFallback tells the user when discovery could not identify a VFLEX
@@ -127,8 +159,11 @@ func (a *App) openRawMIDI(ctx context.Context) (proto.Transport, string, error) 
 //
 // rawmidi.PortInfo.Fallback exists for exactly this and nothing else, and until
 // now nobody read it. The fallback itself is worth keeping -- the vendor app has
-// it too, and the port name a VFLEX actually advertises is unknown (SPEC.md
-// §3.4, §14.2), so on a machine with one MIDI device it is usually right. But
+// it too, and the name a unit advertises is firmware-dependent evidence rather
+// than an identifier: one unit measured as "Werewolf VFLEX" (SPEC.md §14.2), so
+// the substring match of SPEC.md §3.4 does hit a real device, but a second
+// firmware revision may name itself anything at all. On a machine with one MIDI
+// device the sole-port fallback is therefore usually right. But
 // "usually right" is the whole problem: on a machine whose one MIDI device is a
 // synthesizer, this path opens the synth and starts writing protocol frames at
 // it, and every layer above here goes on to describe what it is doing as if it
@@ -366,9 +401,19 @@ func waitForDevice(ctx context.Context, want bool, timeout time.Duration) error 
 }
 
 // sleepCtx sleeps for d unless the context is cancelled first.
+//
+// A non-positive d is not a no-op: it returns ctx.Err(), so the call remains a
+// cancellation checkpoint rather than a way to skip one. internal/session and
+// internal/bootloader carry their own copies of this helper and both already
+// behave that way; this one returned nil, which is the difference that matters
+// on the one caller whose duration a user controls. `scan --settle 0` calls
+// sleepCtx during the unplug/replug handover (scan.go), and the next guard,
+// waitForDevice above, tests devicePresent() before it consults ctx.Done() --
+// so a Ctrl-C arriving there was swallowed twice over and the scan carried on
+// past the interrupt.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
-		return nil
+		return ctx.Err()
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()

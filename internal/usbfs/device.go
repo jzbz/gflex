@@ -50,6 +50,14 @@ type Device struct {
 	f   *os.File
 	ref DeviceRef
 
+	// ioctlFn, when non-nil, stands in for the syscall. Nothing in production
+	// ever sets it: it exists so the claim/release bookkeeping -- which decides
+	// whether a detached kernel driver ever gets rebound, and whose failure
+	// modes all live on error paths a real device will not produce on demand --
+	// can be driven against scripted errnos. It is set at construction and
+	// never written afterwards, so it needs no lock.
+	ioctlFn func(op string, req uintptr, arg unsafe.Pointer, retryEINTR bool) (int, error)
+
 	mu sync.Mutex
 	// claimed maps an interface number to whether this process detached a
 	// kernel driver in order to claim it, which is what tells ReleaseInterface
@@ -72,9 +80,6 @@ func Open(ref DeviceRef) (*Device, error) {
 	}
 	return &Device{f: f, ref: ref, claimed: make(map[int]bool)}, nil
 }
-
-// Ref returns the reference the device was opened from.
-func (d *Device) Ref() DeviceRef { return d.ref }
 
 // String renders the device for diagnostics.
 func (d *Device) String() string { return d.ref.String() }
@@ -124,6 +129,11 @@ func (d *Device) Close() error {
 // sysfs alone, never from the device, so this stays free of bus traffic and of a
 // context; a device whose configuration cannot be read that way is simply left
 // unnarrowed, which is what every caller did before this existed.
+//
+// This is also where the fd is checked against the device that enumeration
+// described: a mismatched idVendor is an error, not a Config, because every
+// later decision -- which interface to claim, which endpoints to drive, whether
+// to stream firmware at it -- is made from the descriptors this returns.
 func (d *Device) Descriptors() (*Config, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -137,6 +147,19 @@ func (d *Device) Descriptors() (*Config, error) {
 	cfg, err := ParseDescriptors(raw)
 	if err != nil {
 		return nil, fmt.Errorf("usbfs: %s: %w", d.ref.Path, err)
+	}
+	// The fd is the first authoritative statement of what is actually on the
+	// other end. Enumeration read idVendor from sysfs and then *synthesised*
+	// the node path from busnum/devnum (Enumerate), and /dev/bus/usb/BBB/DDD is
+	// a bus-address slot the kernel reuses -- so a device unplugged between
+	// enumeration and Open can be replaced by an unrelated one that happens to
+	// land in the freed slot, and nothing before this point would notice.
+	// Both sides are guarded on being non-zero: a hand-built DeviceRef carries
+	// no vendor ID (see Configuration), and a blob whose device descriptor was
+	// shorter than 12 bytes yields none either.
+	if d.ref.VendorID != 0 && cfg.VendorID != 0 && cfg.VendorID != d.ref.VendorID {
+		return nil, fmt.Errorf("usbfs: %s now reports vendor %04x, but enumeration saw %04x: "+
+			"the device at this bus address was replaced", d.ref.Path, cfg.VendorID, d.ref.VendorID)
 	}
 	// Narrowed before the value is published, so nothing ever observes the
 	// union on a device where the union would be wrong.
@@ -197,8 +220,7 @@ func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
 		// unless it is usbfs itself". That is the right filter when the bound
 		// driver's name is not known ahead of time -- which is the case here,
 		// since the VFLEX presents as snd-usb-audio in application mode and as
-		// nothing at all in bootloader mode. Use ClaimInterfaceIfDriver when
-		// the name is known and detaching anything else would be wrong.
+		// nothing at all in bootloader mode.
 		err := d.claimDetaching(num, disconnectClaimExceptDriver, "usbfs")
 		if err == nil {
 			d.markClaimed(num, true)
@@ -212,28 +234,45 @@ func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
 		if !errors.Is(err, ErrNotSupported) {
 			return err
 		}
-		if err := d.detachDriver(num); err != nil {
-			return err
-		}
+		return d.detachThenClaim(num)
 	}
 	if err := d.claim(num); err != nil {
 		return err
 	}
-	d.markClaimed(num, detachKernelDriver)
+	d.markClaimed(num, false)
 	return nil
 }
 
-// ClaimInterfaceIfDriver claims an interface atomically, detaching the bound
-// kernel driver only if its name equals driver (USBDEVFS_DISCONNECT_CLAIM with
-// USBDEVFS_DISCONNECT_CLAIM_IF_DRIVER). If some other driver is bound the
-// kernel refuses with EBUSY rather than detaching it.
+// detachThenClaim is the pre-3.4 fallback: USBDEVFS_DISCONNECT followed by
+// USBDEVFS_CLAIMINTERFACE, with the window between them that
+// USBDEVFS_DISCONNECT_CLAIM exists to close.
 //
-// Use this when you know exactly what you are displacing, e.g.
-// ClaimInterfaceIfDriver(0, "snd-usb-audio"). There is no non-atomic fallback:
-// a caller who cares about which driver gets detached would not want the racy
-// two-step sequence either.
-func (d *Device) ClaimInterfaceIfDriver(num int, driver string) error {
-	if err := d.claimDetaching(num, disconnectClaimIfDriver, driver); err != nil {
+// Between the two ioctls the kernel driver is already unbound, so from the
+// moment the detach succeeds this process owes the system a reattach -- whether
+// or not the claim that follows works. The claim can genuinely fail there
+// (ENOMEM, EINVAL for an interface number claimintf rejects, or udev rebinding
+// and a second process winning), and simply returning would leave snd-usb-audio
+// unbound with nothing anywhere recording it: d.claimed would be empty, so
+// neither ReleaseInterface nor Close would ever issue USBDEVFS_CONNECT and the
+// user's ALSA MIDI port would stay missing until the device was replugged.
+// The reattach therefore happens here, immediately, rather than being left to a
+// cleanup path that has no way to know it is owed.
+func (d *Device) detachThenClaim(num int) error {
+	if err := d.detachDriver(num); err != nil {
+		return err
+	}
+	if err := d.claim(num); err != nil {
+		// Nothing is claimed, so nothing goes in d.claimed; the obligation is
+		// discharged here instead. A failure to rebind is reported alongside
+		// the claim failure rather than replacing it -- the claim failure is
+		// what the caller asked about, the rebind failure is what the user has
+		// to act on.
+		if aerr := d.attachDriver(num); aerr != nil && !errors.Is(aerr, ErrNoDevice) {
+			return errors.Join(err, fmt.Errorf(
+				"usbfs: interface %d could not be claimed and the kernel driver detached to claim it "+
+					"could not be reattached (the ALSA MIDI port will stay missing until the device "+
+					"is replugged): %w", num, aerr))
+		}
 		return err
 	}
 	d.markClaimed(num, true)
@@ -248,34 +287,48 @@ func (d *Device) ClaimInterfaceIfDriver(num int, driver string) error {
 // ALSA MIDI port vanish until the device is physically replugged -- so the
 // default rawmidi transport stops working and the failure looks like broken
 // hardware. Closing the fd does not rebind it; only USBDEVFS_CONNECT does.
+//
+// The reattach is therefore attempted whatever USBDEVFS_RELEASEINTERFACE
+// answered, and the bookkeeping entry is dropped only afterwards. A release
+// failing for any reason outside the ErrNoDevice set says nothing about whether
+// a driver is still detached, so skipping the rebind on that path would discard
+// the only record that one is owed: d.claimed is where Close looks, and the
+// entry is gone by then.
 func (d *Device) ReleaseInterface(num int) error {
 	d.mu.Lock()
 	detached := d.claimed[num]
-	delete(d.claimed, num)
 	d.mu.Unlock()
 
 	n := uint32(num)
-	_, err := d.ioctl(fmt.Sprintf("release interface %d", num), ioctlReleaseInterface, unsafe.Pointer(&n), true)
+	_, relErr := d.ioctl(fmt.Sprintf("release interface %d", num), ioctlReleaseInterface, unsafe.Pointer(&n), true)
 	runtime.KeepAlive(&n)
-	if err != nil {
-		// A device that has gone away has already released everything, and
-		// there is no driver left to rebind.
-		if errors.Is(err, ErrNoDevice) {
-			return nil
+
+	// A device that has gone away has already released everything, and there is
+	// no driver left to rebind, so that is a success with nothing left to do.
+	gone := errors.Is(relErr, ErrNoDevice)
+	if gone {
+		relErr = nil
+	}
+
+	var attachErr error
+	if detached && !gone {
+		// ENODATA (no driver wanted the interface) is already swallowed by
+		// attachDriver; ErrNoDevice here means the device vanished between the
+		// two ioctls, which again leaves nothing to rebind.
+		if err := d.attachDriver(num); err != nil && !errors.Is(err, ErrNoDevice) {
+			attachErr = fmt.Errorf("usbfs: the kernel driver detached to claim interface %d could not be "+
+				"reattached (the ALSA MIDI port will stay missing until the device is replugged): %w", num, err)
 		}
-		return err
 	}
-	if !detached {
-		return nil
-	}
-	if err := d.attachDriver(num); err != nil {
-		if errors.Is(err, ErrNoDevice) {
-			return nil
-		}
-		return fmt.Errorf("usbfs: interface %d was released but the kernel driver could not be reattached "+
-			"(the ALSA MIDI port will stay missing until the device is replugged): %w", num, err)
-	}
-	return nil
+
+	// The claim is gone either way -- a second USBDEVFS_RELEASEINTERFACE from
+	// Close would answer EINVAL and mask whatever really happened -- so the
+	// entry is dropped once the reattach has had its one chance.
+	d.mu.Lock()
+	delete(d.claimed, num)
+	d.mu.Unlock()
+
+	return errors.Join(relErr, attachErr)
 }
 
 // SetInterface selects an alternate setting. The interface must already be
@@ -446,6 +499,13 @@ func (d *Device) interfaceIoctl(num int, code uintptr, op string) error {
 // Close cannot pull the descriptor out from under the syscall, and so the
 // descriptor is not silently switched to blocking mode as a side effect.
 func (d *Device) ioctl(op string, req uintptr, arg unsafe.Pointer, retryEINTR bool) (int, error) {
+	if d.ioctlFn != nil {
+		return d.ioctlFn(op, req, arg, retryEINTR)
+	}
+	return d.syscallIoctl(op, req, arg, retryEINTR)
+}
+
+func (d *Device) syscallIoctl(op string, req uintptr, arg unsafe.Pointer, retryEINTR bool) (int, error) {
 	rc, err := d.f.SyscallConn()
 	if err != nil {
 		return 0, wrapErrno(op, d.ref.Path, err)

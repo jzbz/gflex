@@ -233,10 +233,38 @@ func emitPDOLog(f Formatter, log *pdo.Log, blob []byte, withRaw, setDoc bool) {
 	f.Table("pdos", "advertised capabilities", log.PDOs,
 		[]string{"#", "TYPE", "VOLTAGE", "CURRENT/POWER", "RANGE", "VALID", "RAW"}, rows)
 
+	// The "?" on an SPR AVS voltage range is the only figure in this table that
+	// did not come off the wire, and a bare question mark is not a disclosure.
+	// Spell it out, so nothing above can be read as scanned data when it is
+	// USB-PD 3.2 speaking (SPEC.md §9.4). The wording comes from the pdo package
+	// rather than being restated here: a mark whose meaning is spelled out
+	// differently in two places is two claims, not one, and the same clause is
+	// what pdo.Evaluate puts on a verdict that rests on the assumption.
+	//
+	// After the table on purpose, so it cannot widen a column.
+	if hasSPRAVS(log) {
+		f.Note("")
+		f.Note("? the %s - %s V SPR AVS range is assumed, not scanned: %s",
+			trimFloat(pdo.SPRAVSMinVoltageV, 1), trimFloat(pdo.SPRAVSMaxVoltageV, 1),
+			pdo.SPRAVSAssumptionClause)
+	}
+
 	if withRaw {
 		f.Note("")
 		f.Note("raw blob (little-endian): %s", proto.Hex(blob))
 	}
+}
+
+// hasSPRAVS reports whether any decoded object is an SPR AVS APDO, which is the
+// condition on the assumed-range disclosure above. Invalid objects count: the
+// table prints them too, question mark and all.
+func hasSPRAVS(log *pdo.Log) bool {
+	for _, p := range log.PDOs {
+		if p.Kind == pdo.KindSPRAVS {
+			return true
+		}
+	}
+	return false
 }
 
 func eprCableText(fail bool) string {
@@ -258,8 +286,11 @@ func pdoRange(p pdo.PDO) string {
 	case pdo.KindSPRAVS:
 		// An SPR AVS APDO carries NO voltage range on the wire — only two
 		// band-specific current limits (SPEC.md §9.4). The range below is the
-		// USB-PD 3.2 assumption, and the trailing "?" marks it as such, matching
-		// pdo.Summary. The previous "15 V / 20 V" here was neither: those are
+		// USB-PD 3.2 assumption, and the trailing "?" marks it as such. This is
+		// the only renderer of the capability table, so the convention is
+		// established here; emitPDOLog above spells the mark out in a footnote,
+		// because the mark alone is a hint and not a disclosure. The previous
+		// "15 V / 20 V" here was neither: those are
 		// the boundaries of the two CURRENT bands, printed where a voltage range
 		// belongs, which both understated the low end (the assumed floor is 9 V)
 		// and presented an assumption as if it had been scanned.

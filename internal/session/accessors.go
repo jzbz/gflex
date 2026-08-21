@@ -67,9 +67,12 @@ func (s *Session) SerialNumber(ctx context.Context) (string, error) {
 
 // ChipUUID reads the MCU unique ID (command 9).
 //
-// The vendor application never issues this command. The frame is constructible
-// and a parser exists, but whether the firmware answers at all is unverified;
-// surface that caveat to users.
+// The vendor application never issues this command, but the firmware answers
+// it: bring-up measured a 16-byte UUID, not the 8 bytes §6.4's table assumed
+// (SPEC.md §14, "Corrections this produced"). That is why readString below
+// decodes by the frame's declared length rather than by proto.StringLen -- the
+// vendor's own write guard, which trusts the table, would have rejected a
+// correct UUID.
 func (s *Session) ChipUUID(ctx context.Context) (string, error) {
 	return s.readString(ctx, proto.CmdChipUUID)
 }
@@ -505,38 +508,34 @@ func (s *Session) SetLEDAlwaysOn(ctx context.Context, on bool) error {
 // AuthLock reads the authorisation lock (command 22) and returns both an
 // interpreted level and the untouched payload.
 //
-// This is the only asymmetric command in the protocol, and its read path was
-// never exercised. A write puts the level in the *first* payload byte
-// ([0x03, 0x96, level]), but the vendor's read parser takes
-// device_data.authlock_level from frame[3] -- the *second* payload byte. That
-// is verbatim in the source, and getAuthLock has zero callers, so it has never
-// run against hardware.
+// This is the only asymmetric command in the protocol. A write puts the level
+// in the *first* payload byte ([0x03, 0x96, level]), while the vendor's read
+// parser takes device_data.authlock_level from frame[3] -- the *second*. Since
+// getAuthLock has zero callers in the vendor client, that read had never run
+// anywhere, and an off-by-one was as good an explanation as any. Hardware
+// settled it (SPEC.md §14.8): `tx 02 16` answers `rx 04 16 16 00`, a two-byte
+// payload of [command code echoed a second time, level]. payload[1] is the
+// level and the vendor parser was right all along.
 //
-// Only two explanations fit, and the client cannot distinguish them: either the
-// response genuinely carries two bytes (plausibly [maxLevel, currentLevel]), or
-// the parser is off by one. So this returns both. level follows the vendor
-// parser and comes from payload[1] whenever the payload is long enough; if only
-// one byte arrives, payload[0] is used instead, since a one-byte response can
-// only be the symmetric layout. raw is the whole payload, so a caller can log
-// it and settle the question on real hardware.
+// raw is the whole payload, still returned because byte 0 is an echo nobody
+// documented and a unit answering some other shape should be visible rather
+// than silently reinterpreted. For the same reason a payload too short to hold
+// the level is an error and not a guess: under the measured layout a lone byte
+// is the echoed command code, so reading a level out of it would report 22.
 //
-// Only AUTH_LOCK_UNLOCKED = 0 is defined anywhere. What other levels exist,
-// what they gate, and how to unlock are all unknown (SPEC.md §14.8).
+// Only AUTH_LOCK_UNLOCKED = 0 is defined anywhere, and it is the only level
+// ever seen on hardware. What other levels exist, what they gate, and how to
+// unlock are all still unknown (SPEC.md §14.8).
 func (s *Session) AuthLock(ctx context.Context) (level uint8, raw []byte, err error) {
 	f, err := s.Do(ctx, proto.CmdAuthLock, nil, false)
 	if err != nil {
 		return 0, nil, err
 	}
 	raw = f.Payload // already a private copy, made by await
-	switch {
-	case len(raw) >= 2:
-		level = raw[1]
-	case len(raw) == 1:
-		level = raw[0]
-	default:
-		return 0, raw, fmt.Errorf("decode authlock: empty payload")
+	if len(raw) < 2 {
+		return 0, raw, fmt.Errorf("decode authlock: payload is %d byte(s), the measured layout is [command code, level]", len(raw))
 	}
-	return level, raw, nil
+	return raw[1], raw, nil
 }
 
 // SetAuthLock writes an authorisation lock level (command 22), placing it in

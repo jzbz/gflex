@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -203,5 +204,116 @@ func TestPDORangeSPRAVSIsTheAssumedRange(t *testing.T) {
 	// It must agree with the constants the evaluator uses for the same decision.
 	if !strings.Contains(got, trimFloat(pdo.SPRAVSMinVoltageV, 1)) {
 		t.Errorf("pdoRange(spr_avs) = %q, disagrees with pdo.SPRAVSMinVoltageV", got)
+	}
+}
+
+// renderPDOLog runs a log through emitPDOLog in human mode and returns stdout.
+// setDoc is false because the JSON document is not what these tests are about;
+// what reaches a human is.
+func renderPDOLog(t *testing.T, log *pdo.Log) string {
+	t.Helper()
+	var out, errBuf bytes.Buffer
+	f := newFormatter(false, &out, &errBuf)
+	emitPDOLog(f, log, nil, false, false)
+	if err := f.Flush(); err != nil {
+		t.Fatalf("flushing the formatter: %v", err)
+	}
+	return out.String()
+}
+
+// TestPDOTableDisclosesTheAssumedSPRAVSRange holds the capability table to the
+// disclosure rule internal/pdo states for this one figure.
+//
+// An SPR AVS APDO carries no voltage range on the wire at all -- only its two
+// band current limits (SPEC.md §9.4) -- so the 9-20 V this tool prints is
+// USB-PD 3.2 speaking, not the scan. Every other cell in that column is scanned
+// data, which is exactly what makes a bare "?" insufficient: a reader has no
+// way to tell that one figure apart from the measurements around it. The mark
+// therefore has to be spelled out, in the pdo package's own words so the two
+// statements of it cannot drift.
+//
+// This test used to live against a renderer with no production caller, and the
+// shipped table -- the one `pdo dump` and `scan` reach -- printed the bare mark.
+// Delete the f.Note block in emitPDOLog and this fails.
+func TestPDOTableDisclosesTheAssumedSPRAVSRange(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 2,
+		PDOs: []pdo.PDO{
+			{Index: 0, Kind: pdo.KindFixed, VoltageV: 5, MaxCurrentA: 3, Valid: true},
+			{Index: 1, Kind: pdo.KindSPRAVS, MaxCurrent15VA: 5, MaxCurrent20VA: 3.25,
+				MaxCurrentA: 5, Valid: true},
+		},
+	}
+	got := renderPDOLog(t, log)
+
+	if !strings.Contains(got, pdo.SPRAVSAssumptionClause) {
+		t.Errorf("the table marks the SPR AVS range \"?\" but never explains it; "+
+			"want the package's own clause %q in:\n%s", pdo.SPRAVSAssumptionClause, got)
+	}
+	// And the disclosure must name the range the mark sits on, or it explains
+	// the wrong number.
+	for _, want := range []string{trimFloat(pdo.SPRAVSMinVoltageV, 1), trimFloat(pdo.SPRAVSMaxVoltageV, 1), "assumed"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the assumed-range note does not mention %q:\n%s", want, got)
+		}
+	}
+}
+
+// The negative half: a log with no SPR AVS object has nothing assumed in it, so
+// the note must not appear. A disclosure printed unconditionally is noise, and
+// noise is how a real one stops being read.
+func TestPDOTableOmitsTheAssumptionWhenNothingIsAssumed(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 2,
+		PDOs: []pdo.PDO{
+			{Index: 0, Kind: pdo.KindFixed, VoltageV: 5, MaxCurrentA: 3, Valid: true},
+			{Index: 1, Kind: pdo.KindPPS, MinVoltageV: 3.3, MaxVoltageV: 11, MaxCurrentA: 3, Valid: true},
+		},
+	}
+	if got := renderPDOLog(t, log); strings.Contains(got, pdo.SPRAVSAssumptionClause) {
+		t.Errorf("a log with no SPR AVS object still carries the assumption note:\n%s", got)
+	}
+}
+
+// TestPDOTableDisclosesACableBoundCurrent is the table-level half of the other
+// safety property this package's renderer owes the user.
+//
+// Every current in the table has already been bounded by pdo.MaxCableCurrentA,
+// because over-reporting available current is the one direction that destroys
+// hardware. Clamping silently would be its own hazard, though: a source that
+// advertises 10.23 A would appear in the table as a 5 A supply with nothing to
+// say the figure had been reduced, and a user comparing the table against the
+// charger's own label would conclude the scan had misread it. Delete
+// pdoDeclaredNote's call site and this fails.
+func TestPDOTableDisclosesACableBoundCurrent(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 1,
+		PDOs: []pdo.PDO{{
+			Index: 0, Kind: pdo.KindFixed, VoltageV: 20,
+			MaxCurrentA: pdo.MaxCableCurrentA, DeclaredMaxCurrentA: 10.23, Valid: true,
+		}},
+	}
+	got := renderPDOLog(t, log)
+
+	if !strings.Contains(got, trimFloat(pdo.MaxCableCurrentA, 2)+" A") {
+		t.Errorf("the table does not report the bounded current at all:\n%s", got)
+	}
+	for _, want := range []string{"declares", "10.23"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a current the cable ceiling reduced was clamped silently; want %q in:\n%s", want, got)
+		}
+	}
+}
+
+// And the mirror: a current the ceiling never touched must not claim it was
+// reduced. DeclaredMaxCurrentA is set only when the clamp actually bit, so this
+// pins that the note keys off that and not off the class.
+func TestPDOTableDoesNotInventACableBound(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 1,
+		PDOs:          []pdo.PDO{{Index: 0, Kind: pdo.KindFixed, VoltageV: 9, MaxCurrentA: 3, Valid: true}},
+	}
+	if got := renderPDOLog(t, log); strings.Contains(got, "declares") {
+		t.Errorf("a current within the cable rating was reported as bounded:\n%s", got)
 	}
 }

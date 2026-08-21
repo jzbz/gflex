@@ -214,6 +214,47 @@ func TestPortNamePrefersRawmidiName(t *testing.T) {
 	}
 }
 
+// The kernel builds these names from the device's own USB string descriptors,
+// so a hostile unit chooses them; they get the same printable-ASCII treatment
+// as every other device-supplied string (SPEC.md §17, "identity strings
+// ... sanitised"). Each of portName's three sources is checked, because the
+// filter has to sit on all of them or the device just picks another one.
+func TestPortNameStripsControlBytes(t *testing.T) {
+	s := fixture(t)
+	writeFile(t, filepath.Join(s.procAsound, "card2", "midi0"),
+		"VFLEX\x1b[2J MIDI 1\n\nOutput\n")
+	writeFile(t, filepath.Join(s.sysSound, "midiC3D0", "device", "id"), "V\x07FX3\n")
+	writeFile(t, filepath.Join(s.procAsound, "cards"),
+		" 1 [Loopback       ]: USB-Audio - vFlex\x1b]0;x\x07 Widget\n")
+
+	for _, c := range []struct {
+		card int
+		want string
+	}{
+		// Only the ESC and BEL bytes go; the rest of a sequence survives as the
+		// literal text it is, which is harmless and keeps the name recognisable.
+		{2, "VFLEX[2J MIDI 1"},
+		{3, "VFX3"},
+		{1, "USB-Audio - vFlex]0;x Widget"},
+	} {
+		got := s.portName(c.card, 0)
+		if got != c.want {
+			t.Errorf("portName(%d, 0) = %q, want %q", c.card, got, c.want)
+		}
+	}
+}
+
+// A name that is nothing but control bytes must not shadow a usable name from
+// the next source down: the filter emptying a string is the same situation as
+// the file being absent.
+func TestPortNameFallsThroughWhenNothingPrintableSurvives(t *testing.T) {
+	s := fixture(t)
+	writeFile(t, filepath.Join(s.procAsound, "card2", "midi0"), "\x1b\x07\x00\n")
+	if got := s.portName(2, 0); got != "USB-Audio - VFLEX" {
+		t.Errorf("portName(2, 0) = %q, want the /proc/asound/cards name", got)
+	}
+}
+
 func TestUSBIDsForCard(t *testing.T) {
 	s := fixture(t)
 	vid, pid, sysPath, ok := s.usbIDsForCard(0)
@@ -335,6 +376,9 @@ func TestSelect(t *testing.T) {
 		}
 	})
 
+	// mkPort leaves VendorID 0: the sysfs walk found no USB parent, so the tool
+	// genuinely does not know what this port is. That is the only case the
+	// fallback is for.
 	t.Run("sole port fallback is flagged", func(t *testing.T) {
 		got, err := Select([]PortInfo{other}, "")
 		if err != nil {
@@ -345,6 +389,45 @@ func TestSelect(t *testing.T) {
 		}
 		if !got.Fallback {
 			t.Error("Fallback must be set so the CLI can warn the port is unidentified")
+		}
+	})
+
+	// A port sysfs has traced to another vendor is not unknown, though, and the
+	// fallback must not take it: doing so writes VFLEX protocol frames at
+	// somebody's keyboard. --port is the way to insist.
+	t.Run("sole port of a different vendor is refused", func(t *testing.T) {
+		foreign := PortInfo{Path: "/dev/snd/midiC0D0", Card: 0, Device: 0,
+			Name: "Keystation 49", VendorID: 0x0763, ProductID: 0x0192}
+		foreign.classify()
+		_, err := Select([]PortInfo{foreign}, "")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("got %v, want ErrNotFound", err)
+		}
+		for _, want := range []string{"0x0763", foreign.Path, "--port"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not mention %q: %v", want, err)
+			}
+		}
+	})
+
+	// The vendor ID is authoritative and a name is not, so the confirmed port
+	// wins outright rather than the pair being called ambiguous (SPEC.md §3.4).
+	t.Run("vendor id outranks a name-only match", func(t *testing.T) {
+		confirmed := PortInfo{Path: "/dev/snd/midiC2D0", Card: 2, Device: 0,
+			Name: "Werewolf VFLEX", VendorID: 0x37bf, ProductID: 0x800f}
+		nameOnly := PortInfo{Path: "/dev/snd/midiC1D0", Card: 1, Device: 0,
+			Name: "vFlex Audio Widget"}
+		confirmed.classify()
+		nameOnly.classify()
+		if !nameOnly.IsVFlex {
+			t.Fatal("a port with no USB parent must still be identified by name")
+		}
+		got, err := Select([]PortInfo{nameOnly, confirmed}, "")
+		if err != nil {
+			t.Fatalf("got %v, want the VID-confirmed port", err)
+		}
+		if got.Path != confirmed.Path {
+			t.Errorf("got %s, want %s", got.Path, confirmed.Path)
 		}
 	})
 
@@ -428,7 +511,8 @@ func TestSelect(t *testing.T) {
 }
 
 // The name match reproduces the vendor app's plain, unanchored, case-insensitive
-// substring test (SPEC.md §3.4), and the vendor ID overrides it either way.
+// substring test (SPEC.md §3.4), but only for a port with no USB parent: a known
+// vendor ID decides the question by itself, in both directions.
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name string
@@ -442,6 +526,9 @@ func TestClassify(t *testing.T) {
 		{"", 0x37bf, true},
 		{"Keystation 49", 0x37bf, true},
 		{"", 0, false},
+		// Sysfs says this is an M-Audio device. Whatever it calls itself, it is
+		// not a VFLEX, and the name must not be able to say otherwise.
+		{"vFlex Audio Widget", 0x0763, false},
 	}
 	for _, c := range cases {
 		p := PortInfo{Name: c.name, VendorID: c.vid}
@@ -515,36 +602,6 @@ func TestOpenMissingNode(t *testing.T) {
 // Rendering
 // ---------------------------------------------------------------------------
 
-func TestDescribeAndTable(t *testing.T) {
-	p := PortInfo{Path: "/dev/snd/midiC2D0", Card: 2, Device: 0, Name: "VFLEX MIDI 1",
-		VendorID: 0x37bf, ProductID: 0x800f, IsVFlex: true}
-	got := p.Describe()
-	for _, want := range []string{"/dev/snd/midiC2D0", "card 2", "device 0", "VFLEX MIDI 1", "37bf:800f", "[VFLEX]"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("Describe() = %q, missing %q", got, want)
-		}
-	}
-
-	unknown := PortInfo{Path: "/dev/snd/by-path/x", Card: -1, Device: -1}
-	if strings.Contains(unknown.Describe(), "-1") {
-		t.Errorf("unknown card/device must render as a dash: %q", unknown.Describe())
-	}
-	if unknown.USBID() != "" {
-		t.Errorf("USBID with no USB parent = %q, want empty", unknown.USBID())
-	}
-
-	table := Table([]PortInfo{p, unknown})
-	if !strings.HasPrefix(table, "PATH") || !strings.HasSuffix(table, "\n") {
-		t.Errorf("table shape: %q", table)
-	}
-	if lines := strings.Count(table, "\n"); lines != 3 {
-		t.Errorf("got %d lines, want header + 2 rows", lines)
-	}
-	if !strings.Contains(Table(nil), "no ALSA rawmidi ports") {
-		t.Errorf("empty table: %q", Table(nil))
-	}
-}
-
 func TestSummarise(t *testing.T) {
 	if got := summarise(nil); got != "(none)" {
 		t.Errorf("got %q", got)
@@ -553,8 +610,20 @@ func TestSummarise(t *testing.T) {
 		{Path: "/dev/snd/midiC0D0", Name: "A"},
 		{Path: "/dev/snd/midiC1D0"},
 	})
-	want := fmt.Sprintf("%s, %s", "/dev/snd/midiC0D0 (A)", "/dev/snd/midiC1D0")
+	want := fmt.Sprintf("%s, %s", `/dev/snd/midiC0D0 ("A")`, "/dev/snd/midiC1D0")
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A Name that reached PortInfo by some route other than portName -- a caller
+// building one by hand -- must still not be able to write an escape sequence to
+// the terminal through an error message. That is what the %q is for.
+func TestSummariseEscapesControlBytes(t *testing.T) {
+	got := summarise([]PortInfo{{Path: "/dev/snd/midiC0D0", Name: "A\x1b[2J"}})
+	for i := 0; i < len(got); i++ {
+		if got[i] < 0x20 {
+			t.Fatalf("summarise emitted a control byte %#02x: %q", got[i], got)
+		}
 	}
 }

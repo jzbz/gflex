@@ -12,8 +12,11 @@
 // binary buildable with CGO_ENABLED=0 (SPEC.md §4.1).
 //
 // Discovery is anchored on the USB vendor ID rather than on the port name the
-// vendor app matches, because the name the device advertises is still unknown
-// (SPEC.md §3.4, §14.2); the name substring is kept as a fallback.
+// vendor app matches. The advertised name is now known -- "Werewolf VFLEX",
+// measured on one unit (SPEC.md §14.2) -- and the vendor app's "vflex"
+// substring does match it, but a name is firmware-dependent and anything at all
+// can claim one, whereas the vendor ID is assigned. The substring is kept as a
+// fallback for ports with no USB parent to trace (SPEC.md §3.4).
 package rawmidi
 
 import (

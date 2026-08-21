@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/session"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // serialReader is a scripted CMD_SERIAL_NUMBER, counting how many times it was
@@ -427,5 +429,53 @@ func TestReadSerialRetryingFailsFastOnADeadLink(t *testing.T) {
 	}
 	if r.calls != 1 {
 		t.Errorf("read %d times, want 1: a permanent failure earns no retry", r.calls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The terminal precondition
+// ---------------------------------------------------------------------------
+
+// TestScanRefusesBeforeErasingWhenStdinIsNotATerminal is the regression test for
+// the ordering of the interactive scan's terminal check.
+//
+// Phase 1 used to run unconditionally: connect, gate on firmware, latch the
+// serial, and then erase the capture log -- and only afterwards did the wizard
+// reach pause, whose first act is to refuse when stdin is not a terminal. So
+// `gflex scan </dev/null`, or the same command from cron or a pipeline, destroyed
+// whatever capture the unit was holding and then told the user they had mistyped
+// the command line. SPEC.md §9.2 has no recovery for that short of carrying the
+// unit back to the source; --yes does not help either, because pause is not a
+// confirmation.
+//
+// The condition needs no device at all -- stdinIsTTY is a local ioctl -- so the
+// refusal belongs ahead of every frame, which is what this asserts: the log the
+// fake was holding is still there, byte for byte.
+func TestScanRefusesBeforeErasingWhenStdinIsNotATerminal(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev) // stdin is deliberately not a terminal
+	before, ok := dev.Register(proto.CmdPDOLog)
+	if !ok {
+		t.Fatal("the fake is not holding a capture to lose")
+	}
+	before = append([]byte{}, before...)
+
+	err := tr.run(t, "scan")
+	if err == nil {
+		t.Fatal("`gflex scan` ran the interactive workflow with no terminal to prompt at")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	if !strings.Contains(err.Error(), "--no-prompt") {
+		t.Errorf("error %q does not say how to run this unattended", err)
+	}
+	// The load-bearing assertions, in the order they would fail: no frame at
+	// all, and in particular no erase.
+	if len(dev.Sent()) != 0 {
+		t.Errorf("the device was talked to before the terminal check; frames: %v", cmdNames(dev.Sent()))
+	}
+	if after, ok := dev.Register(proto.CmdPDOLog); !ok || !bytes.Equal(after, before) {
+		t.Fatalf("the capture log was erased before the command refused: %x -> %x", before, after)
 	}
 }

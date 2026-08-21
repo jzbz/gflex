@@ -226,6 +226,64 @@ func TestInfoCancellationBetweenReadsAbortsTheCall(t *testing.T) {
 	}
 }
 
+// TestInfoUnplugDuringOptionalReadsAbortsTheCall: the best-effort block must
+// stop for the same reason a cancelled context stops it. A device unplugged
+// part-way through the nine optional reads fails every remaining one instantly
+// and identically, so tolerating the first produced a report whose empty fields
+// are indistinguishable from a unit that merely declines the unused commands --
+// and exit 0 alongside it, telling the operator nothing went wrong.
+//
+// Nothing in the loop asks whether the transport survived, so the classifier is
+// PermanentErr; ErrTimeout is deliberately outside it, which is what keeps
+// TestInfoIncludeUnusedToleratesFailure (a silent device, nine timeouts, no
+// error) passing unchanged.
+func TestInfoUnplugDuringOptionalReadsAbortsTheCall(t *testing.T) {
+	unplugged := errors.New("read /dev/snd/midiC1D0: no such device")
+
+	// A generous timeout on purpose: the point of the test is that the run stops
+	// because the transport died, and a short deadline would let a slow runner
+	// turn the dead read into an ordinary ErrTimeout, which PermanentErr does
+	// not name. Nothing here waits it out, since every command is answered.
+	s, d := newTestSession(t, Options{Timeout: 2 * time.Second})
+	scriptCore(d)
+	// Every optional command is answered, so only the unplug can stop the run.
+	d.SetResponse(proto.CmdChipUUID, []byte("CHIP0001"))
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), proto.AuthLockUnlocked})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+
+	// Pull the cable once the first optional read is on the wire, which is the
+	// point where the handler fires -- the same technique as
+	// TestUnplugMidCommandReportsTheCause.
+	d.SetHandler(proto.CmdChipUUID, func(proto.Frame) []byte {
+		d.Unplug(unplugged)
+		return nil
+	})
+
+	info, err := s.Info(context.Background(), true)
+	if err == nil {
+		t.Fatalf("Info returned a partial report and no error after an unplug: %+v", info)
+	}
+	if !errors.Is(err, ErrTransportClosed) {
+		t.Errorf("error = %v, want it to wrap ErrTransportClosed", err)
+	}
+	if info != nil {
+		t.Errorf("info = %+v, want nil alongside the error", info)
+	}
+	// Six core reads plus the one optional read that was in flight when the
+	// link died. An unplugged fake.Device still records what the host
+	// transmits, so the remaining eight would show up here had the loop
+	// carried on asking a device that was gone.
+	if n := len(d.Sent()); n != 7 {
+		t.Errorf("sent %d frames, want 7 (6 core + chip uuid); the run kept reading a dead transport", n)
+	}
+}
+
 func TestInfoFailsOnCoreCommand(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 	scriptCore(d)

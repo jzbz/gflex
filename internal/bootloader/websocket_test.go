@@ -255,14 +255,23 @@ func TestReadMessageEnforcesMaxSize(t *testing.T) {
 		}
 	})
 	t.Run("across fragments", func(t *testing.T) {
+		// The second fragment's header declares 8 more bytes, taking the message
+		// to 16 against a limit of 10 — and its payload is deliberately absent
+		// from the stream. A reader that allocates the fragment first and only
+		// then checks the total would block on those eight bytes and report a
+		// truncated read; refusing from the header is what keeps the peak at the
+		// advertised cap instead of twice it.
 		var in []byte
 		in = append(in, 0x02, 8)
 		in = append(in, make([]byte, 8)...)
 		in = append(in, 0x80, 8)
-		in = append(in, make([]byte, 8)...)
 		c := newWSConn(bytes.NewReader(in), &bytes.Buffer{}, &cycleReader{b: []byte{1, 2, 3, 4}}, 10)
-		if _, _, err := c.readMessage(); err == nil {
+		_, _, err := c.readMessage()
+		if err == nil {
 			t.Fatal("expected an error for fragments summing over the limit")
+		}
+		if !strings.Contains(err.Error(), "exceeds the 10-byte limit") {
+			t.Errorf("error = %q, want the fragment refused from its header", err.Error())
 		}
 	})
 }
@@ -299,8 +308,34 @@ func TestHeaderHasToken(t *testing.T) {
 
 func TestFetchRejectsEmptySerial(t *testing.T) {
 	t.Parallel()
-	if _, err := Fetch(t.Context(), "ws://127.0.0.1:1/bootloader", "  ", 0); err == nil {
+	_, err := Fetch(t.Context(), insecureWSScheme+"://127.0.0.1:1/bootloader", "  ", 0)
+	if err == nil {
 		t.Fatal("expected an error for an empty serial")
+	}
+	// The serial is checked before anything is dialled, so this must be the
+	// reason rather than the connection to port 1 failing.
+	if !strings.Contains(err.Error(), "serial number") {
+		t.Errorf("error = %q, want it to name the missing serial", err.Error())
+	}
+}
+
+// The image and the CRC it is checked against arrive in the same document, so a
+// cleartext fetch authenticates neither: whoever answers chooses both. A plain
+// ws:// or http:// URL is refused outright, and the refusal has to name the one
+// spelling that accepts cleartext on purpose — otherwise the operator's only
+// route is to give up or to stop reading the error.
+func TestFetchRefusesCleartextURL(t *testing.T) {
+	t.Parallel()
+	for _, u := range []string{"ws://127.0.0.1:1/bootloader", "http://127.0.0.1:1/bootloader"} {
+		_, err := Fetch(t.Context(), u, "VF001234", time.Second)
+		if err == nil {
+			t.Fatalf("Fetch(%q) succeeded; a cleartext firmware fetch must be refused", u)
+		}
+		// A dial failure would also be an error, so the message is what
+		// distinguishes a refusal from merely failing to reach port 1.
+		if !strings.Contains(err.Error(), insecureWSScheme) {
+			t.Errorf("Fetch(%q) error = %q, want it to name the %s:// downgrade", u, err.Error(), insecureWSScheme)
+		}
 	}
 }
 
@@ -351,7 +386,10 @@ func TestCloseErrorSanitisesReason(t *testing.T) {
 }
 
 // wsUpgradeServer runs a one-shot listener that completes the opening handshake
-// and then hands the accepted connection to serve. It returns the ws:// URL.
+// and then hands the accepted connection to serve. It returns the URL to dial.
+//
+// The listener speaks cleartext on loopback, so the URL carries the explicit
+// downgrade scheme: wsDial refuses a plain ws:// endpoint outright.
 func wsUpgradeServer(t *testing.T, serve func(conn net.Conn, req *http.Request, accept string)) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -376,7 +414,7 @@ func wsUpgradeServer(t *testing.T, serve func(conn net.Conn, req *http.Request, 
 		}
 		serve(conn, req, wsAcceptKey(req.Header.Get("Sec-WebSocket-Key")))
 	}()
-	return "ws://" + ln.Addr().String() + "/bootloader"
+	return insecureWSScheme + "://" + ln.Addr().String() + "/bootloader"
 }
 
 // http.ReadResponse imposes no limit of its own on the status line or the

@@ -168,6 +168,111 @@ func TestDecodeByteStringWhitespaceAndPrefix(t *testing.T) {
 	}
 }
 
+// "0x" is a hex marker only when what follows is hex. Both characters are
+// members of every base64 alphabet, so stripping the prefix before deciding the
+// encoding truncated any base64 page whose encoding happens to begin with them
+// -- about one page in 4096 -- and returned bytes offset from the real image by
+// a byte and a half. A flat image has no per-page equality constraint to trip
+// over it, so on the no-CRC --force path that garbage would be flashed.
+func TestDecodeByteStringBase64BeginningWithZeroX(t *testing.T) {
+	t.Parallel()
+	// 0xD3 0x1n is the family whose base64 starts "0x": the first six bits are
+	// 52 ('0') and the next six are 49 ('x'). Nine bytes, so the encoding has no
+	// padding and the old prefix strip left a string RawStdEncoding accepts --
+	// the silent-corruption case rather than the loud one.
+	img := []byte{0xD3, 0x10, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47}
+	s := base64.StdEncoding.EncodeToString(img)
+	if !strings.HasPrefix(s, "0x") {
+		t.Fatalf("base64 of % x is %q, which does not begin \"0x\"; the test no longer covers the case", img, s)
+	}
+	got, err := decodeByteString(s)
+	if err != nil {
+		t.Fatalf("decodeByteString(%q): %v", s, err)
+	}
+	if !bytes.Equal(got, img) {
+		t.Errorf("decodeByteString(%q) = % x, want % x", s, got, img)
+	}
+}
+
+// A key written as null is present as far as encoding/json is concerned: it
+// stores the four bytes "null" in the json.RawMessage, so a length test alone
+// let it stop the three-key fallback (SPEC.md §10.3) at the first key and
+// report "no pages" about a payload whose pages sit under the second. Any
+// serializer that renders unused optional fields rather than omitting them
+// produces exactly this.
+func TestParseJSONPayloadNullKeyFallsThrough(t *testing.T) {
+	t.Parallel()
+	pg := page(0x10, 16)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "null app_bin, pages under app_bin_data",
+			body: fmt.Sprintf(`{"app_bin":null,"app_bin_data":[%s],"crc":90}`, numberArray(pg)),
+		},
+		{
+			name: "null app_bin and app_bin_data, pages under firmware",
+			body: fmt.Sprintf(`{"app_bin":null,"app_bin_data":null,"firmware":[%s],"crc":90}`, numberArray(pg)),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fw, err := ParseJSONPayload([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("ParseJSONPayload: %v", err)
+			}
+			if len(fw.Pages) != 1 || !bytes.Equal(fw.Pages[0], pg) {
+				t.Errorf("got %d pages (%x), want one page of % x", len(fw.Pages), fw.Pages, pg)
+			}
+		})
+	}
+
+	// A payload whose only pages key is null is still an error, and it is the
+	// accurate one rather than "has no pages".
+	_, err := ParseJSONPayload([]byte(`{"app_bin":null,"crc":90}`))
+	if err == nil {
+		t.Fatal("expected an error when every pages key is null")
+	}
+	if want := "none of app_bin, app_bin_data or firmware is present"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// The page ceiling has to be applied to the element count before the pages are
+// decoded, not only in newFirmware afterwards. The document is bounded by
+// MaxMessageBytes; the number of elements inside it is not, and two bytes of
+// "[]," per element used to buy a 24-byte slice header here and another in the
+// decoded slice -- a few hundred megabytes and millions of decode calls from an
+// 8 MiB message, all of it discarded.
+//
+// The elements below are individually undecodable, so an implementation that
+// still decodes first reports the page rather than the count: that is what
+// makes this test fail when the early ceiling is removed.
+func TestNormalisePagesBoundsPageCountBeforeDecoding(t *testing.T) {
+	t.Parallel()
+	var sb strings.Builder
+	sb.WriteString(`{"app_bin":[`)
+	for i := 0; i <= MaxPages; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(`"!"`) // neither hex nor base64 in any alphabet
+	}
+	sb.WriteString(`]}`)
+
+	_, err := ParseJSONPayload([]byte(sb.String()))
+	if err == nil {
+		t.Fatal("expected an image with more than MaxPages pages to be rejected")
+	}
+	if !errors.Is(err, ErrBadPageLength) {
+		t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+	}
+	if want := "16-bit"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want the page count refused before any page is decoded (%q)", err.Error(), want)
+	}
+}
+
 func TestParseJSONPayloadCRCForms(t *testing.T) {
 	t.Parallel()
 	pg := numberArray(page(0, 8))
@@ -371,6 +476,23 @@ func TestLoadFileWithOptionsPageSize(t *testing.T) {
 	}
 	if fw.PageSize() != 128 || len(fw.Pages) != 2 {
 		t.Errorf("got %d pages of %d bytes, want 2 of 128", len(fw.Pages), fw.PageSize())
+	}
+
+	// A bare JSON array of byte values is the one JSON shape with no page split
+	// of its own, so it is split on the stated geometry exactly like the raw
+	// .bin above. Substituting DefaultPageSize for a geometry the caller named
+	// is wrong on precisely the path where a wrong split can flash and still
+	// verify clean (SPEC.md §10.2, §14.12).
+	jsonPath := filepath.Join(filepath.Dir(path), "image.json")
+	if err := os.WriteFile(jsonPath, []byte(numberArray(page(0, 256))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fw, err = LoadFileWithOptions(jsonPath, LoadOptions{PageSize: 128})
+	if err != nil {
+		t.Fatalf("LoadFileWithOptions(bare array): %v", err)
+	}
+	if fw.PageSize() != 128 || len(fw.Pages) != 2 {
+		t.Errorf("bare array: got %d pages of %d bytes, want 2 of 128", len(fw.Pages), fw.PageSize())
 	}
 }
 

@@ -14,8 +14,11 @@ const (
 	// VendorIDString is the lowercase hex form udev matches on.
 	VendorIDString = "37bf"
 	// PortNameMatch is the case-insensitive substring the vendor app uses to
-	// recognise a VFLEX among MIDI ports. The actual advertised name is
-	// unknown, so this match is reproduced rather than replaced.
+	// recognise a VFLEX among MIDI ports. The advertised name is
+	// "Werewolf VFLEX" on the one unit measured, with ALSA card id "VFLEX"
+	// (SPEC.md §14.2), so the substring does match; it is kept rather than
+	// replaced with the full name because the name is firmware-dependent and
+	// discovery anchors on the vendor ID first.
 	PortNameMatch = "vflex"
 )
 
@@ -30,13 +33,22 @@ const (
 	// VerifyTimeout is the timeout for a firmware CRC verification.
 	VerifyTimeout = 120 * time.Second
 	// ByteDelay is the inter-message delay the vendor app applies when
-	// transmitting MIDI. Whether the device requires it is unknown.
+	// transmitting MIDI. The device does not require anything like it: on the
+	// one unit measured (SPEC.md §14.15), 1 ms and 100 us were both clean over
+	// 120 reads while 1 ns lost 2.5% of frames to response timeouts. The
+	// vendor's 20 ms stays the default until a second unit corroborates that.
 	ByteDelay = 20 * time.Millisecond
 )
 
 // DeviceInfo is everything the protocol can tell us about a connected unit.
-// Fields use the vendor's own names so that --json output, this code and
-// SPEC.md all agree. A nil pointer means "not read".
+// Fields use the vendor's own names, from SPEC.md §8, so that --json output,
+// this code and SPEC.md all agree. There is one deliberate exception: the LED
+// setting is exposed as led_always_on, a bool already un-inverted, rather than
+// the wire name led_disable_during_operation. SPEC.md §6.2 warns that the wire
+// name gets read backwards, and a JSON key meaning the opposite of what it says
+// is that same trap in machine-readable form. Do not rename it back.
+//
+// A nil pointer means "not read".
 type DeviceInfo struct {
 	SerialNum  string `json:"serial_num,omitempty"`
 	UUID       string `json:"uuid,omitempty"`
@@ -62,8 +74,12 @@ type DeviceInfo struct {
 	// LEDAlwaysOn is the user-facing setting, already un-inverted.
 	LEDAlwaysOn *bool `json:"led_always_on,omitempty"`
 	// AuthLockLevel is the byte at payload offset 1 of the read response,
-	// matching the vendor client. AuthLockRaw preserves the whole payload
-	// because the read layout is unverified; see SPEC.md §6.3.
+	// matching the vendor client. SPEC.md §6.3 could not decide whether that
+	// was a second payload byte or an off-by-one; §14.8 settled it on hardware
+	// as [command code, level], so the vendor client was right and the command
+	// really is asymmetric with its own write form. AuthLockRaw still preserves
+	// the whole payload, because only level 0 has ever been observed and what
+	// any other level means remains unknown (SPEC.md §6.3).
 	AuthLockLevel *uint8 `json:"authlock_level,omitempty"`
 	AuthLockRaw   []byte `json:"authlock_raw,omitempty"`
 }
@@ -74,6 +90,15 @@ type DeviceInfo struct {
 // Implementations must be safe for one reader goroutine concurrent with one
 // writer goroutine, but need not support concurrent writers; the session layer
 // serialises all command traffic.
+//
+// Close carries its own requirements, which are easy to miss because it arrives
+// through an embedded io.Closer. It must be idempotent, safe to call while a
+// ReadMIDI or WriteMIDI is in flight, and it must cause a blocked ReadMIDI to
+// return rather than hang: framer.Close closes the transport precisely in order
+// to evict a reader parked in ReadMIDI, and the barrier property it advertises
+// to the rest of the tree rests on that. A transport that cannot honour it does
+// not merely close slowly -- framer.Close gives up after a grace period and
+// reports framer.ErrReaderStuck, degrading to a non-barrier close.
 type Transport interface {
 	// WriteMIDI writes one or more complete MIDI messages.
 	WriteMIDI(p []byte) error

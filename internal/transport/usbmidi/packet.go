@@ -100,8 +100,11 @@ func classify(status byte) (cin byte, length int, ok bool) {
 // It walks a fixed 4-byte stride, skips packets whose first byte is zero (the
 // device pads short transfers with them), and takes cinLength[byte0&0x0F] bytes
 // from offset 1. A trailing partial packet — possible when a transfer is cut
-// short — is ignored rather than treated as an error; the caller will see the
-// remaining bytes on the next read.
+// short — is discarded rather than treated as an error, and those bytes are
+// gone: a USB transfer that ends mid-packet has no continuation, and ReadMIDI
+// keeps no raw remainder to prepend to the next transfer. A conforming USB-MIDI
+// endpoint never produces one, and the shipped unit's are 64-byte bulk
+// endpoints (SPEC.md §14 Q3).
 //
 // The cable number in the high nibble is deliberately not filtered: the VFLEX
 // has one cable, and dropping traffic on the basis of an unverified descriptor

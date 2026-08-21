@@ -98,10 +98,16 @@ type Options struct {
 	// command that should fail fast, or to keep a test from sleeping.
 	ReadyTimeout time.Duration
 	// Trace, when non-nil, is called with every protocol frame that crosses the
-	// session boundary. dir is "tx" or "rx". The slice is a private copy and
-	// may be retained. Received frames are traced even when they are dropped
-	// for a command-code mismatch, since that is precisely the case an operator
-	// needs to see.
+	// session boundary. The slice is a private copy and may be retained.
+	//
+	// dir is one of three values: "tx" for a frame this session transmitted,
+	// "rx" for one received while a command was outstanding, and "rx-late" for
+	// one absorbed by either drain -- a frame that arrived with nothing pending
+	// to match it, so it can only be the answer to a command that has already
+	// failed. Received frames are traced even when they are dropped, for a
+	// command-code mismatch or by a drain, since that is precisely the case an
+	// operator needs to see; and the third label is what keeps a discarded
+	// stale frame from looking exactly like the frame that answered a command.
 	Trace func(dir string, frame []byte)
 }
 
@@ -167,10 +173,18 @@ func (s *Session) Do(ctx context.Context, cmd proto.Cmd, payload []byte, write b
 
 // DoRaw is Do with control over the scratchpad flag.
 //
-// FlagScratchpad (0x40) is never set by the shipped vendor application and its
-// volatile-versus-committed meaning is undetermined (SPEC.md §5.1, §14.4). It
-// is exposed here only so a raw escape hatch can reach it; nothing in this
-// package sets it.
+// FlagScratchpad (0x40) is never set by the shipped vendor application, and
+// hardware settled what it does (SPEC.md §5.1, §14.4): validate-and-discard. A
+// scratchpad write is accepted and echoed back carrying the value written --
+// `tx 04 d2 17 70` was answered `rx 04 12 17 70` -- and then dropped, with
+// `voltage get` still reading the old 5000 mV. A scratchpad read answers
+// exactly as an ordinary read does.
+//
+// So a nil error from DoRaw with scratchpad set means only that the frame was
+// well formed and the device acknowledged it; it is never evidence that the
+// setting took effect, and neither is the returned payload, however faithfully
+// it repeats what was asked for. Exposed here only so a raw escape hatch can
+// reach it; nothing in this package sets it.
 func (s *Session) DoRaw(ctx context.Context, cmd proto.Cmd, payload []byte, write, scratchpad bool) (proto.Frame, error) {
 	return s.exchange(ctx, cmd, payload, write, scratchpad, s.timeout)
 }
@@ -239,10 +253,23 @@ func (s *Session) await(ctx context.Context, cmd proto.Cmd, tx []byte, timeout t
 	frames := s.fr.Frames()
 	errs := s.fr.Errors()
 
-	// Transport-level problems (a malformed frame dropped by the receive state
-	// machine, a short read) are informational: the protocol has no NACK, so a
-	// command is only ever failed by its deadline. The most recent one is kept
-	// so the eventual timeout can name a probable cause.
+	// The framer's last complaint, kept so that whichever failure ends this wait
+	// can name a cause. Two things reach it, and neither is the informational
+	// transport hiccup the name suggests.
+	//
+	// An error on the framer's error channel is TERMINAL: the reader publishes
+	// it and exits, closing both channels behind it (framer.Errors' contract),
+	// so that case is followed almost immediately by the frames channel
+	// reporting !ok, which is where it becomes ErrTransportClosed. It is
+	// recorded rather than acted on here because frames decoded before the
+	// reader died are still queued ahead of that close and one of them may yet
+	// answer this command -- and if the deadline happens to expire in the same
+	// instant, the timeout message can still say why.
+	//
+	// A parse failure is the other, and it cannot arrive from this source at
+	// all: the framer's decoder emits only frames that already satisfy
+	// proto.ValidResponseLen and routes everything it discards to the drop hook
+	// instead (SPEC.md §17, row 3.3). That branch is defence in depth.
 	var lastTransportErr error
 
 	for {
@@ -311,8 +338,11 @@ func (s *Session) await(ctx context.Context, cmd proto.Cmd, tx []byte, timeout t
 
 			f, err := proto.Parse(raw)
 			if err != nil {
-				// Fewer than two bytes: ignored without clearing the pending
-				// state, so the command can still be satisfied (SPEC.md §5.2).
+				// Fewer than two bytes, which the framer's decoder already
+				// refuses to emit -- see lastTransportErr above. Kept because
+				// SPEC.md §5.2 says an unparseable frame is ignored without
+				// clearing the pending state, so the command can still be
+				// satisfied by a later one.
 				lastTransportErr = err
 				continue
 			}
@@ -381,6 +411,12 @@ const settleAfterTimeout = 400 * time.Millisecond
 //
 // So each channel is nil-ed as it is exhausted, which parks its case forever,
 // and draining continues until nothing is left anywhere.
+//
+// Both drains trace their discards as "rx-late" rather than "rx". They discard
+// the same thing for the same reason -- a frame that arrived with no command
+// outstanding -- and only the moment differs, so labelling them differently
+// would make a -v trace claim a distinction that does not exist while hiding
+// the one that does: which received frames actually answered a command.
 
 // drainFor absorbs and discards frames for at most d, returning early if both
 // channels are exhausted or ctx is cancelled. Only call this while holding the
@@ -425,7 +461,7 @@ func (s *Session) drainStale() {
 				frames = nil
 				continue
 			}
-			s.trace("rx", raw)
+			s.trace("rx-late", raw)
 		case _, ok := <-errs:
 			if !ok {
 				errs = nil

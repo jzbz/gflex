@@ -65,13 +65,14 @@ var (
 	// a PD source between the erase and the read-back.
 	ErrPDOLogEmpty = errors.New("No PDO data captured (log is empty). Unplug vFlex from phone, plug into a USB-C PD charger (e.g. MacBook charger) for ~10s, then reconnect and retry.")
 
-	// ErrSerialMismatch is the scan workflow's hard invariant: the unit whose
-	// log was erased must be the unit read back (SPEC.md §9.2). The scan
-	// wizard, not this package, drives that comparison.
-	ErrSerialMismatch = errors.New("A different VFLEX serial number was detected. This scan has been aborted.")
-
-	// ErrFirmwareTooOld gates the scan on firmware >= 5.0.0 (SPEC.md §9).
-	ErrFirmwareTooOld = errors.New("Power Supply Scan requires VFLEX firmware 5.0.0 or newer. Update firmware before scanning.")
+	// The scan workflow's other two vendor strings -- the serial-number
+	// mismatch of SPEC.md §9.2 and the firmware-too-old refusal of §9 -- are
+	// NOT here. Both are decided by the scan wizard rather than by this
+	// package: it owns the serial comparison across the handover, and it
+	// refuses on firmware before any download starts. They live as
+	// msgSerialMismatch and msgFirmwareTooOld in internal/cli/scan.go, and
+	// duplicating them here left two copies of a user-visible string with
+	// nothing keeping them equal.
 )
 
 // ClearPDOLog erases the capture buffer: a write with an empty payload, 02 91

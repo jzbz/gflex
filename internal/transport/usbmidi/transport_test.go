@@ -252,6 +252,47 @@ func TestCloseReleasesThenCloses(t *testing.T) {
 	}
 }
 
+// ReadMIDI drains what the last transfer left buffered before it reports
+// ErrClosed, so a Close racing a final response cannot discard bytes the device
+// already sent. TestCloseReleasesThenCloses covers only the empty-buffer case,
+// which proves less than it looks: with nothing buffered the closed check inside
+// the transfer error path would answer ErrClosed anyway.
+func TestReadMIDIAfterCloseDrainsPendingFirst(t *testing.T) {
+	f := &fakeDev{reads: []readResult{{data: []byte{
+		0x08, 0x80, 0x00, 0x00,
+		0x09, 0x90, 0x00, 0x02,
+		0x0A, 0xA0, 0x00, 0x00,
+	}}}}
+	tr := newTestTransport(f, 64)
+
+	// A 4-byte p leaves five unpacked bytes buffered.
+	p := make([]byte, 4)
+	if n, err := tr.ReadMIDI(p); n != 4 || err != nil {
+		t.Fatalf("ReadMIDI = %d, %v", n, err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var rest []byte
+	for {
+		n, err := tr.ReadMIDI(p)
+		if errors.Is(err, ErrClosed) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadMIDI after Close: %v", err)
+		}
+		if n == 0 {
+			t.Fatal("ReadMIDI after Close returned neither bytes nor ErrClosed")
+		}
+		rest = append(rest, p[:n]...)
+	}
+	if want := []byte{0x00, 0x02, 0xA0, 0x00, 0x00}; !bytes.Equal(rest, want) {
+		t.Fatalf("drained %s after Close, want %s", proto.Hex(rest), proto.Hex(want))
+	}
+}
+
 // A failed release leaves the ALSA MIDI port missing until replug, so it must
 // be reported rather than swallowed -- and the device still has to be closed.
 func TestCloseReportsReleaseFailure(t *testing.T) {

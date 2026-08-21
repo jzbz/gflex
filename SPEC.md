@@ -5,10 +5,13 @@ Android/iOS app and the Chrome-only web app.
 
 **Status:** derived entirely by reverse-engineering `com.tundralabs.vflex_2.0.0.xapk`, the
 functionally identical web build served from `https://vflex.app`, and the vendor manual at
-<https://werewolf.us/a/pages/vflex-user-manual>. No hardware was available. Every claim below is
-either **VERIFIED** against decompiled source (with a citation) or explicitly marked **UNKNOWN** /
-**INFERRED**. Nothing here is a guess presented as fact — see §14 for the full list of things we
-could not determine and which therefore need a bring-up session with a real device.
+<https://werewolf.us/a/pages/vflex-user-manual>. No hardware was available while it was written; a
+unit was obtained on 2026-08-21 and driven by this tool, and §14 records what that measured. Every
+claim below is either **VERIFIED** against decompiled source (with a citation), **MEASURED** on that
+unit, or explicitly marked **UNKNOWN** / **INFERRED**. Nothing here is a guess presented as fact —
+§14 answers nine of the sixteen questions the analysis could not settle and lists the seven that
+still need a second unit, a firmware image, or a deliberate bootloader excursion. Where the body and
+§14 ever disagree, §14 was measured and the body was inferred.
 
 **Contents:** [0 Provenance](#0-provenance-and-method) · [1 The device](#1-what-the-vflex-actually-is)
 · [2 Scope](#2-scope) · [3 Transport](#3-transport--usb-midi-with-nibble-framing)
@@ -72,7 +75,7 @@ negotiates a user-programmed voltage from a USB-C PD source and presents it on a
 | Host link | **wired USB only** — explicitly *not* WiFi/BLE/Bluetooth | manual "Data Connection" |
 | Host protocol | **USB-MIDI**, class-compliant | `VFlexMidiTransport`, `navigator.requestMIDIAccess()` |
 | USB vendor ID | **0x37BF** (`TUNDRA_VENDOR_ID = 14271`) | web module 2812 |
-| USB product ID | **UNKNOWN** — see §14.1 | — |
+| USB product ID | **0x800F** in application mode; the bootloader-mode PID is still unknown | measured 2026-08-21, §14.1 |
 | Firmware update link | vendor-class (0xFF) bulk USB, WebUSB in the app | web module 2811 |
 
 The Chrome/Edge-only requirement for the web app is explained by **Web MIDI** (application mode) and
@@ -159,9 +162,11 @@ This is the protocol's 7-bit-safety mechanism. Both emitted data bytes are alway
 
 Timing: the reference client sleeps `midiPacketDelayMs = 20 ms` after the start marker and after
 each data byte, with **no** trailing delay after the end marker. A frame of N bytes therefore costs
-N+2 MIDI messages and (N+1) × 20 ms ≈ 100 ms for a 4-byte frame. Whether 20 ms is a firmware
-requirement or defensive padding is **UNKNOWN** — make it a `--byte-delay` flag defaulting to 20 ms
-and measure on real hardware before lowering it.
+N+2 MIDI messages and (N+1) × 20 ms ≈ 100 ms for a 4-byte frame. The 20 ms is **defensive padding,
+not a firmware requirement** — a bisection on one unit ran 1 ms clean over 120 reads and 30 writes,
+while full rate dropped 2.5% of frames (measured, §14.15). Make it a `--byte-delay` flag defaulting
+to 20 ms anyway: n=1 on one host is not enough to move a default that costs nothing to keep, and the
+measurement says the floor is somewhere between "1 ms" and "none", not that there is no floor.
 
 ### 3.2 ⚠ The Note-On velocity-0 hazard
 
@@ -243,8 +248,11 @@ input (resp. output) exists on the entire system**, use it. Both an input and an
 required; `tryConnect` refreshes MIDI access once and then throws
 `"No VFLEX MIDI ports available"`.
 
-**The actual port name the device advertises is UNKNOWN** (§14.2) — it appears nowhere in the app,
-the APK, or the manual. Reproduce the substring match rather than hardcoding a name.
+**The port name the device advertises is `Werewolf VFLEX`** (measured, §14.2; ALSA card id `VFLEX`,
+type Legacy, no UMP). It appears nowhere in the app, the APK, or the manual, which is why the
+analysis could not derive it. Reproduce the substring match anyway rather than hardcoding the
+measured name: one unit's name is not the firmware's whole naming policy, and the substring is what
+the vendor app matches on.
 
 Better, for a Linux tool: anchor on the **USB vendor ID**, which is authoritative. Walk
 `/sys/bus/usb/devices/*`, match `idVendor == "37bf"`, then glob
@@ -311,10 +319,13 @@ Inbound: 4-byte stride, skip packets whose `byte0 == 0`, take
 Interface selection: find the alt setting with `(Class == 0x01 || Class == 0xFF) && SubClass == 0x03`.
 
 > **⚠ Do not hardcode bulk endpoints.** `snd-usb-audio` fully supports interrupt endpoints for
-> USB-MIDI (`midi.c:2006`: `if (!usb_endpoint_xfer_bulk(ep) && !usb_endpoint_xfer_int(ep)) continue;`),
-> and VFLEX's descriptors are unknown. Read `bmAttributes` and use interrupt transfers when the
-> endpoint is interrupt. Also check whether the device declares a MIDI 2.0/UMP alt setting, in which
-> case the kernel may expose UMP rather than legacy rawmidi.
+> USB-MIDI (`midi.c:2006`: `if (!usb_endpoint_xfer_bulk(ep) && !usb_endpoint_xfer_int(ep)) continue;`).
+> The one unit measured on 2026-08-21 declares **bulk** endpoints and **no UMP alt setting** (§14.3:
+> `1.1` MIDIStreaming with EP `0x02` OUT / `0x83` IN, 64-byte packets; `1.2` vendor class with EP
+> `0x01`/`0x81`) — so the kernel exposes legacy rawmidi, not UMP. That is one firmware revision on
+> one unit, not a guarantee about the product line, and reading `bmAttributes` costs nothing: keep
+> reading it, use interrupt transfers when the endpoint is interrupt, and keep checking for a UMP alt
+> setting before assuming rawmidi.
 
 Detaching the kernel driver: `USBDEVFS_DISCONNECT_CLAIM` detaches and claims atomically, closing
 the race where udev re-binds in between; the older `USBDEVFS_DISCONNECT` + `CLAIMINTERFACE` pair is
@@ -360,7 +371,11 @@ cgo-free, and it contains every transport.
 node. The same file has no generic USB rule, so a custom rule **is** required for usbfs and the
 bootloader.
 
-Ship `packaging/udev/70-gflex.rules`:
+Ship `packaging/udev/70-gflex.rules`. That file is the canonical copy, and `gflex install-udev`
+embeds a second one at `internal/cli/70-gflex.rules` because `//go:embed` cannot reach outside its
+own package directory; a test in `internal/cli` asserts the two stay byte-identical, and each
+carries a header pointing at the other. The listing below omits that header and is illustrative —
+read the shipped file, not this fence, when the exact bytes matter:
 
 ```
 # Werewolf VFLEX -- Tundra Labs, USB vendor 0x37BF (14271 decimal).
@@ -389,7 +404,8 @@ the group a packaging variable and prefer `uaccess`.
 > The app never uses HID — it uses Web MIDI (ALSA rawmidi on Linux) and WebUSB (usbfs). `MODE="0666"`
 > is world-writable and redundant alongside `uaccess`; `snap_chromium_daemon` is Ubuntu-snap-specific.
 > The page is also visibly AI-generated (the rule is tagged as a "Python" code block). The PID
-> `0x800f` in it is the only PID reference anywhere and is **uncorroborated** — see §14.1.
+> `0x800f` in it was the only PID reference anywhere and was dismissed as uncorroborated; §14.1
+> measured it and **the PID is right**. Everything else in the rule is still wrong.
 
 ---
 
@@ -414,8 +430,11 @@ Flags: `CMD_FLAG_WRITE = 0x80`, `CMD_FLAG_SCRATCHPAD = 0x40`, `CMD_CODE_MASK = 0
 
 **`CMD_FLAG_SCRATCHPAD` (0x40) is never set by the shipped app.** The only code path that could
 (`VFlexProtocol.stringWrapper`) has zero callers in the 6 MB bundle, and the constant is imported
-nowhere. Its volatile-vs-NVM meaning is therefore **UNKNOWN**. Expose it only through a raw escape
-hatch, never as a `--volatile` flag implying known semantics.
+nowhere. Its meaning is **validate-and-discard** (measured, §14.4): a scratchpad write is
+acknowledged and echoed back with the value it was given, and then does not take effect — it is not
+a volatile-vs-NVM distinction at all, and a scratchpad read returns what a normal read returns.
+Expose it only through a raw escape hatch, never as a `--volatile` flag: the echo looks exactly like
+a successful write, so anything that presents it as one is lying to the operator.
 
 ### 5.2 Response handling
 
@@ -464,7 +483,7 @@ implementation **must** serialise all device access through a single mutex.
 | 3 | `CMD_BOOTLOAD_END` | — | empty; jump to app | bootloader |
 | 4–7 | `CMD_RESERVED0…3` | — | **UNKNOWN** | no |
 | 8 | `CMD_SERIAL_NUMBER` | R | 8 ASCII bytes | **yes** |
-| 9 | `CMD_CHIP_UUID` | R | 8 ASCII bytes | no |
+| 9 | `CMD_CHIP_UUID` | R | 16 ASCII bytes (measured, §14; the vendor's table says 8) | no |
 | 10 | `CMD_HARDWARE_ID` | R | 8 ASCII bytes | no |
 | 11 | `CMD_FIRMWARE_VERSION` | R | 12 ASCII bytes | **yes** |
 | 12 | `CMD_MFG_DATE` | R | 8 ASCII bytes | no |
@@ -520,16 +539,18 @@ decode: alwaysOn = (wireByte == 0)
 **Do not name the CLI flag after the wire field** (`disable_led_during_operation`) or users will get
 it backwards. Use `gflex led set on|off` where `on` means the user-facing "always on".
 
-### 6.3 AUTHLOCK — asymmetric, and unexercised
+### 6.3 AUTHLOCK — asymmetric, and unexercised in the vendor client
 
 Write puts the level in the **first** payload byte (`[0x03, 0x96, level]`). The read parser takes
 `device_data.authlock_level = frame[3]` — the **second** payload byte. This is confirmed verbatim in
 the source and is the only genuinely asymmetric command in the protocol.
 
-Two possibilities, undecidable from the client: the read response really carries two payload bytes
-(e.g. `[maxLevel, currentLevel]`), or it is an off-by-one bug. `getAuthLock` has **zero callers**, so
-that path was never exercised. **A Go tool should read and log both `frame[2]` and `frame[3]`** until
-this is checked on hardware.
+The asymmetry is real and the vendor client was right about it (measured, §14.8): `tx 02 16` →
+`rx 04 16 16 00`, a two-byte payload of `[0x16, level]` — the command code echoed a second time,
+then the level. Reading `payload[1]` was never an off-by-one, so a Go tool should read the level
+from there and **refuse a one-byte response** rather than guessing which byte it holds; `getAuthLock`
+has zero callers in the vendor client, so nothing about the short shape was ever exercised there and
+nothing corroborates a reading of it. Levels beyond 0 remain untested.
 
 Only `AUTH_LOCK_UNLOCKED = 0` is defined anywhere. What other levels exist, what they gate, and how
 to unlock are **UNKNOWN**. Note that the post-firmware-update sequence writes `setAuthLock(0)` *first*,
@@ -542,7 +563,11 @@ in its UI. Worth revisiting with a newer APK.
 
 ### 6.4 Identity strings
 
-Fixed payload lengths: serial 8, chip UUID 8, hardware ID 8, firmware version 12, mfg date 8.
+Fixed payload lengths: serial 8, chip UUID **16**, hardware ID 8, firmware version 12, mfg date 8.
+The vendor client's own table says 8 for the chip UUID and this document copied it; hardware returned
+16 (`rx 12 09 …`, `1732abcd7fc0bcc1`), and every other length above was confirmed on the same unit —
+§14, "Corrections this produced". The error survived because at 8 the only guard consulting it, the
+unreachable write path below, would have refused a *correct* UUID and nothing ever ran it.
 
 Read `bytes[2:frame[0]]` and sanitise by dropping NUL, U+FFFD, and everything outside `0x20–0x7E`,
 then trim — the firmware NUL-pads. A serial is considered usable only when ≥ 4 chars after
@@ -553,8 +578,10 @@ length and command bytes and then slices off two *characters*; that misaligns on
 Also do not assume the response lengths: the length table is only consulted by an unreachable write
 path, so take whatever `frame[0]` declares.
 
-Commands 9, 10 and 12 are never issued by the app. The frames are constructible and the parser
-exists, so the CLI can offer them — but flag in `--help` that the firmware's willingness to answer is
+Commands 9, 10 and 12 are never issued by the app, which is why the analysis could say nothing about
+whether the firmware would answer them. All three were driven on hardware and all three answered
+(§14, "Corrections this produced": chip uuid 16, hardware id 8 `VFLEX…`, mfg date 8 `004apr26`), so
+the CLI offers them without a caveat — nothing in `--help` should still call their firmware support
 unverified.
 
 ### 6.5 Voltage, current, limits
@@ -565,7 +592,9 @@ checking is entirely the Go tool's job (§13).
 
 Read semantics: the app treats a returned **0 mV as "not ready"** and retries (3 attempts, 300 ms
 apart), returning null if never > 0. Match this or you will report 0 V on a freshly connected
-device. After a write, always issue an explicit read-back rather than trusting the echo.
+device. After a write, always issue an explicit read-back rather than trusting the echo — the echo
+proves nothing, as §14.4's scratchpad result shows. The implementation applies this to the settings
+that can hurt something and not to the rest; §17 records which, and why.
 
 **`CMD_CURRENT_LIMIT_MA` (19)** — u16 BE milliamps. On every successful connect the app performs a
 read-modify-write to 5000 mA if it differs. This is a **negotiation request, not a measurement** —
@@ -596,7 +625,9 @@ computing one. Firmware-side behaviour is the only plausible explanation.
 `<<`/`|` produce int32, so a top-bit-set response reads back negative and the reference
 implementation is signed in both directions. Use `int32`, not `uint32`. Both default to 0, which
 implies the firmware treats 0 as "use built-in calibration" rather than as a literal multiplier
-(otherwise every reading would be zero) — inference, not proof.
+(otherwise every reading would be zero). Confirmed on hardware (§14.11): a factory unit reads 0 for
+both terms and still answers `CMD_VMEASURE` with a sensible calibrated value — 437 raw counts →
+5270 mV.
 
 **There is no host-side calibration formula anywhere in the client.** The device computes the
 calibrated millivolts itself and returns them in `CMD_VMEASURE`. The fixed-point interpretation of
@@ -635,8 +666,10 @@ for CRC verify.
 **State to model:** `{connected, connecting, resetting, suspended, serialNumber, voltageMv,
 vlimitLowMv, vlimitHighMv, ledAlwaysOn, lastError}`.
 
-**Invalidate the cache on disconnect.** The reference client never clears its `device_data` object —
-a latent staleness bug worth not reproducing.
+**Do not cache device state at all.** The reference client never clears its `device_data` object — a
+latent staleness bug worth not reproducing, and a one-shot CLI has no session to keep warm, so the
+implementation holds no decoded device fields anywhere and every accessor issues a fresh read (§17).
+Anyone adding a cache is adding invalidation too; there is no existing mechanism to inherit.
 
 **Surface write errors.** The reference `port.send` swallows every exception, emits an `error` event,
 and resolves; a failed write therefore surfaces ~5 s later as a generic timeout. Return a real error.
@@ -655,7 +688,7 @@ output so the spec and the tool agree.
 | `hw_id` | string | — | 10 |
 | `fw_id` | string | — | 11 |
 | `mfg_date` | string | — | 12 |
-| `led_disable_during_operation` | u8 | inverted flag | 15 |
+| `led_disable_during_operation` | u8 | inverted flag; `--json` emits `led_always_on` un-inverted instead (§17) | 15 |
 | `secretsecrets` | []byte | — | 16 |
 | `pdo_payload`, `pdo_last_chunk_id`, `pdo_last_chunk_payload` | — | — | 17 |
 | `voltage_mv` | u16 | mV | 18 |
@@ -866,6 +899,12 @@ into equal pages. A flat binary carries no CRC, so it needs `--crc` or `--force`
 has its own budget, `--fetch-timeout` (15 s per this section); `--timeout` bounds MIDI commands and
 must not be reused for a download.
 
+**`--ws-url` must name a TLS endpoint.** The image and the CRC it is checked against arrive in the
+same JSON document, so whoever controls the stream controls both the bytes and the value they are
+compared against — a cleartext fetch authenticates nothing. A `ws://` or `http://` URL is refused
+rather than quietly downgraded; the deliberate spelling for a genuinely cleartext endpoint is
+`ws+insecure://`, which nobody types out of habit. The vendor client has no such notion (§17).
+
 Version comparison (for "is an update available"): uppercase and trim both strings, extract all
 decimal runs, compare element-wise with missing components as 0; an `X` or `*` in the new version
 always means "update available".
@@ -919,6 +958,9 @@ gflex firmware  version
                 bootloader               jump and stop
                 flash [file] [--recover] [--fetch] [--ws-url <u>] [--fetch-timeout <d>]
                                          [--crc <byte>] [--force] [--ack-mode]
+                                         [--page-size <n>]   split a raw .bin into
+                                         pages of n bytes; only a raw .bin has no
+                                         page split of its own (§10.2)
 gflex raw <hex…> [--no-ack] [--any-length]   send a frame verbatim, print the response
 gflex monitor [--for <d>]                decode and print live inbound frames
 gflex install-udev [--print]             write the rule, reload, report
@@ -1035,9 +1077,10 @@ here rather than quietly dropped:
 - **No clock is injected.** Timeout, backoff and retry tests sleep for real, which costs the
   `internal/session` suite about 15 s of wall time. It is honest — the same code paths run as in
   production — but it is why that one package dominates `go test ./...`.
-- **There is no hardware-test harness** (`//go:build hardware` + `GFLEX_TEST_PORT`). Nothing has
-  ever been run against a device, so there was nothing to gate; §14 is the bring-up plan instead.
-  Anyone with a unit adding one should keep it out of the default build, as originally specified.
+- **There is no hardware-test harness** (`//go:build hardware` + `GFLEX_TEST_PORT`). A bring-up
+  session did run on 2026-08-21 and §14 records what it measured, but it was driven by hand through
+  the CLI, so there is nothing checked in to gate. Anyone with a unit adding one should keep it out
+  of the default build, as originally specified; §14's measurements are the obvious first assertions.
 
 Packaging: `CGO_ENABLED=0` static binaries for amd64/arm64. The udev rule is embedded in the binary
 and `gflex install-udev` writes it to `/etc/udev/rules.d/70-gflex.rules`, which is the correct
@@ -1099,9 +1142,12 @@ one interlock that needs a second key uses a self-describing name rather than a 
 ## 14. Open questions — mostly resolved on hardware, 2026-08-21
 
 **Bring-up happened.** A real unit — serial `81a0bcc3`, firmware `APP.05.00.00`, PID `0x800F` — was
-attached and driven by this tool for the first time. Ten of the sixteen questions below are now
-answered from measurement rather than inference, and they are marked **RESOLVED** with what was
-observed. Three of the answers corrected this document; one corrected the code.
+attached and driven by this tool for the first time. **Nine** of the sixteen questions below are now
+answered from measurement rather than inference — 1, 2, 3, 4, 8, 11, 13, 14 and 15 — and one
+question the original list did not contain, the meaning of `SelectedPDOID`, was settled alongside
+them. Seven remain open: 5, 6, 7, 9, 10, 12 and 16. The answers are collected in the table
+immediately below, which is what marks a question resolved; there is no separate marker in the
+preserved list further down. Three of the answers corrected this document; one corrected the code.
 
 The single most important result is not in the list: **the protocol works.** Every frame this
 document describes round-tripped on the first attempt — the nibble-encoded MIDI framing, the
@@ -1124,7 +1170,7 @@ excursion. The originals are kept below for provenance; nothing has been deleted
 | 11 | ADC calibration | Offset and scale both read **0** on a factory unit, and `CMD_VMEASURE` still returns a sensible calibrated value (raw 437 counts → 5270 mV). Confirms the inference that firmware treats 0 as "use built-in calibration". The formula itself is still device-side and unknown. |
 | 13 | Does the device echo the flag bits? | **No — it clears them.** `tx 04 92 13 88` (write flag set) → `rx 04 12 13 88`. Masking the received command byte with `CmdCodeMask` is required, not merely defensive. |
 | 14 | Unsolicited frames? | **None.** Twelve seconds idle on a connected unit produced nothing. The device speaks only when spoken to. |
-| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe.** Failure rates over `info` (7 commands each): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**, each failure a response timeout. Writes at 1 ms: 0/30 failed, 0/30 wrong read-back. So the vendor's 20 ms is roughly 20× more conservative than needed and 1 ms is ~10× faster end to end (`info` 0.38 s → 0.04 s) — but the device does drop frames when pushed at full rate. Measured on one unit, one host; the default stays 20 ms until that is corroborated. |
+| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe.** Failure rates over plain `gflex info` (6 commands each — the count `internal/session/info_test.go` pins; 7 would be `info --all`, which adds the chip UUID): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**, each failure a response timeout. Writes at 1 ms: 0/30 failed, 0/30 wrong read-back. So the vendor's 20 ms is roughly 20× more conservative than needed and 1 ms is ~10× faster end to end (`info` 0.38 s → 0.04 s) — but the device does drop frames when pushed at full rate. Measured on one unit, one host; the default stays 20 ms until that is corroborated. |
 | — | `SelectedPDOID` semantics (§8) | **1-based USB-PD object position.** A unit targeting 5 V against a charger whose PDO 0 is the 5 V fixed supply reported `selected pdo: 1`. |
 
 ### Corrections this produced
@@ -1237,10 +1283,17 @@ constant anywhere — so **do not encode 430 as a protocol constant.**
 
 ## 15. Golden test vectors
 
-Frame → MIDI stream. These seeded the framer's table-driven tests and are now pinned, along with
+Frame → MIDI stream. These seeded the framer's table-driven tests and are also pinned, along with
 the rest, in `testdata/golden/frames.json` — which carries the same vectors plus their USB-MIDI
-packet form, several response (`rx`) frames, and two malformed frames that must be dropped. The
-file is the authority the tests read; every vector below appears in it verbatim.
+packet form, several response (`rx`) frames, and two malformed frames that must be dropped.
+
+The JSON is not a single source that the tests all read: `internal/transport/fake` opens it, while
+`internal/framer` and `internal/transport/usbmidi` carry their own transcriptions of the same
+vectors as Go literals. That is deliberate — three independent transcriptions of the same bytes
+cannot all drift the same way, which is the same reasoning that makes the fake decode the framing
+independently (§12). What keeps them in step is `fake.TestGoldenVectorsCoverSpec`, which asserts
+that every vector printed below is present in the JSON verbatim; changing a vector means changing
+this section and all three transcriptions.
 
 **Read serial number** — frame `02 08`
 
@@ -1340,7 +1393,9 @@ implementation deliberately does something else, because the vendor's behaviour 
 limitation, or a fit for a long-lived phone app rather than a one-shot CLI.
 
 They are listed here so that a future reader comparing code against spec does not "correct" the code
-back into a bug. Each was found during code review and carries a regression test.
+back into a bug. Each was found during code review, and each carries a regression test wherever
+there is behaviour to pin — the exception is row 8, where the deviation is the *absence* of a
+mechanism and there is nothing a test could hold still.
 
 | § | Vendor / spec behaviour | Implementation | Why |
 |---|---|---|---|
@@ -1356,9 +1411,13 @@ back into a bug. Each was found during code review and carries a regression test
 | 7 | 500 ms + 800 ms settle, then a ~25 s fixed backoff chain | No fixed settle; adaptive backoff against a ~10 s budget | The settle suits a long-lived app session; 1.3 s on every CLI invocation does not. The *persistence* is kept — without it a freshly plugged unit fails. A ready device pays nothing. |
 | 7 | `ensureCurrentLimitMa(5000)` on every connect | Not done | A CLI that silently rewrites your current limit during `voltage get` would be a bug, not parity. |
 | 5.2 | Send failures swallowed; surface as a 5 s timeout | Returned directly | "Timed out" for a failed write sends the user hunting the wrong problem. |
-| 8 | `device_data` never cleared on disconnect | Cache invalidated | Latent staleness bug; not worth reproducing. |
+| 8 | `device_data` never cleared on disconnect | **No cache at all**: `Session` holds no decoded device fields and every accessor issues a fresh read | Latent staleness bug; not worth reproducing. A one-shot CLI has nothing to cache across, so there is no invalidation path either — anyone adding a cache is adding invalidation with it, not inheriting one. |
 | 6.4 | Identity strings UTF-8-decoded over the whole frame, then sliced by *character* | `bytes[2:len]`, sanitised | The vendor's decode misaligns on any byte ≥ 0x80. |
 | 6.5 | No range validation of any kind | Full interlocks (§13) | The vendor writes whatever 16-bit value it is given. Ours is the only guard. |
+| 6.5 | "After a write, always issue an explicit read-back" — stated as universal | Read-back on `voltage`, `current` and `vlimit`; **not** on `led`, `authlock`, `tolerance` or `calibrate` | A read-back is a second round trip: a two-byte read frame is three MIDI messages and 3 × `--byte-delay` before the device answers, so at the 20 ms default it roughly doubles the cost of a one-setting write. It earns that on the three settings that can damage a load or lock a user out of their own envelope. It does not earn it on an LED preference, a lock level nothing yet reads, a tolerance term whose units are still unknown (§14.9), or a calibration pair the very next `gflex measure` will expose. Where a read-back is skipped, what is printed is the value that was *written*: it is never presented as a confirmation of what the device now holds. |
+| 8, 6.2 | `--json` field `led_disable_during_operation`, u8, inverted | `led_always_on`, bool, already un-inverted | §6.2 warns that the wire name gets read backwards; a JSON key meaning the opposite of what it says is that trap in machine-readable form. A consumer reading the vendor's name and honouring it would invert the setting. |
+| 3.4 | Fall back to the only MIDI port on the system, whatever it is | Fallback refused when discovery has positively identified the port as some **other** vendor's | Discovery walks sysfs for every port, so a non-zero vendor ID that is not Tundra Labs' is knowledge, not ignorance. The fallback exists for "the tool cannot tell what this is", which is not the same as "the tool can tell, and it is a synthesizer" — and taking it would start writing protocol frames at that synthesizer. `--port` still says "yes, that one, I mean it". |
+| 10.3 | `--fetch` over whatever URL it is given; the vendor client has no scheme rule | `ws://` and `http://` refused; TLS required, or the explicit `ws+insecure://` downgrade | The image and the CRC it is checked against arrive in the same document, so a cleartext fetch authenticates neither. The downgrade is spelled out in full for the same reason as `--ignore-device-limits` (§11): a second key nobody types out of habit, left in the shell history of the run it applied to. |
 
 ### Resolved since this document was written
 
@@ -1368,3 +1427,12 @@ back into a bug. Each was found during code review and carries a regression test
 - **§10.2's dead constants confirmed dead.** `BOOTLOADER_PREAMBLE_LEN = 4` and
   `MAX_VERIFY_PACKET_DATA = 60` are referenced nowhere in the vendor client. The real bootloader
   preamble is 2 bytes, as the frame table shows.
+- **§6.3's AUTHLOCK read layout is settled** (§14.8). The response carries two payload bytes,
+  `[0x16, level]` — the command code echoed a second time, then the level. The vendor client's
+  `frame[3]` was right and was never an off-by-one, so §6.3's "read and log both bytes until this is
+  checked" instruction no longer applies: the level is `payload[1]`, and a payload too short to hold
+  it is an error rather than a guess.
+- **§5.1's `CMD_FLAG_SCRATCHPAD` semantics are settled** (§14.4). The flag is validate-and-discard —
+  the write is acknowledged and echoed back with the value it was given, and then does not take
+  effect. It is not the volatile-vs-NVM distinction the name suggests, which is why it stays behind
+  the raw escape hatch and gets no friendlier spelling.

@@ -314,6 +314,81 @@ func TestCheckRawFrame(t *testing.T) {
 	if d := CheckRawFrame(scratch); !d.Confirm || !containsAny(d.Warnings, "scratchpad") {
 		t.Errorf("the scratchpad flag must be called out; got confirm=%v warnings=%q", d.Confirm, d.Warnings)
 	}
+	// And it must say what the flag actually does. Bring-up measured it as
+	// validate-and-discard -- acknowledged, echoed back, never committed
+	// (SPEC.md §14.4) -- which is the one thing a user needs to be told here,
+	// because the frame will look like it worked.
+	if d := CheckRawFrame(scratch); !containsAny(d.Warnings, "never committed") {
+		t.Errorf("the scratchpad warning does not say the write will not take effect: %q", d.Warnings)
+	}
+}
+
+// TestCheckRawFrameDisruptiveCommands covers the three self-warning cases of
+// SPEC.md §13.10 -- the ones the four generic reasons above the switch cannot
+// see.
+//
+// CMD_JUMP_APP_TO_BOOTLOADER is the case that motivated the switch: a plain
+// READ frame carrying a documented, known command code, so Write, Undocumented,
+// !Known and Scratchpad all say nothing about it, and without its arm
+// CheckRawFrame returns a zero Decision -- `gflex raw 02 14` would go out
+// unchallenged and leave the unit somewhere only `firmware flash --recover` can
+// reach.
+//
+// Every case asserts the warning TEXT, not merely that a confirmation happened.
+// For the voltage write that distinction is the whole test: the generic Write
+// reason already sets Confirm, so an assertion on Confirm alone would still
+// pass with the arm deleted and would be measuring nothing.
+func TestCheckRawFrameDisruptiveCommands(t *testing.T) {
+	cases := []struct {
+		name     string
+		frame    proto.Frame
+		wantWarn string
+	}{
+		{
+			"the jump is a documented read and still confirms",
+			proto.Frame{Cmd: proto.CmdJumpAppToBootloader},
+			"disconnects the device into bootloader mode",
+		},
+		{
+			"bootload end in application mode",
+			proto.Frame{Cmd: proto.CmdBootloadEnd},
+			"is a bootloader command",
+		},
+		{
+			"write chunk in application mode",
+			proto.Frame{Cmd: proto.CmdBootloaderWriteChunk},
+			"is a bootloader command",
+		},
+		{
+			"commit page in application mode",
+			proto.Frame{Cmd: proto.CmdBootloaderCommitPage},
+			"is a bootloader command",
+		},
+		{
+			"verify in application mode",
+			proto.Frame{Cmd: proto.CmdBootloaderVerify},
+			"is a bootloader command",
+		},
+		{
+			"a raw voltage write names the checks it bypasses",
+			proto.Frame{Cmd: proto.CmdVoltageMv, Write: true},
+			"bypassing every range check",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := CheckRawFrame(tc.frame)
+			if !d.OK() {
+				t.Fatalf("refused outright (%q); these are confirmations, not refusals", d.Refused)
+			}
+			if !d.Confirm {
+				t.Errorf("%s went through with no confirmation", tc.frame.Cmd)
+			}
+			if !containsAny(d.Warnings, tc.wantWarn) {
+				t.Errorf("warnings %q do not name the reason (%q)", d.Warnings, tc.wantWarn)
+			}
+		})
+	}
 }
 
 func containsAny(haystack []string, needle string) bool {

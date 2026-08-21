@@ -123,7 +123,11 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 }
 
 // readFrame reads one frame header and its payload.
-func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
+//
+// budget is how much of the message ceiling is still unspent, and it bounds the
+// payload allocation for a data frame. Control frames do not spend it: they are
+// bounded at 125 bytes by the RFC and are answered rather than accumulated.
+func (c *wsConn) readFrame(budget int) (fin bool, opcode byte, payload []byte, err error) {
 	var h [2]byte
 	if _, err := io.ReadFull(c.r, h[:]); err != nil {
 		return false, 0, nil, wrapRead(err)
@@ -163,8 +167,7 @@ func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) 
 		if length > 125 {
 			return false, 0, nil, fmt.Errorf("%w: control frame of %d bytes exceeds 125", errWebsocket, length)
 		}
-	}
-	if length > uint64(c.maxMsg) {
+	} else if length > uint64(budget) {
 		return false, 0, nil, fmt.Errorf("%w: frame of %d bytes exceeds the %d-byte limit", errWebsocket, length, c.maxMsg)
 	}
 
@@ -198,7 +201,13 @@ func (c *wsConn) readMessage() (byte, []byte, error) {
 		started bool
 	)
 	for {
-		fin, op, payload, err := c.readFrame()
+		// What is left of the ceiling, not the whole of it: checking the total
+		// only after the append let a two-fragment message allocate maxMsg on
+		// top of the maxMsg-1 already held, so the peak was twice the advertised
+		// cap (and more, across append's growth) before anything objected. Spent
+		// budget is passed down instead, so an over-long fragment is refused
+		// from its header, before its payload is allocated at all.
+		fin, op, payload, err := c.readFrame(c.maxMsg - len(buf))
 		if err != nil {
 			return 0, nil, err
 		}
@@ -226,9 +235,6 @@ func (c *wsConn) readMessage() (byte, []byte, error) {
 			buf = append(buf, payload...)
 		default:
 			return 0, nil, fmt.Errorf("%w: unknown opcode 0x%x", errWebsocket, op)
-		}
-		if len(buf) > c.maxMsg {
-			return 0, nil, fmt.Errorf("%w: message exceeds the %d-byte limit", errWebsocket, c.maxMsg)
 		}
 		if fin {
 			return msgOp, buf, nil
@@ -336,6 +342,22 @@ func (h *headerLimitReader) Read(p []byte) (int, error) {
 // unbound lifts the limit once the handshake has been accepted.
 func (h *headerLimitReader) unbound() { h.unlimited = true }
 
+// insecureWSScheme is the scheme that spells out a deliberate cleartext fetch.
+//
+// The image and the CRC it will be checked against arrive in the same JSON
+// document (SPEC.md §10.3), so whoever controls the stream controls both the
+// bytes and the value they are compared against: TLS is the only thing that
+// separates the vendor's firmware from anyone else's. A plain ws:// or http://
+// URL is therefore refused rather than quietly downgraded — the CLI's only
+// mention of the endpoint is an informational line, so nothing else in a run
+// would say the transport was unauthenticated.
+//
+// Cleartext is still reachable, but only by writing the downgrade out in full,
+// which is the same discipline as --ignore-device-limits (SPEC.md §11): a
+// second key that nobody types out of habit, and that stays in the shell
+// history of the run it applied to.
+const insecureWSScheme = "ws+insecure"
+
 // wsDial opens a WebSocket connection and completes the opening handshake.
 func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	u, err := url.Parse(rawURL)
@@ -346,8 +368,12 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	switch strings.ToLower(u.Scheme) {
 	case "wss", "https":
 		secure = true
-	case "ws", "http":
+	case insecureWSScheme:
 		secure = false
+	case "ws", "http":
+		return nil, fmt.Errorf("%w: %q is not a TLS endpoint, and firmware carries its expected CRC "+
+			"in the same document, so a cleartext fetch authenticates nothing; use wss:// or, if the "+
+			"endpoint really is cleartext, say so with %s://", errWebsocket, rawURL, insecureWSScheme)
 	default:
 		return nil, fmt.Errorf("%w: unsupported URL scheme %q", errWebsocket, u.Scheme)
 	}
@@ -482,9 +508,10 @@ const DefaultFetchTimeout = 15 * time.Second
 // happens to use does not matter.
 //
 // wsURL may be empty, in which case DefaultWSURL is used; timeout may be zero
-// for DefaultFetchTimeout. Callers who want to work offline should prefer
-// LoadFile — the local file is the primary input and this service is a
-// convenience (SPEC.md §10.3).
+// for DefaultFetchTimeout. It must name a TLS endpoint — see insecureWSScheme
+// for why, and for the one spelling that says otherwise on purpose. Callers who
+// want to work offline should prefer LoadFile — the local file is the primary
+// input and this service is a convenience (SPEC.md §10.3).
 func Fetch(ctx context.Context, wsURL, serial string, timeout time.Duration) (*Firmware, error) {
 	if wsURL == "" {
 		wsURL = DefaultWSURL

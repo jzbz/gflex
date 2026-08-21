@@ -24,8 +24,19 @@ const readBufSize = 512
 
 // idleBackoff is how long readLoop waits after a transport reports that no
 // bytes are available, so that a transport whose "nothing yet" is instant
-// cannot spin the CPU. It is far below the protocol's own pacing, so it adds no
-// measurable latency to a response.
+// cannot spin the CPU. Only usbmidi reaches it, and only for a zero-length or
+// padding-only IN transfer; its ordinary quiet case is a 100 ms transfer
+// timeout. On the default rawmidi transport the branch is unreachable
+// altogether: the node is opened O_NONBLOCK so the read parks in the netpoller,
+// and a zero-byte read from an os.File surfaces as io.EOF, never as (0, nil).
+//
+// It is not free when it does fire. The device does not pace what it sends:
+// SPEC.md §14 Q15's timings put a whole multi-message response inside a few
+// milliseconds, so an inbound byte can certainly be waiting sooner than 2 ms --
+// the outbound ByteDelay says nothing about the inbound direction. The cost is
+// bounded at one stall per response-arrival edge, which is noise against the
+// 20 ms default ByteDelay but worth revisiting if a low --byte-delay ever
+// becomes the default.
 const idleBackoff = 2 * time.Millisecond
 
 // defaultCloseGrace bounds how long Close waits for the reader goroutine to
@@ -245,9 +256,10 @@ func (f *Framer) readLoop() {
 			// available right now" -- usbmidi does, for a zero-length IN packet
 			// or a transfer carrying only padding, both of which complete
 			// instantly. Re-entering ReadMIDI immediately would pin a core
-			// issuing ioctls for as long as the device stays quiet. Backing off
-			// costs nothing: the protocol paces at ByteDelay per MIDI message,
-			// so there is never a byte waiting sooner than this.
+			// issuing ioctls for as long as the device stays quiet. The wait
+			// can delay a reply by up to idleBackoff -- the device does not
+			// pace what it sends (SPEC.md §14 Q15) -- but only once per
+			// arrival edge; see idleBackoff for why that is cheap.
 			select {
 			case <-f.done:
 				return

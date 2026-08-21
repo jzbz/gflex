@@ -203,6 +203,60 @@ func TestParseHexBytes(t *testing.T) {
 	}
 }
 
+// TestParseDecimalInt covers the grammar every device-write integer flag goes
+// through. The case that matters is "0750": base 0 -- what strconv and pflag
+// both default to -- reads it as octal 488, and 488 mV is an unremarkable
+// value that no interlock can question.
+func TestParseDecimalInt(t *testing.T) {
+	tests := []struct {
+		in   string
+		bits int
+		want int64
+		ok   bool
+	}{
+		{in: "0", bits: 32, want: 0, ok: true},
+		{in: "750", bits: 32, want: 750, ok: true},
+		{in: " 750 ", bits: 32, want: 750, ok: true},
+		// The finding's case: decimal 750, and never octal 488.
+		{in: "0750", bits: 32, want: 750, ok: true},
+		{in: "010", bits: 32, want: 10, ok: true},
+		// A sign parses; the callers own the bound, so a negative offset is
+		// legitimate here and an out-of-range tolerance is refused downstream.
+		{in: "-2147483648", bits: 32, want: -2147483648, ok: true},
+		{in: "+750", bits: 32, want: 750, ok: true},
+		// Go literal shapes are refused outright.
+		{in: "0x10", bits: 32, ok: false},
+		{in: "1_0", bits: 32, ok: false},
+		{in: "1e1", bits: 32, ok: false},
+		{in: "7.5", bits: 32, ok: false},
+		{in: "", bits: 32, ok: false},
+		{in: "seven", bits: 32, ok: false},
+		// Wider than the caller's conversion fails the parse rather than
+		// wrapping into a plausible-looking value.
+		{in: "2147483648", bits: 32, ok: false},
+	}
+	for _, tt := range tests {
+		got, err := parseDecimalInt(tt.in, "--nominal", "0..65535", tt.bits)
+		if tt.ok {
+			if err != nil {
+				t.Errorf("parseDecimalInt(%q) failed: %v", tt.in, err)
+				continue
+			}
+			if got != tt.want {
+				t.Errorf("parseDecimalInt(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("parseDecimalInt(%q) = %d, want a refusal", tt.in, got)
+			continue
+		}
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("parseDecimalInt(%q): ExitCode = %d, want ExitUsage (%d)", tt.in, code, ExitUsage)
+		}
+	}
+}
+
 func TestFormatters(t *testing.T) {
 	if got, want := formatMv(12000), "12000 mV (12 V)"; got != want {
 		t.Errorf("formatMv(12000) = %q, want %q", got, want)

@@ -115,14 +115,14 @@ type disconnectClaim struct {
 	driver [maxDriverName + 1]byte
 }
 
-// Flags for USBDEVFS_DISCONNECT_CLAIM. Both are filters on the driver currently
-// bound to the interface: IF_DRIVER detaches only when the bound driver's name
-// equals driver[], EXCEPT_DRIVER detaches only when it differs. With neither
-// flag set the kernel detaches whatever is bound.
-const (
-	disconnectClaimIfDriver     = 0x01
-	disconnectClaimExceptDriver = 0x02
-)
+// disconnectClaimExceptDriver is USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER: a
+// filter on the driver currently bound to the interface, detaching it only when
+// its name differs from driver[]. The kernel also defines
+// USBDEVFS_DISCONNECT_CLAIM_IF_DRIVER (0x01), the opposite filter, and treats
+// neither flag set as "detach whatever is bound"; neither is used here, because
+// the VFLEX presents as snd-usb-audio in application mode and as nothing at all
+// in bootloader mode, so the bound driver's name is never known ahead of time.
+const disconnectClaimExceptDriver = 0x02
 
 // Request numbers. These are constants in all but name -- Go cannot call a
 // function from a const expression, and nothing ever writes to them. The

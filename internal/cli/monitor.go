@@ -32,10 +32,11 @@ func newMonitorCommand(app *App) *cobra.Command {
 		Short: "Print decoded protocol frames as they arrive",
 		Long: "monitor opens the transport and prints every frame the device sends, decoded and\n" +
 			"timestamped. It sends nothing itself.\n\n" +
-			"This is a bring-up tool. Two of the open questions in SPEC.md §14 are answerable\n" +
-			"with it and nothing else: whether the device ever sends unsolicited frames (§14.14)\n" +
-			"and whether it echoes the write and scratchpad flag bits, which the vendor client\n" +
-			"masks off before it can observe them (§14.13).\n\n" +
+			"This is a bring-up tool, and it did its first job: SPEC.md §14.14 and §14.13 were\n" +
+			"settled with it and nothing else -- the device sends nothing unsolicited, and it\n" +
+			"clears the write and scratchpad flag bits rather than echoing them. What is left\n" +
+			"is watching for frames the decoder discards, which nothing else surfaces at all\n" +
+			"(SPEC.md §3.3), and confirming either answer on a second unit or firmware.\n\n" +
 			"Only the receive direction is visible here, because the ALSA rawmidi node does not\n" +
 			"loop back what another process writes. To see both directions of a real exchange,\n" +
 			"run the command you want to watch with -v, which traces the session's own frames.\n\n" +
@@ -74,19 +75,10 @@ func (a *App) runMonitor(ctx context.Context, duration time.Duration) error {
 	// resync, an accumulator overflow -- never reach Frames() or Errors(). The
 	// vendor client drops them silently and the pending command just times out
 	// five seconds later with no diagnostic, which SPEC.md §3.3 asks us to fix.
-	// Surfacing them is most of the point of this command: they are the
-	// evidence that would settle SPEC.md §14.13 and §14.14 on real hardware.
-	//
-	// The hook runs on the framer's reader goroutine, so it must be installed
-	// before Start and must not block. drops is buffered and the send is
-	// non-blocking for exactly that reason.
-	drops := make(chan monitorDrop, 32)
-	fr.SetDropHook(func(reason string, buffered []byte) {
-		select {
-		case drops <- monitorDrop{at: time.Now(), reason: reason, buffered: buffered}:
-		default: // reader is behind; a lost drop notice must not stall decoding
-		}
-	})
+	// Surfacing them is most of the point of this command: a malformed frame is
+	// the one class of device output nothing else in the tool can see, and it is
+	// what §14.13 and §14.14 were watched for on hardware.
+	drops := monitorDrops(fr)
 	fr.Start()
 	defer fr.Close()
 
@@ -114,8 +106,9 @@ func (a *App) runMonitor(ctx context.Context, duration time.Duration) error {
 // goods". That coin flip cost real evidence twice over: on an unplug the
 // terminal ENODEV sat in errs while frames closed first, so about half of
 // unplugs exited 0 printing nothing -- and in the mirror case up to 16
-// buffered decoded frames were abandoned, which on this command are the
-// bring-up observations that would settle SPEC.md §14.13/§14.14. session.go
+// buffered decoded frames were abandoned, which on this command are the whole
+// record of what the device sent -- the observations that settled SPEC.md
+// §14.13 and §14.14 arrived exactly this way. session.go
 // documents the same pattern at its drain sites ("a closed channel is not a
 // reason to stop"); this is that pattern with the drop hook serviced alongside.
 //
@@ -192,6 +185,33 @@ func (a *App) printMonitorFrame(enc *json.Encoder, at time.Time, dir string, fra
 		return
 	}
 	fmt.Fprintf(a.stdout, "%-12s %-3s %-34s %s\n", at.Format("15:04:05.000"), dir, proto.Hex(frame), decoded)
+}
+
+// monitorDrops installs the drop hook on fr and returns the channel it feeds.
+//
+// It exists as a named function rather than as five lines inside runMonitor
+// because it is the whole of a SPEC.md §17 deliberate divergence -- the vendor
+// drops malformed frames silently, this reports them -- and §17 asks that each
+// of those carry a regression test. runMonitor's own transport cannot be faked,
+// but this can: TestMonitorDropHookIsWiredToTheFramer drives a real Framer over
+// a malformed stream and waits on the returned channel, so deleting the
+// SetDropHook call, or the framer's delegation to the decoder, fails a test
+// instead of quietly restoring the vendor behaviour.
+//
+// Call it before fr.Start(). The hook runs on the framer's reader goroutine and
+// the decoder's hook field is not lock-guarded, so installing it after Start
+// both races that reader and misses every drop until it lands. The hook must
+// not block either, which is why the channel is buffered and the send is
+// non-blocking.
+func monitorDrops(fr *framer.Framer) chan monitorDrop {
+	drops := make(chan monitorDrop, 32)
+	fr.SetDropHook(func(reason string, buffered []byte) {
+		select {
+		case drops <- monitorDrop{at: time.Now(), reason: reason, buffered: buffered}:
+		default: // reader is behind; a lost drop notice must not stall decoding
+		}
+	})
+	return drops
 }
 
 // monitorDrop is one frame the decoder discarded, carried from the framer's

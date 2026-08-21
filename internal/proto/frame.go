@@ -7,11 +7,15 @@ import (
 	"strings"
 )
 
-// Frame errors.
+// Frame errors. These two are the whole set the package can produce.
+//
+// There is deliberately no error for an invalid declared length: Parse must
+// reproduce the vendor client's lenient fallback (SPEC.md §5.2) rather than
+// reject, so that condition is reported through Frame.DeclaredValid instead of
+// through a sentinel nothing would ever return.
 var (
 	ErrPayloadTooLong = errors.New("proto: payload exceeds maximum frame size")
 	ErrShortFrame     = errors.New("proto: frame shorter than the 2-byte preamble")
-	ErrBadLength      = errors.New("proto: declared frame length is invalid")
 )
 
 // Frame is a decoded protocol frame.
@@ -21,18 +25,34 @@ type Frame struct {
 	// Write reports whether FlagWrite was set in the command byte.
 	Write bool
 	// Scratchpad reports whether FlagScratchpad was set. The vendor app never
-	// sets this bit; its meaning is undetermined.
+	// sets this bit. On the one unit measured it is validate-and-discard: the
+	// write is acknowledged and echoed back but never takes effect (SPEC.md
+	// §14.4).
 	Scratchpad bool
 	// Payload is the frame body, excluding the two preamble bytes.
 	Payload []byte
+	// DeclaredLen is the length byte as received, before validation.
+	DeclaredLen int
+	// DeclaredValid reports that DeclaredLen itself bounded the frame -- it was
+	// within [PreambleLen, len(raw)] and no lenient fallback was applied.
+	//
+	// The distinction is what separates a frame from noise, and it cannot be
+	// recovered from Payload afterwards: CmdBootloaderWriteChunk is command
+	// code 0, so under the fallback an all-zero buffer parses as a well-formed
+	// WRITE_CHUNK frame whose payload length happens to match the buffer
+	// exactly. The bootloader's sibling parser carries the same flag for the
+	// same reason; see bootloader.Response.
+	DeclaredValid bool
 }
 
 // Build encodes a request frame.
 //
 // The write flag marks the frame as carrying a value to be stored. The
 // scratchpad flag is exposed for completeness but is never set by the vendor
-// application and its effect on the device is unknown; callers should not set
-// it outside a deliberate raw/experimental path.
+// application, and on the one unit measured it makes a write validate and then
+// discard -- acknowledged, echoed back, never committed (SPEC.md §14.4). It is
+// therefore a trap outside a deliberate raw/experimental path, where a
+// successful-looking response means the value was not stored.
 //
 // Build enforces only the limit inherent to the frame format -- the single-byte
 // length field. It deliberately does not enforce the tighter MaxPayloadLen: that
@@ -73,25 +93,34 @@ func Write(c Cmd, payload []byte) ([]byte, error) {
 
 // Parse decodes a received frame.
 //
-// It reproduces the vendor client's lenient length handling: if the declared
-// length is absent, below the preamble size, or larger than the bytes actually
-// received, the whole buffer is used instead. Callers that need to know a frame
-// was malformed should compare len(raw) against the returned frame size.
+// It reproduces the vendor client's lenient length handling, which SPEC.md §5.2
+// mandates: if the declared length is absent, below the preamble size, or larger
+// than the bytes actually received, the whole buffer is used instead and no
+// error is returned.
+//
+// Callers that must not act on a malformed frame check Frame.DeclaredValid.
+// Comparing len(raw) against the returned payload length does not work and is
+// exactly backwards: under the fallback the payload runs to the end of the
+// buffer, so the two agree precisely when the declared length was bogus, while a
+// well-formed frame followed by padding is the case where they differ.
 func Parse(raw []byte) (Frame, error) {
 	if len(raw) < PreambleLen {
 		return Frame{}, fmt.Errorf("%w: %d bytes", ErrShortFrame, len(raw))
 	}
 	declared := int(raw[0])
+	valid := declared >= PreambleLen && declared <= len(raw)
 	end := declared
-	if declared < PreambleLen || declared > len(raw) {
+	if !valid {
 		end = len(raw)
 	}
 	b := raw[1]
 	return Frame{
-		Cmd:        Cmd(b & CmdCodeMask),
-		Write:      b&FlagWrite != 0,
-		Scratchpad: b&FlagScratchpad != 0,
-		Payload:    raw[PreambleLen:end],
+		Cmd:           Cmd(b & CmdCodeMask),
+		Write:         b&FlagWrite != 0,
+		Scratchpad:    b&FlagScratchpad != 0,
+		Payload:       raw[PreambleLen:end],
+		DeclaredLen:   declared,
+		DeclaredValid: valid,
 	}, nil
 }
 

@@ -40,8 +40,9 @@ func newDevicesCommand(app *App) *cobra.Command {
 		Long: "devices lists every ALSA rawmidi port on the system and every USB device carrying\n" +
 			"the Tundra Labs vendor ID, so you can tell which one to pass to --port.\n\n" +
 			"A port is marked as a VFLEX when its USB parent has vendor 0x37BF. The product ID\n" +
-			"is not matched: it appears nowhere in the vendor application and the only PID ever\n" +
-			"published for this device is uncorroborated (SPEC.md §14.1).",
+			"is not matched: application mode reports 0x800F (SPEC.md §14.1, measured), but the\n" +
+			"bootloader-mode PID is still unmeasured (SPEC.md §14.16), so the vendor ID is the\n" +
+			"only thing that identifies the device in both modes.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return app.run(cmd, func(ctx context.Context, f Formatter) error {
@@ -69,6 +70,12 @@ func (a *App) listDevices(_ context.Context, f Formatter) error {
 			ProductID: hexID(p.ProductID),
 			IsVFlex:   p.IsVFlex,
 		})
+		// p.Name is device-supplied and goes into the table unquoted. That is
+		// safe at the source rather than here: rawmidi's portName filters every
+		// candidate through printableName, so anything outside printable ASCII
+		// -- the escapes and newlines that would let a name forge a row -- is
+		// gone before this ever sees it. Re-quoting here would only make the
+		// common case harder to read.
 		rows = append(rows, []string{p.Path, fmt.Sprintf("%d:%d", p.Card, p.Device), p.Name, idPair(p), vflexMark(p.IsVFlex)})
 	}
 	f.Table("midi_ports", "MIDI ports", items,

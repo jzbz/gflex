@@ -49,6 +49,12 @@ type Fault struct {
 	// Drop suppresses the response entirely. The command then times out, which
 	// is the only failure mode the protocol itself has: there is no NACK and no
 	// device-reported error anywhere (SPEC.md §5.2).
+	//
+	// The drop happens before the responder runs, so a dropped write never
+	// takes effect either: this models the REQUEST being lost, not an applied
+	// write whose acknowledgement was lost. The host cannot tell those apart
+	// (SPEC.md §5.2) and only the first is staged here. A test that needs the
+	// second has to write without a fault and then swallow the reply.
 	Drop bool
 
 	// Delay holds the response back for this long before it becomes readable.
@@ -56,8 +62,11 @@ type Fault struct {
 	Delay time.Duration
 
 	// Mismatch replaces the response's command code with MismatchCmd, keeping
-	// the flag bits of the request. A host must log this and keep waiting
-	// rather than treat it as a hard error (SPEC.md §5.2).
+	// the request's write flag. Only that one flag: the scratchpad bit is
+	// cleared on every response path, mismatched or not, so a test that needs a
+	// response carrying it has to inject the frame with Device.Push. A host
+	// must log a mismatch and keep waiting rather than treat it as a hard error
+	// (SPEC.md §5.2).
 	Mismatch    bool
 	MismatchCmd proto.Cmd
 
@@ -273,9 +282,10 @@ func (d *Device) ClearSent() {
 }
 
 // Push makes frame readable by the host as if the device had sent it
-// unprompted, without any request having arrived. Use it to exercise the host's
-// unexpected-frame path (SPEC.md §5.2); whether real firmware ever does this is
-// undetermined (SPEC.md §14.14).
+// unprompted, without any request having arrived. Real firmware never does
+// this -- twelve seconds idle on a connected unit produced nothing (SPEC.md
+// §14, question 14) -- but the host still has an unexpected-frame path
+// (SPEC.md §5.2), and this is how it is exercised.
 func (d *Device) Push(frame []byte) error {
 	return d.PushMIDI(encodeFrameMIDI(frame))
 }
@@ -488,9 +498,13 @@ func (d *Device) reply(req proto.Frame, payload []byte, fault Fault) {
 		cmd = fault.MismatchCmd
 	}
 	// Echo the write flag: a write is answered by an echo the host may parse as
-	// if it were a read (SPEC.md §5.2). Whether real firmware echoes the flag
-	// bits at all is undetermined (SPEC.md §14.13); the host masks them off
-	// before comparing, so echoing is the safe choice.
+	// if it were a read (SPEC.md §5.2). A real unit does NOT do this -- it
+	// clears the flag bits (SPEC.md §14, question 13, measured 2026-08-21:
+	// tx 04 92 13 88 -> rx 04 12 13 88). The fake echoes anyway, deliberately,
+	// because that makes it the stricter double: a host that forgot to mask the
+	// received command byte with proto.CmdCodeMask fails here, where against a
+	// flag-clearing fake it would pass and then break on hardware. The
+	// scratchpad flag is never echoed on any path.
 	frame, err := proto.Build(cmd, payload, req.Write, false)
 	if err != nil {
 		return // unreachable: payload was clamped above

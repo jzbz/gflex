@@ -82,7 +82,23 @@ func newFirmwareVersionCommand(app *App) *cobra.Command {
 				}
 				f.KV("fw_id", "firmware", v, v)
 				// The PD capability scan is hard-gated on 5.0.0 (SPEC.md §9).
-				if ok, _, err := c.Session.FirmwareAtLeast(ctx, 5, 0, 0); err == nil && !ok {
+				//
+				// Compared here rather than through Session.FirmwareAtLeast,
+				// which starts by reading the version off the device again:
+				// this command's entire body is one read, and asking twice
+				// doubled both its device time and its worst-case wait on a
+				// unit that has stopped answering. The comparison itself needs
+				// no device -- session.VersionAtLeast is a pure function of the
+				// string -- so the one read above answers both what to print
+				// and whether to warn, which is what --dry-run has always
+				// advertised above with its single Read frame.
+				//
+				// It also stops a failure being swallowed: the second read's
+				// error was discarded (`err == nil && !ok`), so a dropped
+				// response -- routine in a protocol with no NACK (SPEC.md §5.2)
+				// -- silently omitted the note from a unit that had already
+				// told us its version was too old.
+				if !session.VersionAtLeast(v, 5, 0, 0) {
 					f.Note("")
 					f.Note("%s", msgFirmwareTooOld)
 				}
@@ -171,9 +187,9 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 		wsURL        string
 		fetchTimeout time.Duration
 		force        bool
-		crcArg       int
+		crcArg       string
 		ackFirst     bool
-		pageSize     int
+		pageSizeArg  string
 	)
 	cmd := &cobra.Command{
 		Use:   "flash [file]",
@@ -205,12 +221,24 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 				if path != "" && fetch {
 					return codedf(ExitUsage, "give a firmware file or --fetch, not both")
 				}
-				if crcArg < -1 || crcArg > 255 {
-					return codedf(ExitUsage, "--crc must be a byte value 0..255")
+				// -1 is "no expected CRC given", which is what the image's
+				// own value is checked against when it has one.
+				crc := -1
+				if strings.TrimSpace(crcArg) != "" {
+					v, err := parseCRCByte(crcArg)
+					if err != nil {
+						return err
+					}
+					crc = v
 				}
 				if fetchTimeout <= 0 {
 					return codedf(ExitUsage, "--fetch-timeout must be positive, got %s", fetchTimeout)
 				}
+				pageSize64, err := parseDecimalInt(pageSizeArg, "--page-size", "a 32-bit page size", 32)
+				if err != nil {
+					return err
+				}
+				pageSize := int(pageSize64)
 				// The library treats a page size <= 0 as "unset, use the
 				// default" so that LoadOptions has a workable zero value. That
 				// is right for the zero value and wrong for an explicit
@@ -241,7 +269,7 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 					wsURL:        wsURL,
 					fetchTimeout: fetchTimeout,
 					force:        force,
-					crc:          crcArg,
+					crc:          crc,
 					ackFirst:     ackFirst,
 					pageSize:     pageSize,
 				})
@@ -252,7 +280,14 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 	fl.BoolVar(&recoverMode, "recover", false,
 		"skip the jump and talk straight to a unit already in bootloader mode (slow-blinking white LED)")
 	fl.BoolVar(&fetch, "fetch", false, "fetch the image for this unit's serial from the vendor service")
-	fl.StringVar(&wsURL, "ws-url", bootloader.DefaultWSURL, "WebSocket endpoint used by --fetch")
+	// The TLS requirement belongs in the help rather than only in the dial
+	// error: the image and the CRC it is checked against arrive in the same
+	// document, so a cleartext fetch authenticates neither (SPEC.md §10.3).
+	// Someone pointing this at a lab endpoint should learn the spelling of the
+	// downgrade before the refusal, not from it.
+	fl.StringVar(&wsURL, "ws-url", bootloader.DefaultWSURL,
+		"WebSocket endpoint used by --fetch; must be wss:// or https:// -- a cleartext endpoint is "+
+			"refused unless its URL says ws+insecure:// in full")
 	// --timeout is the per-command response timeout for the MIDI protocol and
 	// has no bearing on an HTTP/WebSocket download; using it here bounded a
 	// whole firmware download by 5 s. The budget SPEC.md §10.3 records for the
@@ -260,12 +295,24 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 	fl.DurationVar(&fetchTimeout, "fetch-timeout", bootloader.DefaultFetchTimeout,
 		"budget for the whole --fetch download (SPEC.md §10.3); --timeout bounds MIDI commands, not this")
 	fl.BoolVar(&force, "force", false, "flash an image that carries no CRC, skipping verification")
-	fl.IntVar(&crcArg, "crc", -1, "expected CRC byte, when the image does not carry one")
+	// A string parsed by parseCRCByte rather than IntVar, for the reason given
+	// there: a CRC is compared rather than applied, so a misread value fails
+	// silently by matching for the wrong reason.
+	fl.StringVar(&crcArg, "crc", "", "expected CRC byte, when the image does not carry one; "+
+		"decimal, or hex with an explicit 0x prefix")
 	fl.BoolVar(&ackFirst, "ack-mode", false, "stream in acknowledged mode from the start (slower, more robust)")
-	fl.IntVar(&pageSize, "page-size", 0, fmt.Sprintf(
-		"split a raw .bin into flash pages of this many bytes (0 means the %d-byte default); "+
-			"set it to the part's real page size -- a wrongly split raw image can flash and even "+
-			"verify cleanly (SPEC.md §10.2). Not for JSON images or --fetch, which carry their own split",
+	// A string parsed by parseDecimalInt rather than IntVar, for the reason
+	// given there: pflag parses an integer flag with base 0, so `--page-size
+	// 0200` would be read as octal 128 rather than 200 -- and both of those are
+	// geometries the loader accepts, so nothing downstream can catch the
+	// substitution. This is the one flag in the tool whose wrong value can
+	// flash *and verify* cleanly (SPEC.md §10.2, §14.12), which makes it the
+	// last one that may quietly mean a different number than the one typed.
+	fl.StringVar(&pageSizeArg, "page-size", "0", fmt.Sprintf(
+		"split a raw .bin into flash pages of this many bytes, plain decimal (0 means the %d-byte "+
+			"default, which is an assumption about the part, not a value read from it); set it to "+
+			"the part's real page size -- a wrongly split raw image can flash and even verify "+
+			"cleanly (SPEC.md §10.2). Not for JSON images or --fetch, which carry their own split",
 		bootloader.DefaultPageSize))
 	return cmd
 }
@@ -370,6 +417,27 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 	if err != nil {
 		return err
 	}
+	// Deferred, and not closed the moment the flash is over the way the MIDI
+	// port is above. bootloader.Update's caller contract lists closing the
+	// usbfs device first among the steps that follow it, and this is the one
+	// caller that does not do it there; the reason is that here there is
+	// nothing for an early release to unblock. The MIDI port is released early
+	// because the presence check that follows watches an ALSA node this process
+	// would otherwise be holding. Neither half of that applies to this handle:
+	// the bootloader interface is vendor-class with no kernel driver bound
+	// (usbfs.Device.ClaimInterface says so), so the release owes the system no
+	// rebind, and CMD_BOOTLOAD_END resets the unit, which comes back at a fresh
+	// bus address -- this fd names a device instance that has already left the
+	// bus and cannot hold the new node against snd-usb-audio. Holding it to the
+	// end instead means one release point covering every early return between
+	// here and the end of phase 5.
+	//
+	// That last step is reasoning about how usbfs behaves rather than something
+	// measured -- SPEC.md §14.16 (bootloader re-enumeration) is still open --
+	// so if a flash is ever seen to stall in phase 4 waiting for the unit to
+	// come back, moving the release to just after runUpdate is the first thing
+	// to try. Device.Close is not idempotent (it re-closes the *os.File), so
+	// that change needs a once-guard rather than a second bare call.
 	defer dev.Close()
 
 	expectSerial := appSerial
@@ -915,19 +983,29 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 			return nil, fmt.Errorf("fetching firmware for serial %s: %w", serial, err)
 		}
 	} else {
-		// --page-size only means anything to a raw .bin: the JSON payload
-		// shapes carry their own page split, and the loader ignores
-		// LoadOptions.PageSize for them. Silently ignoring the one flag whose
-		// whole purpose is guarding raw-image geometry -- the path where a
-		// wrong split can flash and verify cleanly (SPEC.md §10.2, §14.12) --
-		// would leave the user believing they had set it, so a JSON image
-		// with the flag is refused instead. A sniff error is deliberately not
-		// acted on here: LoadFileWithOptions reads the same file next and
-		// reports the failure with the path in it.
+		// --page-size is refused on every JSON image, because whether the
+		// loader would honour it depends on the shape *inside* the document.
+		// The object payload takes its split from the payload's own page_size
+		// and ignores LoadOptions.PageSize outright. A bare array is honoured
+		// only when its elements turn out to be byte values -- a flat image
+		// with no split of its own, which bootloader.ParseImage treats exactly
+		// like a raw .bin -- and ignored when they are pages. Telling those two
+		// apart means parsing the whole document, which is the loader's job,
+		// not a sniff's, and being wrong about it means silently ignoring the
+		// one flag whose whole purpose is guarding raw-image geometry, on the
+		// path where a wrong split can flash and even verify cleanly (SPEC.md
+		// §10.2, §14.12). So the refusal is deliberately wider than the set of
+		// images that would actually ignore the flag: it costs a bare-array
+		// user the ability to state a geometry from this command, which is a
+		// worse outcome only if they cannot hand the same bytes over as a .bin.
+		//
+		// A sniff error is deliberately not acted on here: LoadFileWithOptions
+		// reads the same file next and reports the failure with the path in it.
 		if o.pageSize != 0 {
 			if isJSON, jerr := fileLooksJSON(o.path); jerr == nil && isJSON {
-				return nil, codedf(ExitUsage, "--page-size splits a raw .bin, but %s is a JSON image "+
-					"carrying its own page split; drop the flag", o.path)
+				return nil, codedf(ExitUsage, "--page-size splits a raw .bin, but %s is a JSON image, "+
+					"where the page split is the payload's to state; drop the flag, or pass the "+
+					"image as a raw .bin", o.path)
 			}
 		}
 		// Page-geometry validation (divisibility by ChunksPerPage, chunk fit)
@@ -956,9 +1034,11 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 // shapes rather than a raw binary, by the same rule bootloader.ParseImage
 // detects the format with: the first non-whitespace byte is '{' or '['. The
 // duplication is one switch on one byte, and it exists so that --page-size can
-// be refused on a JSON image *before* the loader silently ignores it; a wholly
-// whitespace or unreadable file is not judged here -- the loader reads the
-// same file next and its error names the path.
+// be refused on a JSON image *before* the loader is handed it -- see
+// loadFirmware for why that refusal deliberately covers every JSON shape and
+// not only the ones whose split really does come from the payload. A wholly
+// whitespace or unreadable file is not judged here: the loader reads the same
+// file next and its error names the path.
 func fileLooksJSON(path string) (bool, error) {
 	fh, err := os.Open(path)
 	if err != nil {

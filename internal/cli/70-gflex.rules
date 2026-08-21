@@ -1,5 +1,11 @@
 # Werewolf VFLEX -- Tundra Labs, USB vendor 0x37BF (14271 decimal).
 # Product ID is deliberately not matched: the vendor app filters on VID only.
+#
+# This file exists twice, byte-identical: internal/cli/70-gflex.rules, which
+# install-udev embeds, and packaging/udev/70-gflex.rules, which distributions
+# ship. go:embed cannot reach outside its own package directory, so the copy is
+# forced -- edit both. TestPackagedUdevRuleMatchesTheEmbeddedOne fails if the
+# two ever drift.
 
 # Raw USB (usbfs) for the direct-USB transport and the class-0xFF bootloader.
 # ATTR{} (not ATTRS{}) is correct: the usb_device node owns idVendor itself.

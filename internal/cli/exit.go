@@ -81,6 +81,13 @@ func codedSelfExplanatory(code int, format string, args ...any) error {
 
 // refused builds the error returned when a safety interlock blocks an
 // operation. The wording deliberately states that nothing was written.
+//
+// That sentence is a claim about the caller, and the callers have to keep it
+// true. It holds for every SPEC.md §13 confirmation because each one is
+// evaluated ahead of the write it guards -- App.apply runs before App.connect
+// at each of its call sites. It does NOT hold for the scan wizard's handover
+// prompt, which runs after the capture log has been erased, so that path
+// reports a usage error instead; see errNoAnswer in root.go.
 func refused(reason string) error {
 	return codedf(ExitRefused, "refused: %s\nnothing was written to the device", reason)
 }

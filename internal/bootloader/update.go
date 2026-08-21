@@ -140,20 +140,6 @@ func Update(ctx context.Context, dev *usbfs.Device, iface usbfs.Interface, fw *F
 	return update(ctx, NewFlasher(dev, iface), fw, opts)
 }
 
-// ReadSerial reports the serial number of a unit that is already in bootloader
-// mode, writing nothing to it.
-//
-// It exists for the recovery path (--recover), which reaches the bootloader
-// without ever having been in application mode and so has to ask the unit who
-// it is before it can fetch the right image. The ordinary path already has the
-// serial from application mode. Either way, pass it as
-// UpdateOptions.ExpectSerial: Update re-reads and re-checks it as its own first
-// step, which is the check that must happen with the flash immediately behind
-// it (SPEC.md §9.2 enforces the same invariant for the PDO scan).
-func ReadSerial(ctx context.Context, dev *usbfs.Device, iface usbfs.Interface) (string, error) {
-	return NewFlasher(dev, iface).Serial(ctx)
-}
-
 // update is Update over an already-built Flasher, so the sequencing can be
 // tested without a USB device.
 func update(ctx context.Context, f *Flasher, fw *Firmware, opts UpdateOptions) (*UpdateResult, error) {

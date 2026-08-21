@@ -383,7 +383,7 @@ func sprAVSFailureNote(p PDO, v float64) (note string, assumed bool) {
 
 	case v+cmpEps < SPRAVSMinVoltageV || v-cmpEps > SPRAVSMaxVoltageV:
 		return fmt.Sprintf("SPR AVS covers %s only, and that range is assumed rather than scanned: %s",
-			formatRange(SPRAVSMinVoltageV, SPRAVSMaxVoltageV), sprAVSAssumptionClause), true
+			formatRange(SPRAVSMinVoltageV, SPRAVSMaxVoltageV), SPRAVSAssumptionClause), true
 
 	default:
 		// v is inside the assumed range, so the range is not what refused it:
@@ -392,7 +392,7 @@ func sprAVSFailureNote(p PDO, v float64) (note string, assumed bool) {
 		// a 15-20 V band can ask for 18 V instead.
 		empty, other, otherA := sprAVSBandDesc(v, lower, upper)
 		return fmt.Sprintf("the SPR AVS APDO declares no current in the %s band, so it cannot supply %s; it offers %s in the %s band only, and those bands are assumed rather than scanned: %s",
-			empty, formatV(v), formatA(otherA), other, sprAVSAssumptionClause), true
+			empty, formatV(v), formatA(otherA), other, SPRAVSAssumptionClause), true
 	}
 }
 
@@ -542,12 +542,15 @@ func cableBoundNote(p PDO, declared float64) string {
 // much of the answer came from the scan and how much from the specification.
 func sprAVSAssumptionNote(v float64) string {
 	return fmt.Sprintf("the assumed %s output range is not scanned data: %s, so reaching %s is what USB-PD 3.2 says such a source does rather than something this scan observed",
-		formatRange(SPRAVSMinVoltageV, SPRAVSMaxVoltageV), sprAVSAssumptionClause, formatV(v))
+		formatRange(SPRAVSMinVoltageV, SPRAVSMaxVoltageV), SPRAVSAssumptionClause, formatV(v))
 }
 
-// sprAVSAssumptionClause is the shared half-sentence, so the disclosure reads
-// identically wherever the assumption decides an answer.
-const sprAVSAssumptionClause = "an SPR AVS APDO carries no voltage range on the wire, only its two current limits (SPEC.md §9.4)"
+// SPRAVSAssumptionClause is the shared half-sentence, so the disclosure reads
+// identically wherever the assumption decides an answer. Exported because the
+// capability table is rendered outside this package and the "?" it puts on an
+// SPR AVS voltage range has to be explained in these same words: a mark whose
+// meaning is spelled out differently in two places is two claims, not one.
+const SPRAVSAssumptionClause = "an SPR AVS APDO carries no voltage range on the wire, only its two current limits (SPEC.md §9.4)"
 
 // ---------------------------------------------------------------------------
 // Capability lookups. Each returns the most capable matching object, so a source
@@ -737,7 +740,7 @@ func betterSPRAVSExplanation(cand, best PDO, v float64) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Formatting helpers, shared by Evaluate and Summary.
+// Formatting helpers for the verdict's prose.
 // ---------------------------------------------------------------------------
 
 // formatV renders a requested or fixed voltage with no trailing zeros: "9 V",

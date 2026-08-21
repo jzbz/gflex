@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // clearGflexEnv neutralises any GFLEX_* the developer happens to export, so
@@ -23,8 +26,109 @@ func clearGflexEnv(t *testing.T) {
 	for _, k := range []string{
 		"GFLEX_PORT", "GFLEX_TRANSPORT", "GFLEX_TIMEOUT",
 		"GFLEX_BYTE_DELAY", "GFLEX_JSON", "GFLEX_VERBOSE",
+		// The last two are not read by applyEnv and deliberately never will
+		// be (SPEC.md §11). They are cleared anyway so that
+		// TestNoEnvironmentVariableAnswersAConfirmation cannot be defeated by
+		// a developer who happens to export one -- a test of an absence has to
+		// start from a known absence.
+		"GFLEX_YES", "GFLEX_DRY_RUN",
 	} {
 		t.Setenv(k, "")
+	}
+}
+
+// TestEnvironmentLayerFillsUnsetFlags covers SPEC.md §11's precedence rule --
+// flag > env > default -- which until now was held by review alone.
+//
+// Both halves matter and they fail differently. If applyEnv stopped reading the
+// environment, a user's GFLEX_PORT would silently stop selecting their unit; if
+// it stopped honouring f.Changed, an exported variable would silently override
+// the flag the user just typed, which is the more dangerous direction.
+func TestEnvironmentLayerFillsUnsetFlags(t *testing.T) {
+	clearGflexEnv(t)
+	t.Setenv("GFLEX_PORT", "/dev/snd/midiC9D0")
+	t.Setenv("GFLEX_TRANSPORT", "usb")
+	t.Setenv("GFLEX_TIMEOUT", "1500ms")
+	t.Setenv("GFLEX_VERBOSE", "true")
+
+	var stdout, stderr bytes.Buffer
+	app := &App{stdout: &stdout, stderr: &stderr, stdin: strings.NewReader("")}
+	root := NewRootCommand(app)
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	// An explicit --timeout, so the same run proves both halves: the flag wins
+	// over GFLEX_TIMEOUT while the three unset flags still take their values
+	// from the environment. `version` reaches no device.
+	root.SetArgs([]string{"version", "--timeout=9s"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("`gflex version`: %v", err)
+	}
+	if app.Port != "/dev/snd/midiC9D0" {
+		t.Errorf("Port = %q, want it filled in from GFLEX_PORT", app.Port)
+	}
+	if app.Transport != transportUSB {
+		t.Errorf("Transport = %q, want %q from GFLEX_TRANSPORT", app.Transport, transportUSB)
+	}
+	if !app.Verbose {
+		t.Error("Verbose = false, want it set from GFLEX_VERBOSE")
+	}
+	if app.Timeout != 9*time.Second {
+		t.Errorf("Timeout = %s, want the explicit --timeout=9s to beat GFLEX_TIMEOUT=1500ms", app.Timeout)
+	}
+}
+
+// A malformed variable is a usage error, not a generic failure: the user's
+// shell is wrong, not their device, and exit 2 is what says so.
+func TestMalformedEnvironmentVariableIsAUsageError(t *testing.T) {
+	clearGflexEnv(t)
+	t.Setenv("GFLEX_TIMEOUT", "half a minute")
+
+	var stdout, stderr bytes.Buffer
+	app := &App{stdout: &stdout, stderr: &stderr, stdin: strings.NewReader("")}
+	root := NewRootCommand(app)
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"version"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("an unparseable GFLEX_TIMEOUT was accepted")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	if !strings.Contains(err.Error(), "GFLEX_TIMEOUT") {
+		t.Errorf("error %q does not name the variable at fault", err)
+	}
+}
+
+// TestNoEnvironmentVariableAnswersAConfirmation pins an absence, and the
+// absence is the safety decision (SPEC.md §11): --dry-run and --yes are the two
+// global flags with no environment counterpart, because a GFLEX_YES left
+// exported in a shell profile would pre-answer every §13 confirmation for
+// months without anyone noticing.
+//
+// Adding `get("yes", "GFLEX_YES")` to applyEnv for symmetry is a two-line
+// change that reads as tidying up, and until this test existed the whole suite
+// stayed green when it was made. The assertion is deliberately the same one the
+// other wiring tests use -- what did and did not reach the device -- rather
+// than a check on the App field, because the field is not what does the damage.
+func TestNoEnvironmentVariableAnswersAConfirmation(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev) // clears the GFLEX_* environment first
+	t.Setenv("GFLEX_YES", "1")
+	t.Setenv("GFLEX_DRY_RUN", "1")
+
+	err := tr.run(t, "authlock", "set", "1")
+	if err == nil {
+		t.Fatal("an exported GFLEX_YES pre-answered a §13 confirmation")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if tr.wrote(t, proto.CmdAuthLock) {
+		t.Fatalf("the auth lock was written from the environment; frames: %v", cmdNames(dev.Sent()))
 	}
 }
 
@@ -236,6 +340,89 @@ func TestPauseRefusesWhenStdinIsNotATerminal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--no-prompt") {
 		t.Errorf("error %q does not say how to run this unattended", err)
+	}
+}
+
+// TestPauseEOFIsAUsageErrorNotARefusal is the other half of the same
+// distinction, reached from a real terminal.
+//
+// readLine used to hand back refused("no answer read from stdin") itself, and
+// refused() appends the fixed sentence "nothing was written to the device"
+// (exit.go) -- deliberately, because it is true for a §13 confirmation, which
+// is always evaluated before the write it guards. pause is not a confirmation.
+// Its only caller is the scan wizard's handover, which runs AFTER the capture
+// log has been erased, so a Ctrl-D at that prompt printed a §13-shaped refusal
+// whose central claim was false at exactly the moment the user needed to know
+// their capture was gone.
+func TestPauseEOFIsAUsageErrorNotARefusal(t *testing.T) {
+	master, slave := openPTY(t)
+	var stderr bytes.Buffer
+	app := &App{stdout: io.Discard, stderr: &stderr, stdin: slave}
+	// A literal EOT, which is what Ctrl-D sends: in canonical mode the line
+	// discipline turns it into a zero-length read at the start of a line, so
+	// the reader sees EOF while the descriptor stays a terminal. Closing the
+	// master instead would hang the slave up, and the TTY check above would
+	// then be what refused -- the test would pass without ever reaching the
+	// branch it exists to cover.
+	if _, err := master.WriteString("\x04"); err != nil {
+		t.Fatalf("sending EOT to the terminal: %v", err)
+	}
+	if !app.stdinIsTTY() {
+		t.Fatal("a pseudo-terminal is not being recognised as a terminal")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := app.pause(ctx, "Press Enter once the VFLEX is plugged back in...")
+	if ctx.Err() != nil {
+		t.Fatal("pause never noticed the end of input")
+	}
+	if err == nil {
+		t.Fatal("pause returned success with no answer given")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	// Names the branch, so a hung-up terminal taking the "not a terminal" path
+	// cannot stand in for the one under test.
+	if !strings.Contains(err.Error(), "no answer read from stdin") {
+		t.Errorf("error %q is not the end-of-input branch", err)
+	}
+	if strings.Contains(err.Error(), "nothing was written to the device") {
+		t.Errorf("pause claims nothing was written, but `scan` erases the capture log before "+
+			"it prompts:\n%v", err)
+	}
+	if !strings.Contains(err.Error(), "--no-prompt") {
+		t.Errorf("error %q does not say how to run this unattended", err)
+	}
+}
+
+// The asymmetry is the point, so the interlock side is pinned too: the same EOF
+// at a confirmation must still be a refusal, and must still say nothing was
+// written -- which is true there. Without this, "fixing" the test above by
+// making readLine never refuse would look like a pass.
+func TestConfirmEOFStillRefuses(t *testing.T) {
+	master, slave := openPTY(t)
+	var stderr bytes.Buffer
+	app := &App{stdout: io.Discard, stderr: &stderr, stdin: slave}
+	if _, err := master.WriteString("\x04"); err != nil { // Ctrl-D, as above
+		t.Fatalf("sending EOT to the terminal: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := app.confirm(ctx, "Set 12000 mV?")
+	if ctx.Err() != nil {
+		t.Fatal("confirm never noticed the end of input")
+	}
+	if err == nil {
+		t.Fatal("confirm approved the operation with no answer given")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if !strings.Contains(err.Error(), "nothing was written to the device") {
+		t.Errorf("refusal %q dropped the sentence that says the rail is untouched", err)
 	}
 }
 

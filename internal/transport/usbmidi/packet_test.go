@@ -372,3 +372,54 @@ func TestAllByteValuesRoundTrip(t *testing.T) {
 		t.Fatal("nibble-encoded stream did not survive the USB-MIDI packet round trip")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz
+// ---------------------------------------------------------------------------
+
+// FuzzUnpackPackets treats an IN transfer as what it is: bytes chosen by a
+// device this tool does not control. The unpacker is the first thing they reach
+// (ReadMIDI hands it the raw scratch buffer), so it must be total.
+//
+// Two invariants, both checkable without a second implementation of the rule:
+// no buffer may panic it, and it may never invent or reorder device data. The
+// second is expressed as "the output is a subsequence of the input" -- the
+// unpacker only ever copies data slots forward -- with the three-quarters bound
+// as a cheap first cut, since one byte in every four is a header.
+func FuzzUnpackPackets(f *testing.F) {
+	for _, v := range goldenVectors {
+		msgs, err := splitMessages(v.midi)
+		if err != nil {
+			f.Fatalf("golden vector %q: splitMessages: %v", v.name, err)
+		}
+		var packets []byte
+		for _, m := range msgs {
+			packets = append(packets, PackPacket(m)...)
+		}
+		f.Add(packets)
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0x09, 0x90, 0x00})       // shorter than one packet
+	f.Add([]byte{0x00, 0x00, 0x00, 0x00}) // pure padding
+	f.Add([]byte{0x01, 0xFF, 0xFF, 0xFF}) // reserved CIN, no payload
+	f.Add(bytes.Repeat([]byte{0x0F, 0x7F, 0x7F, 0x7F}, 16))
+
+	f.Fuzz(func(t *testing.T, buf []byte) {
+		out := UnpackPackets(buf)
+		if max := 3 * (len(buf) / 4); len(out) > max {
+			t.Fatalf("unpacked %d bytes from %d, at most %d of which can be MIDI data",
+				len(out), len(buf), max)
+		}
+		i := 0
+		for _, b := range out {
+			for i < len(buf) && buf[i] != b {
+				i++
+			}
+			if i == len(buf) {
+				t.Fatalf("UnpackPackets(%s) = %s, which is not a subsequence of the input",
+					proto.Hex(buf), proto.Hex(out))
+			}
+			i++
+		}
+	})
+}

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -91,6 +92,24 @@ func newReplaySession(t *testing.T, dev *fake.Device) *session.Session {
 	return s
 }
 
+// countDeviceReads counts the read frames for cmd that actually reached the
+// device. Not what was printed: how many times the command asked, which is what
+// a protocol charging 20 ms per message (SPEC.md §3.1) bills for.
+func countDeviceReads(t *testing.T, dev *fake.Device, cmd proto.Cmd) int {
+	t.Helper()
+	n := 0
+	for _, fr := range dev.Sent() {
+		parsed, err := proto.Parse(fr)
+		if err != nil {
+			t.Fatalf("the device received an unparseable frame %s: %v", proto.Hex(fr), err)
+		}
+		if !parsed.Write && parsed.Cmd == cmd {
+			n++
+		}
+	}
+	return n
+}
+
 // containsLine reports whether any line contains sub.
 func containsLine(lines []string, sub string) bool {
 	for _, l := range lines {
@@ -99,6 +118,69 @@ func containsLine(lines []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// firmware version
+// ---------------------------------------------------------------------------
+
+// TestFirmwareVersionAsksTheDeviceOnce pins the single read. The whole body of
+// this command is one CMD_FIRMWARE_VERSION exchange, and it used to issue two:
+// once to print the string, and again inside Session.FirmwareAtLeast, whose
+// first act is another read. At the vendor's 20 ms per message (SPEC.md §3.1)
+// that doubled the command's device time, and against a unit that has stopped
+// answering it doubled the wait to two full --timeout periods. --dry-run has
+// always advertised the one-frame shape; this makes the live path agree.
+//
+// Reverting to FirmwareAtLeast makes the count 2 and fails here.
+func TestFirmwareVersionAsksTheDeviceOnce(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "firmware", "version"); err != nil {
+		t.Fatalf("firmware version: %v", err)
+	}
+	if got := countDeviceReads(t, dev, proto.CmdFirmwareVersion); got != 1 {
+		t.Errorf("the device saw %d CMD_FIRMWARE_VERSION reads, want exactly 1", got)
+	}
+	out := tr.stdout.String()
+	if !strings.Contains(out, fake.TypicalFirmware) {
+		t.Errorf("the version was not printed:\n%s", out)
+	}
+	if strings.Contains(out, msgFirmwareTooOld) {
+		t.Errorf("firmware %s was reported as too old:\n%s", fake.TypicalFirmware, out)
+	}
+}
+
+// TestFirmwareVersionNotesFirmwareTooOld: the note is the only reason the
+// version is compared at all -- the PD capability scan is hard-gated on 5.0.0
+// (SPEC.md §9) -- so it has to survive the comparison moving off the device and
+// into session.VersionAtLeast, still on the one read.
+//
+// It also pins the behaviour change that came with the single read. The old
+// form discarded the second read's error (`err == nil && !ok`), so a dropped
+// response -- routine in a protocol with no NACK (SPEC.md §5.2) -- silently
+// omitted this note from a unit that had already reported a 4.x version. There
+// is no second read left to fail.
+func TestFirmwareVersionNotesFirmwareTooOld(t *testing.T) {
+	dev := fake.NewTypical()
+	dev.SetResponse(proto.CmdFirmwareVersion, []byte("4.9.2"))
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "firmware", "version"); err != nil {
+		t.Fatalf("firmware version: %v", err)
+	}
+	out := tr.stdout.String()
+	if !strings.Contains(out, "4.9.2") {
+		t.Errorf("the version was not printed:\n%s", out)
+	}
+	// The vendor's own wording, verbatim: users search for it (SPEC.md §9.6).
+	if !strings.Contains(out, msgFirmwareTooOld) {
+		t.Errorf("firmware 4.9.2 was not flagged as too old for the scan:\n%s", out)
+	}
+	if got := countDeviceReads(t, dev, proto.CmdFirmwareVersion); got != 1 {
+		t.Errorf("the device saw %d CMD_FIRMWARE_VERSION reads, want exactly 1", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -419,10 +501,13 @@ func TestPageSizeReachesTheLoader(t *testing.T) {
 	}
 }
 
-// TestPageSizeOnAJSONImageIsAUsageError: a JSON payload carries its own page
-// split and the loader ignores LoadOptions.PageSize for it, so accepting the
-// flag there would silently ignore the one flag whose purpose is geometry
-// safety. It is refused as a usage error instead.
+// TestPageSizeOnAJSONImageIsAUsageError: the object payload takes its split
+// from its own page_size field and ignores LoadOptions.PageSize entirely, so
+// accepting the flag there would silently discard the one flag whose purpose is
+// geometry safety. It is refused as a usage error instead. (The refusal is
+// deliberately wider than that -- it covers the bare-array shape too, where the
+// loader would honour the flag for a flat image; see loadFirmware for why the
+// sniff does not try to tell those apart.)
 func TestPageSizeOnAJSONImageIsAUsageError(t *testing.T) {
 	// Leading whitespace on purpose: format detection tolerates it
 	// (bootloader.ParseImage trims before sniffing), so the refusal must too.
@@ -520,6 +605,121 @@ func TestPageSizeFlagUsageErrors(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "--page-size must be positive") {
 			t.Errorf("the refusal does not name the flag: %v", err)
+		}
+	})
+}
+
+// TestPageSizeIsPlainDecimal pins the base the flag is parsed in. It was
+// registered with pflag's IntVar, which calls strconv.ParseInt(s, 0, ...) --
+// Go literal syntax -- so `--page-size 0200` meant octal 128. Both 128 and 200
+// are geometries the loader accepts, so nothing downstream could catch the
+// substitution, on the one flag whose wrong value can flash and even verify
+// cleanly (SPEC.md §10.2, §14.12). Restoring IntVar makes the page count 4 in
+// the first subtest and accepts the hex spelling in the second.
+// --crc is compared, never applied, so a misparse does not fail loudly: it can
+// match what the device answers for a reason the user never intended. pflag's
+// base-0 integer flag read `--crc 017` as 15.
+func TestCRCIsNotSilentlyOctal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x77}, 512), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("a leading zero is refused rather than read as octal", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		err := tr.run(t, "firmware", "flash", path, "--crc", "017", "--dry-run")
+		if err == nil {
+			t.Fatal("--crc 017 was accepted; it would have meant 15")
+		}
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("exit code %d, want ExitUsage (%d)", code, ExitUsage)
+		}
+		if !strings.Contains(err.Error(), "not octal") {
+			t.Errorf("the refusal does not say what was wrong: %v", err)
+		}
+	})
+
+	t.Run("decimal and explicit hex both reach the loader", func(t *testing.T) {
+		for _, tc := range []struct {
+			arg  string
+			want int
+		}{
+			{"90", 90},
+			{"0x5a", 90},
+			{"0X5A", 90},
+			{"0", 0},
+			{"255", 255},
+		} {
+			tr := newFakeTree(t, fake.NewTypical())
+			if err := tr.run(t, "firmware", "flash", path, "--crc", tc.arg, "--dry-run", "--json"); err != nil {
+				t.Fatalf("--crc %s: %v\n%s", tc.arg, err, tr.stderr.String())
+			}
+			var doc struct {
+				CRC *int `json:"crc"`
+			}
+			if err := json.Unmarshal(tr.stdout.Bytes(), &doc); err != nil {
+				t.Fatalf("--crc %s: the dry run did not emit a JSON object (%v):\n%s", tc.arg, err, tr.stdout.String())
+			}
+			if doc.CRC == nil {
+				t.Fatalf("--crc %s: the dry run reported no expected CRC:\n%s", tc.arg, tr.stdout.String())
+			}
+			if *doc.CRC != tc.want {
+				t.Errorf("--crc %s reached the loader as %d, want %d", tc.arg, *doc.CRC, tc.want)
+			}
+		}
+	})
+
+	t.Run("out of range is refused", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		err := tr.run(t, "firmware", "flash", path, "--crc", "256", "--dry-run")
+		if err == nil {
+			t.Fatal("--crc 256 was accepted")
+		}
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("exit code %d, want ExitUsage (%d)", code, ExitUsage)
+		}
+	})
+}
+
+func TestPageSizeIsPlainDecimal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x77}, 400), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// --dry-run reaches the loader and stops before any device is opened;
+	// --crc gives the raw image the CRC CheckFlash insists on before it will
+	// agree to a flash at all.
+	t.Run("a leading zero is not octal", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		if err := tr.run(t, "firmware", "flash", path,
+			"--page-size", "0200", "--crc", "90", "--dry-run", "--json"); err != nil {
+			t.Fatalf("dry-run flash: %v\n%s", err, tr.stderr.String())
+		}
+		var doc struct {
+			Pages int `json:"pages"`
+		}
+		if err := json.Unmarshal(tr.stdout.Bytes(), &doc); err != nil {
+			t.Fatalf("the dry run did not emit a JSON object (%v):\n%s", err, tr.stdout.String())
+		}
+		// 400 bytes at 200 is 2 pages; read as octal 128 it would be 4.
+		if doc.Pages != 2 {
+			t.Errorf("pages = %d, want 2: --page-size 0200 was not read as decimal 200", doc.Pages)
+		}
+	})
+
+	t.Run("hex is refused", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		err := tr.run(t, "firmware", "flash", path,
+			"--page-size", "0x200", "--crc", "90", "--dry-run")
+		if err == nil {
+			t.Fatal("--page-size 0x200 was accepted")
+		}
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("exit code %d, want ExitUsage (%d)", code, ExitUsage)
+		}
+		if !strings.Contains(err.Error(), "not a plain decimal number") {
+			t.Errorf("the refusal does not say what was wrong: %v", err)
 		}
 	})
 }

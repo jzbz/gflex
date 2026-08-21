@@ -196,6 +196,26 @@ type scanOpts struct {
 }
 
 func (a *App) runScan(ctx context.Context, f Formatter, o scanOpts) error {
+	// The interactive handover ends at a.pause, which refuses outright when
+	// stdin is not a terminal (interlock 7, SPEC.md §13.7). That refusal has to
+	// happen HERE, before phase 1, because phase 1 finishes by erasing the
+	// device's capture log -- and SPEC.md §9.2 offers no way to get one back
+	// short of carrying the unit to the source and scanning it again. Reaching
+	// the check afterwards meant `gflex scan </dev/null`, or the same command
+	// from cron or CI, destroyed a capture the user cared about and then told
+	// them they had mistyped the command line. --yes does not help either:
+	// pause is not a confirmation and has no --yes path.
+	//
+	// Nothing about the condition needs the device. stdinIsTTY is a local ioctl
+	// on our own stdin (see tty.go), so it is answerable before a single frame
+	// is sent -- which is the same ordering every §13 interlock already uses,
+	// where App.apply runs ahead of App.connect.
+	if !o.noPrompt && !a.stdinIsTTY() {
+		return codedf(ExitUsage, "the scan has to ask you to unplug the VFLEX and plug it back in, but "+
+			"stdin is not a terminal;\n  use --no-prompt (optionally with --wait) to run this unattended. "+
+			"Nothing has been sent to the device.")
+	}
+
 	// --- phase 1: gate on firmware, latch the serial, erase ------------------
 	c, err := a.connect(ctx, f)
 	if err != nil {
@@ -234,6 +254,12 @@ func (a *App) runScan(ctx context.Context, f Formatter, o scanOpts) error {
 
 	// --- phase 2: the user attaches the unit to the source under test --------
 	if err := a.scanHandover(ctx, f, o, waitForDevice); err != nil {
+		// Everything from here on is past the erase, so an abort leaves the
+		// unit holding nothing. Say so plainly rather than leaving the user to
+		// infer it from the Diag line above: the only recovery SPEC.md §9.2
+		// describes is to attach the unit to the source and scan again.
+		f.Diag("the capture log was already erased, so this unit now holds no capture; " +
+			"re-run `gflex scan` to take a fresh one")
 		return err
 	}
 

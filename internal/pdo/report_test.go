@@ -173,44 +173,6 @@ func TestEPRAVSFailureNeverContradictsItself(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: the assumed SPR AVS range is never shown as scanned data
-// ---------------------------------------------------------------------------
-
-// TestSummaryDisclosesAssumedSPRAVSRange covers the display side of SPEC.md §9.4.
-// The table's voltage column marks the SPR AVS row with "?", which on its own is
-// not a disclosure — a reader has no way to know what the mark means, and every
-// other figure in the table came off the wire.
-func TestSummaryDisclosesAssumedSPRAVSRange(t *testing.T) {
-	s := simpleLog(t, fixed5V3A, sprAVS).Summary()
-	if !strings.Contains(s, "9.0-20.0 V?") {
-		t.Errorf("the assumed range lost its mark:\n%s", s)
-	}
-	for _, want := range []string{
-		"? the SPR AVS 9.0-20.0 V output range is assumed, not scanned",
-		"carries no voltage range on the wire",
-		"SPEC.md §9.4",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("Summary() missing %q:\n%s", want, s)
-		}
-	}
-
-	// No SPR AVS object, no footnote: the note must not be boilerplate that a
-	// reader learns to skip.
-	if s := simpleLog(t, fixed5V3A, pps3311V3A).Summary(); strings.Contains(s, "is assumed, not scanned") {
-		t.Errorf("assumption footnote on a source with no SPR AVS object:\n%s", s)
-	}
-
-	// The two band currents are labelled with the voltage each applies at, and
-	// must not be mistakable for a voltage range: SPEC.md §9.4 gives an SPR AVS
-	// APDO no range on the wire, so "15 V / 20 V" in a voltage column would be
-	// scanned-looking data that does not exist.
-	if strings.Contains(s, "15 V / 20 V") {
-		t.Errorf("band current labels rendered as a voltage range:\n%s", s)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Regression: the cable ceiling is central, on every path out of the package
 // ---------------------------------------------------------------------------
 
@@ -231,8 +193,9 @@ func overCeiling(s string) []float64 {
 
 // disclosed reports whether s is one of the sanctioned shapes in which a figure
 // above the ceiling may appear: the user's own request echoed back, or the
-// source's claim named as a claim (cableBoundNote, declaredNote). Anything else
-// is this package telling a user that a current no cable carries is available.
+// source's claim named as a claim (cableBoundNote, and the bracketed note the
+// capability table appends in internal/cli). Anything else is this package
+// telling a user that a current no cable carries is available.
 func disclosed(s string) bool {
 	for _, marker := range []string{"requested", "advertises", "would allow", "source declares"} {
 		if strings.Contains(s, marker) {
@@ -245,10 +208,11 @@ func disclosed(s string) bool {
 // TestNoOutputReportsMoreCurrentThanACableCarries closes the loop that
 // TestEvaluateNeverReportsMoreThanACableCarries opens. That test checks one
 // field; this one checks everything this package hands out — every exported
-// current field, PDO.CurrentAt at every voltage, every Match message, and the
-// rendered table — against MaxCableCurrentA. A new code path that read a stored
-// field instead of going through boundCurrent would fail here even if it never
-// touched Match.MaxCurrentA.
+// current field, PDO.CurrentAt at every voltage, and every Match message —
+// against MaxCableCurrentA. A new code path that read a stored field instead of
+// going through boundCurrent would fail here even if it never touched
+// Match.MaxCurrentA. The rendered capability table is not this package's to
+// check: it is built in internal/cli, and the same invariant is asserted there.
 //
 // The logs are deliberately hostile: every class has a current field wide enough
 // to express a figure no cable can carry (SPEC.md §9.4 field widths), and the
@@ -289,23 +253,6 @@ func TestNoOutputReportsMoreCurrentThanACableCarries(t *testing.T) {
 					if a := p.CurrentAt(v); a > MaxCableCurrentA+cmpEps {
 						t.Errorf("PDO #%d %v: CurrentAt(%v) = %v, above the ceiling", p.Index, p.Kind, v, a)
 					}
-				}
-				// A bounded object must say so, whichever way it is rendered.
-				if p.CableBound() {
-					if !strings.Contains(p.String(), "source declares") {
-						t.Errorf("PDO #%d was bounded but String() hides it: %s", p.Index, p.String())
-					}
-				}
-				for _, line := range overCeiling(p.String()) {
-					if !disclosed(p.String()) {
-						t.Errorf("PDO.String() offers %v A with no disclosure: %s", line, p.String())
-					}
-				}
-			}
-
-			for _, line := range strings.Split(l.Summary(), "\n") {
-				if len(overCeiling(line)) > 0 && !disclosed(line) {
-					t.Errorf("Summary() line offers a current above the ceiling with no disclosure: %q", line)
 				}
 			}
 
@@ -361,19 +308,6 @@ func TestHandBuiltPDONeverEscapesTheCeiling(t *testing.T) {
 				t.Errorf("PDO #%d %v: CurrentAt(%v) = %v, above the ceiling", p.Index, p.Kind, v, a)
 			}
 		}
-		// The rendered figure must be the bounded one; the hand-built claim may
-		// appear only as a claim, which is what declaredNote makes of it.
-		if s := p.String(); len(overCeiling(s)) > 0 && !disclosed(s) {
-			t.Errorf("PDO #%d %v: String() offers a current above the ceiling undisclosed: %s", p.Index, p.Kind, s)
-		}
-		if !strings.Contains(p.String(), "source declares") {
-			t.Errorf("PDO #%d %v: String() bounded silently: %s", p.Index, p.Kind, p.String())
-		}
-	}
-	for _, line := range strings.Split(l.Summary(), "\n") {
-		if len(overCeiling(line)) > 0 && !disclosed(line) {
-			t.Errorf("Summary() renders an unbounded hand-built current: %q", line)
-		}
 	}
 	for _, v := range []float64{5, 9, 12, 18, 20} {
 		m := l.Evaluate(v, 6)
@@ -382,6 +316,18 @@ func TestHandBuiltPDONeverEscapesTheCeiling(t *testing.T) {
 		}
 		if m.OK {
 			t.Errorf("Evaluate(%v, 6) = OK: no cable carries 6 A", v)
+		}
+		// Reducing the figure is only half of it: the hand-built claim must
+		// survive as a claim, or the verdict is quietly conservative and a user
+		// comparing it against the charger's own label has nothing to go on.
+		// Every one of these five requests lands on an object the ceiling bit.
+		if m.DeclaredMaxCurrentA <= MaxCableCurrentA {
+			t.Errorf("Evaluate(%v, 6): DeclaredMaxCurrentA = %v, the hand-built claim was dropped rather than disclosed",
+				v, m.DeclaredMaxCurrentA)
+		}
+		if !hasCaveat(m, CaveatCableCurrentBound) {
+			t.Errorf("Evaluate(%v, 6) bounded a hand-built current without the %s caveat: %v",
+				v, CaveatCableCurrentBound, m.Caveats)
 		}
 	}
 }
@@ -407,8 +353,13 @@ func TestBoundCurrentIsTheOnlyGate(t *testing.T) {
 		}
 	}
 	// Infinity is the one input that must not survive as a comparison-defeating
-	// value: a NaN or +Inf current compares false against every limit.
-	if use, _ := boundCurrent(math.Inf(1)); use > MaxCableCurrentA {
-		t.Errorf("boundCurrent(+Inf) = %v, above the ceiling", use)
+	// value: a NaN or +Inf current compares false against every limit. The
+	// usable half is clamped, like any figure over the ceiling — it is not
+	// collapsed to zero the way NaN is. The declared half is the unbounded claim
+	// by construction, so +Inf reaches it verbatim; pinned here because that is
+	// the one place a non-finite number still leaves this function, and a caller
+	// marshalling it would be the one to find out.
+	if use, decl := boundCurrent(math.Inf(1)); use != MaxCableCurrentA || !math.IsInf(decl, 1) {
+		t.Errorf("boundCurrent(+Inf) = (%v, %v), want (%v, +Inf)", use, decl, MaxCableCurrentA)
 	}
 }

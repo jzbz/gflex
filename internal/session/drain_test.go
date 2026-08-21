@@ -64,10 +64,27 @@ func deadSession(t *testing.T, n int) (*Session, *fake.Device) {
 func TestDrainStaleEmptiesBothChannels(t *testing.T) {
 	s, _ := deadSession(t, 12)
 
+	// Installing the hook after New rather than through Options is safe here
+	// and only here: the framer's reader is already dead, so the drain below is
+	// the only thing that will ever call it, on this goroutine.
+	var dirs []string
+	s.traceFn = func(dir string, _ []byte) { dirs = append(dirs, dir) }
+
 	s.drainStale() // nothing else is running, so the single-flight lock is free
 
 	if got := len(s.fr.Frames()); got != 0 {
 		t.Errorf("%d frames still queued after drainStale; a closed channel means stop reading that channel, not stop draining", got)
+	}
+	// Every discard is "rx-late", the same label the settle drain uses: an
+	// operator reading a -v trace must be able to tell a swallowed stale frame
+	// from the frame that answered a command.
+	if len(dirs) != 12 {
+		t.Fatalf("traced %d frames, want 12", len(dirs))
+	}
+	for i, dir := range dirs {
+		if dir != "rx-late" {
+			t.Errorf("trace[%d] dir = %q, want \"rx-late\"", i, dir)
+		}
 	}
 }
 
@@ -87,6 +104,50 @@ func TestDrainForEmptiesBothChannels(t *testing.T) {
 	// out the rest of the settle window.
 	if elapsed := time.Since(start); elapsed >= settleAfterTimeout {
 		t.Errorf("drainFor took %v; with both channels closed it should return at once", elapsed)
+	}
+}
+
+// TestTimeoutAbsorbsALateAnswer pins the settle drain's CALL SITE, which the
+// two tests above do not: they exercise drainFor directly, so deleting
+// `s.drainFor(...)` from await's timer branch leaves them green. So does
+// TestStaleFrameDropped, which looks like the end-to-end case but is satisfied
+// by either drain -- its late frame lands long enough after the timeout that
+// the next command's drainStale would remove it anyway.
+//
+// The discriminator is the trace: the settle drain is the only thing that can
+// absorb a frame while no command is outstanding and no further command has
+// been issued. Delete the call and the late answer simply sits in the framer's
+// channel, unabsorbed and untraced, and this test fails.
+func TestTimeoutAbsorbsALateAnswer(t *testing.T) {
+	const timeout = 150 * time.Millisecond
+
+	// The hook is called only from exchange, await and drainFor, all of which
+	// run on this goroutine inside the SerialNumber call below, so the slice
+	// needs no lock.
+	var dirs []string
+	s, d := newTestSession(t, Options{
+		Timeout: timeout,
+		Trace:   func(dir string, _ []byte) { dirs = append(dirs, dir) },
+	})
+
+	// The answer arrives after the command has given up but well inside the
+	// settle window, which is the case the drain exists for. Both margins are
+	// generous so a loaded runner does not turn this into a flake.
+	d.SetResponse(proto.CmdSerialNumber, []byte("LATE0001"))
+	d.SetFault(proto.CmdSerialNumber, fake.Fault{Delay: 2 * timeout})
+
+	if got, err := s.SerialNumber(context.Background()); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("SerialNumber = %q, %v; want ErrTimeout", got, err)
+	}
+
+	var late int
+	for _, dir := range dirs {
+		if dir == "rx-late" {
+			late++
+		}
+	}
+	if late != 1 {
+		t.Errorf("trace = %q; want exactly one \"rx-late\": the late answer must be absorbed on the timeout path, not left queued for the next command", dirs)
 	}
 }
 

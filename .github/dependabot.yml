@@ -11,6 +11,11 @@ version: 2
 # both pinned with hashes in go.sum, and a CLI that vendors nothing and runs no
 # server has little to gain from a steady trickle of patch bumps. Add a
 # gomod entry here if that balance ever changes.
+#
+# One thing neither ecosystem reaches: the staticcheck that ci.yml `go install`s
+# by commit SHA. It resolves outside the module graph, so no gomod entry would
+# see it either -- STATICCHECK_COMMIT and STATICCHECK_VERSION are bumped by
+# hand, together, and ci.yml fails the run if only one of them moves.
 updates:
   - package-ecosystem: github-actions
     directory: /

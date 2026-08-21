@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -80,6 +82,24 @@ func (tr *fakeTree) wrote(t *testing.T, cmd proto.Cmd) bool {
 			t.Fatalf("the device received an unparseable frame %s: %v", proto.Hex(fr), err)
 		}
 		if parsed.Write && parsed.Cmd == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+// sent is wrote's sibling for the commands that are disruptive without carrying
+// the write flag. CMD_JUMP_APP_TO_BOOTLOADER is the case SPEC.md §13.10 singles
+// out: a plain read frame that drops the device off the bus, so "did a write
+// reach it" is the wrong question to ask about it entirely.
+func (tr *fakeTree) sent(t *testing.T, cmd proto.Cmd) bool {
+	t.Helper()
+	for _, fr := range tr.dev.Sent() {
+		parsed, err := proto.Parse(fr)
+		if err != nil {
+			t.Fatalf("the device received an unparseable frame %s: %v", proto.Hex(fr), err)
+		}
+		if parsed.Cmd == cmd {
 			return true
 		}
 	}
@@ -189,8 +209,17 @@ func TestAuthLockSetIsGatedByTheConfirmation(t *testing.T) {
 	if tr.wrote(t, proto.CmdAuthLock) {
 		t.Fatalf("the auth lock was written despite the refusal; frames: %v", cmdNames(dev.Sent()))
 	}
-	if level, ok := dev.Register(proto.CmdAuthLock); !ok || level[0] != proto.AuthLockUnlocked {
-		t.Errorf("device auth lock = %v, want it left at %d", level, proto.AuthLockUnlocked)
+	// The AUTHLOCK read payload is [0x16, level]: the command code echoed a
+	// second time, then the level (SPEC.md §14.8, measured `tx 02 16` ->
+	// `rx 04 16 16 00`). The level lives at index 1, which is what the fake
+	// stores and what the vendor client always read.
+	level, ok := dev.Register(proto.CmdAuthLock)
+	if !ok || len(level) < 2 {
+		t.Fatalf("device auth lock register = %v, want the two-byte [echo, level] read payload", level)
+	}
+	if level[1] != proto.AuthLockUnlocked {
+		t.Errorf("device auth lock level = %d, want it left at %d (register %v)",
+			level[1], proto.AuthLockUnlocked, level)
 	}
 }
 
@@ -208,11 +237,141 @@ func TestAuthLockSetProceedsWithYes(t *testing.T) {
 	}
 }
 
+// TestRawBootloaderJumpIsGatedByTheConfirmation is the wiring test for the case
+// SPEC.md §13.10 singles out, and the one `gflex raw` cannot survive getting
+// wrong: `raw 02 14` is a plain READ frame with a documented command code, so
+// none of CheckRawFrame's generic reasons (write, undocumented, unknown,
+// scratchpad) fires on it. Only the disruptive-command switch does, and if that
+// switch went missing the frame would go out unchallenged and strand the unit
+// in the bootloader, where nothing in this tool but `firmware flash` can reach
+// it.
+func TestRawBootloaderJumpIsGatedByTheConfirmation(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "raw", "02", "14")
+	if err == nil {
+		t.Fatal("`raw 02 14` sent the device into the bootloader with nobody to confirm it")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if tr.sent(t, proto.CmdJumpAppToBootloader) {
+		t.Fatalf("the jump frame reached the device despite the refusal; frames: %v", cmdNames(dev.Sent()))
+	}
+}
+
+// Its positive control: with --yes the same frame goes out, so the refusal
+// above came from the interlock and not from the plumbing. --no-ack is how the
+// jump is sent for real -- the device disconnects instead of answering
+// (SPEC.md §6.1), which is why the fake drops it too -- so this is the
+// invocation a user would actually type.
+func TestRawBootloaderJumpProceedsWithYes(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "raw", "02", "14", "--yes", "--no-ack"); err != nil {
+		t.Fatalf("`raw 02 14 --yes --no-ack`: %v", err)
+	}
+	if !tr.sent(t, proto.CmdJumpAppToBootloader) {
+		t.Errorf("--yes did not reach the device; frames: %v", cmdNames(dev.Sent()))
+	}
+}
+
+// TestVLimitWideningIsGatedByTheConfirmation is the wiring test for interlock 3
+// of SPEC.md §13. Widening the window removes the guard rail interlock 1
+// depends on, so it must be confirmed -- and on a non-TTY that is a refusal
+// before the write.
+func TestVLimitWideningIsGatedByTheConfirmation(t *testing.T) {
+	dev := fake.NewTypical()
+	// A window an owner would set for a 12 V pedal, so that raising the ceiling
+	// to 20 V is unambiguously a widening.
+	dev.SetRegister(proto.CmdUserVLimit, proto.EncodeVLimit(5000, 12000))
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "vlimit", "set", "--low", "5000mV", "--high", "20000mV")
+	if err == nil {
+		t.Fatal("`vlimit set` widened the window with nobody to confirm it")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if tr.wrote(t, proto.CmdUserVLimit) {
+		t.Fatalf("the window was widened despite the refusal; frames: %v", cmdNames(dev.Sent()))
+	}
+	if stored, ok := dev.Register(proto.CmdUserVLimit); !ok ||
+		!bytes.Equal(stored, proto.EncodeVLimit(5000, 12000)) {
+		t.Errorf("device window = %x, want the original %x", stored, proto.EncodeVLimit(5000, 12000))
+	}
+}
+
+// TestCalibrateADCIsGatedByTheConfirmation is the wiring test for interlock 5.
+// A wrong calibration makes every subsequent voltage reading silently wrong,
+// which defeats interlock 1 by corrupting the evidence it relies on -- so
+// CheckCalibrate confirms unconditionally and this path must never write on a
+// non-TTY without --yes.
+func TestCalibrateADCIsGatedByTheConfirmation(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "calibrate", "adc", "--offset", "40", "--scale", "9")
+	if err == nil {
+		t.Fatal("`calibrate adc` rewrote the calibration with nobody to confirm it")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if tr.wrote(t, proto.CmdVMeasureADCOffset) || tr.wrote(t, proto.CmdVMeasureADCScale) {
+		t.Fatalf("the calibration was rewritten despite the refusal; frames: %v", cmdNames(dev.Sent()))
+	}
+}
+
+// TestFirmwareFlashIsGatedByTheConfirmation is the wiring test for interlock 6,
+// and the highest-stakes of the set: the `app.apply(CheckFlash(...))` line is
+// the only thing standing between a scripted `firmware flash` and
+// Session.JumpToBootloader, after which the unit is off the bus and only
+// `--recover` can reach it.
+//
+// --crc is what makes this test measure the confirmation rather than the
+// no-CRC refusal: a raw .bin carries no CRC of its own, and CheckFlash refuses
+// an unverifiable image outright before it ever gets as far as confirming.
+func TestFirmwareFlashIsGatedByTheConfirmation(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+	path := filepath.Join(t.TempDir(), "image.bin")
+	if err := os.WriteFile(path, make([]byte, 512), 0o600); err != nil {
+		t.Fatalf("writing the test image: %v", err)
+	}
+
+	err := tr.run(t, "firmware", "flash", path, "--crc", "0")
+	if err == nil {
+		t.Fatal("`firmware flash` started an update with nobody to confirm it")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if tr.sent(t, proto.CmdJumpAppToBootloader) {
+		t.Fatalf("the device was sent into the bootloader despite the refusal; frames: %v",
+			cmdNames(dev.Sent()))
+	}
+}
+
 // The seam must be invisible to the shipped tree: an App built the way Execute
 // builds one opens a real transport, so no production path can reach a fake.
-func TestTestTransportSeamIsUnsetByDefault(t *testing.T) {
-	app := &App{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, stdin: strings.NewReader("")}
+//
+// It has to be the App Execute really builds. A test that writes its own
+// &App{...} literal and finds testTransport nil has proved that Go zeroes an
+// omitted field, which holds whatever this package looks like -- so newApp
+// exists (root.go) to give the assertion something to bite on. NewRootCommand
+// is driven too, because installing the override while wiring up the tree would
+// be just as much a leak as setting it in the constructor.
+func TestShippedAppCarriesNoTransportSeam(t *testing.T) {
+	app := newApp()
 	if app.testTransport != nil {
-		t.Error("a freshly built App carries a transport override")
+		t.Fatal("the App Execute builds carries a transport override")
+	}
+	_ = NewRootCommand(app)
+	if app.testTransport != nil {
+		t.Fatal("NewRootCommand installed a transport override")
 	}
 }

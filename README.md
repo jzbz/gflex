@@ -165,8 +165,15 @@ The USB path (`--transport usb`, and all firmware operations) needs a udev rule:
 sudo gflex install-udev
 ```
 
-That writes `/etc/udev/rules.d/70-gflex.rules` and reloads udev. Use `gflex install-udev --print` to
-read the rule first. If you'd rather do it by hand:
+That writes `/etc/udev/rules.d/70-gflex.rules` and reloads udev. The write is atomic — a temporary
+file in the same directory, then a rename — so an interrupted install can never leave a half-written
+rule behind. If the file is already there and you have edited it, `install-udev` shows you and asks
+before overwriting rather than discarding your changes silently; `--yes` answers that in a script,
+and with no terminal to ask on it refuses instead.
+
+`gflex install-udev --print` writes the rule to stdout and needs no root, so you can read it first,
+or install it yourself with `gflex install-udev --print | sudo tee /etc/udev/rules.d/70-gflex.rules`.
+If you'd rather do it by hand:
 
 ```
 SUBSYSTEM=="usb", ATTR{idVendor}=="37bf", MODE="0660", TAG+="uaccess"
@@ -258,12 +265,13 @@ gflex firmware flash firmware.json --recover   # unit already stuck in the bootl
 | Flag | Meaning |
 |---|---|
 | `--fetch` | Pull the image for this unit's serial from the vendor service |
-| `--ws-url` | Override that service's endpoint |
+| `--ws-url` | Override that service's endpoint. It must be TLS (`wss://`); a `ws://` URL is refused, because the image and the CRC it is checked against arrive in the same document. If the endpoint really is cleartext, say so with `ws+insecure://` |
 | `--fetch-timeout` | Budget for the whole download (default 15 s). `--timeout` bounds MIDI commands, not this |
 | `--recover` | Skip the jump; talk straight to a unit already in the bootloader |
 | `--crc <byte>` | Supply the expected CRC for an image that carries none (a raw `.bin`) |
 | `--force` | Flash an unverifiable image anyway — see below |
 | `--ack-mode` | Stream with acknowledgements from the start: slower, more robust |
+| `--page-size <n>` | Page size used to split a raw `.bin` (default 512). A JSON image and `--fetch` carry their own page split, so it cannot be combined with either |
 
 The sequence is: jump to the bootloader over MIDI → wait for re-enumeration → reconnect over the
 vendor-class USB interface → confirm the serial matches → stream the image page by page → verify the
@@ -278,7 +286,8 @@ override a mismatch. `--force` exists for the one case where verification is imp
 `.bin`, which has no CRC to check against — and it warns loudly about what is being skipped. If you
 know the expected value, `--crc` is the better answer. Page geometry is validated before the first
 byte is written, so a mis-split image is refused rather than half-flashed: the CRC would not catch
-that anyway, since the device computes it over whatever it was told to write.
+that anyway, since the device computes it over whatever it was told to write. If your part's flash
+page is not the 512 bytes assumed for a raw `.bin`, that refusal is what `--page-size` is for.
 
 ### Debugging
 
@@ -445,7 +454,7 @@ interoperability is protected in many jurisdictions (EU Directive 2009/24/EC Art
 §1201(f)), but that's general context rather than legal advice.
 
 Where the implementation deliberately departs from what the vendor's app does — and it does, in
-fifteen places, mostly because the vendor's behaviour is unsafe — those are catalogued in
+nineteen places, mostly because the vendor's behaviour is unsafe — those are catalogued in
 [SPEC.md §17](SPEC.md#17-where-the-implementation-deliberately-differs-from-this-spec).
 
 ---
@@ -458,8 +467,9 @@ nibble-encoded MIDI framing, the big-endian scalars, the identity strings, the i
 the HIGH-before-LOW voltage limits, and the full PD capability scan including its serial-latch
 invariant. No decode had to be corrected afterwards.
 
-Ten of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
-are now answered from measurement, and three of the answers corrected the documentation. Highlights:
+Nine of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
+are now answered from measurement — plus one the original list did not contain — and three of the
+answers corrected the documentation. Highlights:
 
 - The **USB product ID is `0x800F`**, and the vendor's own udev rule had it right all along.
 - The device **clears the write/scratchpad flag bits** in its echo, so masking on receive is
@@ -495,9 +505,12 @@ Everything is testable without a device. The protocol is exercised against
 decoder. `testdata/golden/frames.json` pins the frame ↔ MIDI ↔ USB-MIDI encodings so they can't
 drift silently.
 
-Coverage is highest where correctness is protocol-critical (framer ~97%, pdo ~96%, fake ~96%,
-proto ~91%, rawmidi ~88%, session ~86%) and lowest where the code is mostly ioctl plumbing or cobra
-wiring that only real hardware exercises (usbmidi ~75%, bootloader ~66%, usbfs ~46%, cli ~32%).
+Coverage is highest where correctness is protocol-critical — `framer`, `pdo`, the fake device and
+`proto` lead, with `rawmidi` and `session` close behind — and lowest where the code is mostly ioctl
+plumbing or cobra wiring that only real hardware exercises: `usbmidi`, `bootloader`, `usbfs` and
+`cli` trail, `cli` by the widest margin. Run `go test -cover ./...` for the current figures; earlier
+revisions of this file quoted per-package percentages, which went stale the first time the suite
+grew.
 
 The `internal/session` suite dominates the wall time — around 15 s — because no clock is injected:
 the retry, backoff and timeout tests sleep for real, on the same code paths that run in production.

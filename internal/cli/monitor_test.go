@@ -156,3 +156,72 @@ func TestMonitorLoopCleanShutdownIsNotAnError(t *testing.T) {
 		t.Fatalf("a clean shutdown returned %v", err)
 	}
 }
+
+// TestMonitorDropHookIsWiredToTheFramer is the regression test SPEC.md §17 owes
+// the drop-hook divergence.
+//
+// §17 records it deliberately: the vendor client discards a malformed frame in
+// silence and the pending command just times out five seconds later with no
+// diagnostic, and this tool reports it instead, surfaced by `gflex monitor`
+// (SPEC.md §3.3). The whole divergence is one SetDropHook call, which reads
+// like optional instrumentation -- delete it, or reorder it after fr.Start(),
+// and every test still passed while the command silently went back to the
+// vendor behaviour.
+//
+// So this drives a real Framer over a stream whose end-of-frame marker arrives
+// with a length byte the accumulator cannot satisfy: two buffered bytes
+// declaring an eight-byte frame. That is dropped by the decoder, never reaches
+// Frames(), and is visible only through the hook -- so the notice arriving on
+// the channel proves the whole chain, monitorDrops -> Framer.SetDropHook ->
+// Decoder.SetDropHook, not just the top of it.
+func TestMonitorDropHookIsWiredToTheFramer(t *testing.T) {
+	// 0x08 declares eight bytes; only these two are buffered when the
+	// end-of-frame marker arrives.
+	malformed := framer.EncodeMIDI([]byte{0x08, 0x01})
+	st := &scriptedTransport{
+		reads: [][]byte{malformed},
+		err:   errors.New("device unplugged (ENODEV)"),
+	}
+	fr := framer.New(st, time.Nanosecond)
+	drops := monitorDrops(fr)
+	fr.Start()
+	defer func() { _ = fr.Close() }()
+
+	select {
+	case d := <-drops:
+		if !strings.Contains(d.reason, "declared frame length") {
+			t.Errorf("drop reason %q does not say why the frame was discarded", d.reason)
+		}
+		if len(d.buffered) == 0 {
+			t.Error("the drop notice carries no buffered bytes, so the operator sees no evidence")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a malformed frame produced no drop notice; monitor is back to the vendor's silent discard")
+	}
+}
+
+// The frames a drop notice describes never reach Frames(), which is the reason
+// the hook exists at all: without it that byte stream is indistinguishable from
+// a device that said nothing.
+func TestMonitorDroppedFramesNeverReachTheFrameChannel(t *testing.T) {
+	malformed := framer.EncodeMIDI([]byte{0x08, 0x01})
+	st := &scriptedTransport{
+		reads: [][]byte{malformed},
+		err:   errors.New("device unplugged (ENODEV)"),
+	}
+	fr := framer.New(st, time.Nanosecond)
+	drops := monitorDrops(fr)
+	fr.Start()
+
+	var out bytes.Buffer
+	app := &App{stdout: &out, stderr: io.Discard}
+	if err := app.monitorLoop(context.Background(), fr.Frames(), fr.Errors(), drops); err == nil {
+		t.Fatal("the terminal transport error was swallowed")
+	}
+	if cerr := fr.Close(); cerr != nil {
+		t.Fatalf("closing the framer: %v", cerr)
+	}
+	if !strings.Contains(out.String(), "drop") {
+		t.Errorf("the monitor printed no drop line for a malformed frame:\n%s", out.String())
+	}
+}

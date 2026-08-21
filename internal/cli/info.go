@@ -18,9 +18,9 @@ func newInfoCommand(app *App) *cobra.Command {
 			"version, output voltage, current limit, user voltage limits and the LED setting.\n\n" +
 			"--all additionally issues the commands the vendor app never sends: chip UUID,\n" +
 			"hardware ID, manufacturing date, the auth lock, both tolerance terms, the ADC\n" +
-			"calibration pair and a measurement. The frames are constructible and a parser\n" +
-			"exists, but the firmware's willingness to answer them is unverified (SPEC.md §6.4),\n" +
-			"so failures are tolerated and simply leave the field out.",
+			"calibration pair and a measurement. Every one of them answered on the single unit\n" +
+			"bring-up reached (SPEC.md §14), which is one unit and not a guarantee, so failures\n" +
+			"are still tolerated and simply leave the field out.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return app.run(cmd, func(ctx context.Context, f Formatter) error {
@@ -42,7 +42,7 @@ func newInfoCommand(app *App) *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&all, "all", false, "also issue the commands the vendor app never sends (unverified)")
+	cmd.Flags().BoolVar(&all, "all", false, "also issue the commands the vendor app never sends (best-effort)")
 	return cmd
 }
 
@@ -61,10 +61,15 @@ func newInfoCommand(app *App) *cobra.Command {
 // list. Changing one without the other now fails the build's tests rather than
 // silently making the promise false again.
 //
-// One approximation remains and is inherent: CMD_VOLTAGE_MV is read with the
-// vendor's not-ready retry, up to three times 300 ms apart (SPEC.md §6.5), so a
-// device that answers 0 mV sends that frame more than once. The listing shows
-// the healthy-device case, which is the one attempt every other command makes.
+// One approximation remains and is inherent: CMD_VOLTAGE_MV is read with
+// session.VoltageMv's ready-retry, so a device that answers 0 mV sends that
+// frame more than once. The vendor's fixed ladder -- three attempts 300 ms
+// apart, then an outer backoff chain -- is deliberately not what this does
+// (SPEC.md §17): the first read goes out immediately and only a not-ready
+// answer or a failed read starts an escalating backoff, 100 ms doubling to a
+// 1 s cap, against session.DefaultReadyTimeout (10 s). That is a dozen or more
+// frames on a unit that never settles, not three. The listing shows the
+// healthy-device case, which is the one attempt every other command makes.
 func infoReadCmds(all bool) []proto.Cmd {
 	cmds := []proto.Cmd{
 		proto.CmdSerialNumber,
@@ -158,7 +163,13 @@ func emitDeviceInfo(f Formatter, info *proto.DeviceInfo, all bool) {
 	if v := info.AuthLockLevel; v != nil {
 		display := fmt.Sprintf("%d", *v)
 		if len(info.AuthLockRaw) > 0 {
-			display += fmt.Sprintf("   (raw payload %s; the read layout is unverified, SPEC.md §6.3)",
+			// The layout is settled: a two-byte payload of [0x16, level], the
+			// command code echoed a second time and then the level, so reading
+			// payload[1] was never an off-by-one (SPEC.md §14.8). The raw bytes
+			// stay on the line because levels above 0 are still untested and a
+			// unit that answers differently should be visible, not silently
+			// reduced to one number.
+			display += fmt.Sprintf("   (raw payload %s; [code, level] per SPEC.md §14.8)",
 				proto.Hex(info.AuthLockRaw))
 		}
 		f.KV("authlock_level", "auth lock", *v, display)

@@ -35,7 +35,7 @@ const (
 	CmdReserved2            Cmd = 6  // UNKNOWN
 	CmdReserved3            Cmd = 7  // UNKNOWN
 	CmdSerialNumber         Cmd = 8  // used: 8 ASCII bytes
-	CmdChipUUID             Cmd = 9  // 8 ASCII bytes; never issued by the vendor app
+	CmdChipUUID             Cmd = 9  // 16 ASCII bytes (measured); never issued by the vendor app
 	CmdHardwareID           Cmd = 10 // 8 ASCII bytes; never issued by the vendor app
 	CmdFirmwareVersion      Cmd = 11 // used: 12 ASCII bytes
 	CmdMfgDate              Cmd = 12 // 8 ASCII bytes; never issued by the vendor app
@@ -60,7 +60,7 @@ const (
 // Frame flags OR'd into the command byte.
 const (
 	FlagWrite      uint8 = 0x80 // this frame carries a value to be stored
-	FlagScratchpad uint8 = 0x40 // never set by the vendor app; semantics unknown
+	FlagScratchpad uint8 = 0x40 // never set by the vendor app; validate-and-discard (SPEC.md §14.4)
 	CmdCodeMask    uint8 = 0x3F // mask isolating the command code
 )
 
@@ -188,8 +188,13 @@ func (c Cmd) Known() bool {
 }
 
 // Undocumented reports whether c is in the command table but its payload format
-// and effect were never determined. Callers should refuse to emit these without
-// an explicit override.
+// and effect were never determined (SPEC.md §14.5-§14.7, all still open).
+//
+// Callers must not emit one silently: SPEC.md §13.10 requires the raw escape
+// hatch to name the code and confirm, which is what cli.CheckRawFrame does. Do
+// not turn that into an override flag -- SPEC.md §11 rejects a global --force
+// precisely because it would shadow `firmware flash --force`, where the same
+// word already means "flash an image that carries no CRC".
 func (c Cmd) Undocumented() bool {
 	switch c {
 	case CmdReserved0, CmdReserved1, CmdReserved2, CmdReserved3,

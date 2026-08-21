@@ -30,13 +30,17 @@ import (
 )
 
 // Error classes callers branch on. Every error this package returns for a
-// failed syscall matches exactly one of these under errors.Is, and also matches
-// the underlying syscall.Errno, so both
+// failed syscall matches the underlying syscall.Errno, and matches at most one
+// of these under errors.Is, so both
 //
 //	errors.Is(err, usbfs.ErrNoDevice)
 //	errors.Is(err, unix.ENODEV)
 //
-// work.
+// work. At most, not exactly one: classify recognises a fixed set of errnos and
+// anything outside it -- EINVAL for a bad interface number, EOVERFLOW for a
+// device that sent more than the buffer holds, whatever a future kernel invents
+// -- carries no class at all. A caller branching on these therefore needs a
+// default arm; see Error.Class.
 var (
 	// ErrPermission is EACCES or EPERM: the process may not open or drive the
 	// usbfs node. Almost always a missing udev rule.

@@ -60,9 +60,12 @@ func (e Endpoint) IsIn() bool { return e.Address&endpointDirMask != 0 }
 // IsBulk reports whether bmAttributes says bulk.
 //
 // Callers must actually check this. SPEC.md §4.2 records that snd-usb-audio
-// accepts interrupt endpoints for USB-MIDI just as readily as bulk, that the
-// VFLEX's descriptors were never observed, and that hardcoding bulk would
-// therefore be a real bug rather than a theoretical one.
+// accepts interrupt endpoints for USB-MIDI just as readily as bulk, so
+// hardcoding bulk would be a real bug rather than a theoretical one. The unit
+// dumped at bring-up declares bulk endpoints on both its MIDIStreaming and its
+// vendor-class interface (SPEC.md §14.3) -- which settles what that one VFLEX
+// does in application mode, not what a bootloader-mode descriptor set or a
+// later hardware revision will.
 func (e Endpoint) IsBulk() bool { return e.Attributes&endpointXferMask == xferBulk }
 
 // IsInterrupt reports whether bmAttributes says interrupt.
@@ -159,9 +162,10 @@ type Configuration struct {
 // bNumConfigurations), and interface numbers are only unique within one of
 // them. Configurations keeps them apart; Interfaces is the working set that
 // selection runs over, and Device.Descriptors narrows it to the active
-// configuration when it can. The VFLEX is believed to declare a single
-// configuration, but its descriptors have never been dumped (SPEC.md §14.3), so
-// nothing here assumes that.
+// configuration when it can. The unit dumped at bring-up presented its three
+// interfaces under configuration 1 (SPEC.md §14.3), but that dump records no
+// bNumConfigurations and no bootloader-mode descriptor set has ever been seen,
+// so nothing here assumes a single configuration.
 type Config struct {
 	// Interfaces is the set of interface alt settings to select from, in
 	// descriptor order. For a single-configuration device -- and for any device

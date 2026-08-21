@@ -182,6 +182,31 @@ func TestFaultDrop(t *testing.T) {
 	}
 }
 
+// A Drop models the REQUEST being lost, not an applied write whose
+// acknowledgement was lost: the drop happens before the responder runs, so the
+// register never moves. Moving the check past the responder switch would make
+// this pass silently in the other direction, which is why it is asserted.
+func TestFaultDropSuppressesTheWriteItself(t *testing.T) {
+	d := New()
+	defer d.Close()
+	h := newHost(t, d)
+
+	d.SetRegister(proto.CmdVoltageMv, proto.EncodeU16(5000))
+	d.SetFault(proto.CmdVoltageMv, Fault{Drop: true})
+
+	w, err := proto.Write(proto.CmdVoltageMv, proto.EncodeU16(9000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, w)
+	if f, ok := h.recv(t, 150*time.Millisecond); ok {
+		t.Errorf("dropped write still answered with %x", f)
+	}
+	if v, ok := d.Register(proto.CmdVoltageMv); !ok || !bytes.Equal(v, proto.EncodeU16(5000)) {
+		t.Errorf("register = %x after a dropped write, want it untouched at %x", v, proto.EncodeU16(5000))
+	}
+}
+
 func TestFaultMismatch(t *testing.T) {
 	d := New()
 	defer d.Close()
@@ -192,6 +217,23 @@ func TestFaultMismatch(t *testing.T) {
 	got := h.mustRecv(t)
 	if proto.Cmd(got[1]&proto.CmdCodeMask) != proto.CmdCurrentLimitMa {
 		t.Errorf("response cmd = %#x, want %v", got[1], proto.CmdCurrentLimitMa)
+	}
+
+	// Of the two flag bits a mismatched response keeps exactly one: the write
+	// flag is echoed, the scratchpad bit is cleared -- here and on every other
+	// response path. A test that needs a response carrying the scratchpad bit
+	// has to inject the frame with Device.Push.
+	req, err := proto.Build(proto.CmdVoltageMv, proto.EncodeU16(9000), true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, req)
+	resp, err := proto.Parse(h.mustRecv(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Write || resp.Scratchpad {
+		t.Errorf("mismatched response write=%v scratchpad=%v, want true/false", resp.Write, resp.Scratchpad)
 	}
 }
 
@@ -599,6 +641,17 @@ func TestTypicalIdentityAndSettings(t *testing.T) {
 	if got := proto.DecodeString(read(proto.CmdSerialNumber).Payload); got != TypicalSerial {
 		t.Errorf("serial = %q, want %q", got, TypicalSerial)
 	}
+	// The chip UUID's payload length is asserted as well as its contents:
+	// hardware answers with 16 bytes, not the 8 §6.4's table claims, and
+	// proto's stringLen carries the corrected value (SPEC.md §14,
+	// "Corrections this produced").
+	uuid := read(proto.CmdChipUUID).Payload
+	if got := proto.DecodeString(uuid); got != TypicalChipUUID {
+		t.Errorf("chip uuid = %q, want %q", got, TypicalChipUUID)
+	}
+	if want, ok := proto.StringLen(proto.CmdChipUUID); !ok || len(uuid) != want {
+		t.Errorf("chip uuid payload = %d bytes, want %d", len(uuid), want)
+	}
 	if got := proto.DecodeString(read(proto.CmdFirmwareVersion).Payload); got != TypicalFirmware {
 		t.Errorf("firmware = %q, want %q", got, TypicalFirmware)
 	}
@@ -656,9 +709,11 @@ func TestTypicalAuthLockIsAsymmetric(t *testing.T) {
 
 	h.send(t, proto.Read(proto.CmdAuthLock))
 	got := h.mustRecv(t)
-	// The vendor client reads the level from payload[1]; a reader taking
-	// payload[0] must see the same thing while the layout is unverified.
-	if want := []byte{0x04, 0x16, 0x02, 0x02}; !bytes.Equal(got, want) {
+	// The read answers [0x16, level]: the command code echoed a second time,
+	// then the level the write above stored. This is the frame hardware sent
+	// (SPEC.md §14, question 8: tx 02 16 -> rx 04 16 16 00), so payload[0]
+	// carrying anything but 0x16 means the fake has drifted off the capture.
+	if want := []byte{0x04, 0x16, 0x16, 0x02}; !bytes.Equal(got, want) {
 		t.Errorf("authlock read = %x, want %x", got, want)
 	}
 }

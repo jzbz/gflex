@@ -38,7 +38,19 @@ env:
   # (Observed locally 2026-08-21 when the host toolchain moved to 1.27 while
   # go.mod still said 1.26.) So: bumping the go directive means bumping this
   # too, in the same commit.
+  #
+  # This name is documentation and an assertion, not the pin: the install below
+  # uses the commit SHA. A tag is a mutable git ref, and this workflow already
+  # refuses to trust one for the actions above; a tool whose output gates the
+  # merge and which is fetched by neither go.mod nor go.sum does not get a
+  # weaker rule than an action does. The staticcheck step checks that the SHA
+  # still resolves to this version, which is what keeps the two lines from
+  # drifting apart when only one of them is bumped.
   STATICCHECK_VERSION: v0.7.0
+  # dominikh/go-tools, the commit tagged v0.7.0. There is no Dependabot
+  # ecosystem covering a `go install` outside the module graph, so unlike the
+  # action SHAs this pair is bumped by hand.
+  STATICCHECK_COMMIT: ff63afafc529279f454e02f1d060210bd4263951
 
 jobs:
   check:
@@ -72,7 +84,15 @@ jobs:
 
       - name: staticcheck
         run: |
-          go install "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}"
+          # The resolve runs in an empty directory on purpose: a module query
+          # from inside the repo is answered against this module's graph, and
+          # honnef.co/go/tools is not in it.
+          resolved="$(cd "$(mktemp -d)" && go list -m -f '{{.Version}}' "honnef.co/go/tools@${STATICCHECK_COMMIT}")"
+          if [ "$resolved" != "$STATICCHECK_VERSION" ]; then
+            echo "::error::STATICCHECK_COMMIT resolves to $resolved, but STATICCHECK_VERSION says $STATICCHECK_VERSION; bump both or neither"
+            exit 1
+          fi
+          go install "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_COMMIT}"
           staticcheck ./...
 
       - name: test

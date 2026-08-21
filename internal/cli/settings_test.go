@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // TestParseAuthLockLevelIsStrictDecimal is the regression test for parsing the
@@ -105,6 +106,155 @@ func TestAuthLockSetLeadingZeroIsDecimal(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), proto.Hex(octal)) {
 		t.Errorf("dry run lists the OCTAL reading of \"010\" (level 8): %s\n%s", proto.Hex(octal), stdout.String())
+	}
+}
+
+// mustFrame builds the frame a dry run is expected to list, or to leave out.
+func mustFrame(t *testing.T, cmd proto.Cmd, payload []byte) string {
+	t.Helper()
+	fr, err := proto.Write(cmd, payload)
+	if err != nil {
+		t.Fatalf("building the %v frame: %v", cmd, err)
+	}
+	return proto.Hex(fr)
+}
+
+// TestSettingWriteFlagsAreStrictDecimal is the same regression as
+// TestAuthLockSetLeadingZeroIsDecimal, for the flags that had the defect after
+// `authlock set` was fixed. pflag's IntVar and Int32Var call
+// strconv.ParseInt(s, 0, ...), so --nominal, --sag, --offset and --scale
+// reached base 0 -- Go literal syntax -- without a conversion in this package
+// ever spelling it out. "0750" was octal 488, and every one of these values is
+// written to non-volatile memory with no prompt (tolerance) or a prompt that
+// --yes removes (calibrate).
+//
+// Both halves are asserted, and reverting the fix flips both: the dry run
+// would list the octal frame and not the decimal one. The negative assertion
+// earns its place by naming the failure -- a red test reads "the dry run
+// listed 488 mV" rather than only "750 mV is missing".
+func TestSettingWriteFlagsAreStrictDecimal(t *testing.T) {
+	clearGflexEnv(t)
+	cases := []struct {
+		name    string
+		args    []string
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "tolerance nominal",
+			args: []string{"tolerance", "set", "--nominal", "0750", "--dry-run"},
+			want: []string{mustFrame(t, proto.CmdVToleranceNominalMv, proto.EncodeU16(750))},
+			// Octal 750 is 488 mV: inside every bound the code checks.
+			notWant: []string{mustFrame(t, proto.CmdVToleranceNominalMv, proto.EncodeU16(488))},
+		},
+		{
+			name:    "tolerance sag",
+			args:    []string{"tolerance", "set", "--sag", "010", "--dry-run"},
+			want:    []string{mustFrame(t, proto.CmdVToleranceSagPerMa, proto.EncodeU16(10))},
+			notWant: []string{mustFrame(t, proto.CmdVToleranceSagPerMa, proto.EncodeU16(8))},
+		},
+		{
+			name: "calibrate offset and scale",
+			args: []string{"calibrate", "adc", "--offset", "010", "--scale", "020", "--dry-run"},
+			want: []string{
+				mustFrame(t, proto.CmdVMeasureADCOffset, proto.EncodeI32(10)),
+				mustFrame(t, proto.CmdVMeasureADCScale, proto.EncodeI32(20)),
+			},
+			notWant: []string{
+				mustFrame(t, proto.CmdVMeasureADCOffset, proto.EncodeI32(8)),
+				mustFrame(t, proto.CmdVMeasureADCScale, proto.EncodeI32(16)),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			app := &App{stdout: &stdout, stderr: &stderr, stdin: strings.NewReader("")}
+			root := NewRootCommand(app)
+			root.SetArgs(tc.args)
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("`gflex %s`: %v", strings.Join(tc.args, " "), err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(stdout.String(), want) {
+					t.Errorf("dry run does not list the decimal write frame %s:\n%s", want, stdout.String())
+				}
+			}
+			for _, bad := range tc.notWant {
+				if strings.Contains(stdout.String(), bad) {
+					t.Errorf("dry run lists the OCTAL reading as frame %s:\n%s", bad, stdout.String())
+				}
+			}
+		})
+	}
+}
+
+// The Go-literal shapes are usage errors on these flags too, so a script
+// cannot feed a hex or underscored value past cobra into non-volatile memory.
+func TestSettingWriteFlagsRefuseGoLiteralShapes(t *testing.T) {
+	clearGflexEnv(t)
+	for _, flag := range []struct{ cmd, name string }{
+		{"tolerance set", "--nominal"},
+		{"tolerance set", "--sag"},
+		{"calibrate adc", "--offset"},
+		{"calibrate adc", "--scale"},
+	} {
+		for _, arg := range []string{"0x10", "1_0"} {
+			args := append(strings.Fields(flag.cmd), flag.name, arg)
+			// calibrate's dry run needs both flags; the other one stays
+			// plain decimal so only the shape under test can fail.
+			switch flag.name {
+			case "--offset":
+				args = append(args, "--scale", "0")
+			case "--scale":
+				args = append(args, "--offset", "0")
+			}
+			args = append(args, "--dry-run")
+
+			var stdout, stderr bytes.Buffer
+			app := &App{stdout: &stdout, stderr: &stderr, stdin: strings.NewReader("")}
+			root := NewRootCommand(app)
+			root.SetArgs(args)
+
+			err := root.ExecuteContext(context.Background())
+			if err == nil {
+				t.Errorf("`gflex %s` was accepted; stdout:\n%s", strings.Join(args, " "), stdout.String())
+				continue
+			}
+			if code := ExitCode(err); code != ExitUsage {
+				t.Errorf("`gflex %s`: ExitCode = %d, want ExitUsage (%d): %v",
+					strings.Join(args, " "), code, ExitUsage, err)
+			}
+		}
+	}
+}
+
+// TestLEDSetReportsWhatItWrote pins the annotation that keeps `led set`'s
+// output honest. The command does not spend a round trip reading the setting
+// back, so the line it prints is the request; without "(written)" it is
+// indistinguishable from `voltage set`'s line, which is a read-back. A
+// scratchpad-flagged write is acknowledged and echoed and still never commits
+// (SPEC.md §14.4), so the difference is real, not pedantic.
+func TestLEDSetReportsWhatItWrote(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+	if err := tr.run(t, "led", "set", "off"); err != nil {
+		t.Fatalf("`led set off`: %v", err)
+	}
+	if !tr.wrote(t, proto.CmdDisableLEDDuringOp) {
+		t.Fatalf("`led set off` never reached the device:\n%s", tr.stdout.String())
+	}
+	var line string
+	for _, l := range strings.Split(tr.stdout.String(), "\n") {
+		if strings.Contains(l, "led always on") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("`led set off` printed no led line:\n%s", tr.stdout.String())
+	}
+	if !strings.Contains(line, "(written)") {
+		t.Errorf("`led set` presents an unverified write as confirmed state: %q", line)
 	}
 }
 

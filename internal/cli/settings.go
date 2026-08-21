@@ -425,7 +425,7 @@ func newToleranceCommand(app *App) *cobra.Command {
 		},
 	})
 
-	var nominal, sag int
+	var nominalArg, sagArg string
 	set := &cobra.Command{
 		Use:   "set [--nominal <mV>] [--sag <raw>]",
 		Short: "Set the tolerance parameters",
@@ -436,6 +436,21 @@ func newToleranceCommand(app *App) *cobra.Command {
 				haveSag := cmd.Flags().Changed("sag")
 				if !haveNominal && !haveSag {
 					return codedf(ExitUsage, "give at least one of --nominal or --sag")
+				}
+				var nominal, sag int
+				if haveNominal {
+					v, err := parseDecimalInt(nominalArg, "--nominal", fmt.Sprintf("0..%d", maxWireValue), 32)
+					if err != nil {
+						return err
+					}
+					nominal = int(v)
+				}
+				if haveSag {
+					v, err := parseDecimalInt(sagArg, "--sag", fmt.Sprintf("0..%d", maxWireValue), 32)
+					if err != nil {
+						return err
+					}
+					sag = int(v)
 				}
 				for _, v := range []struct {
 					name string
@@ -487,8 +502,13 @@ func newToleranceCommand(app *App) *cobra.Command {
 			})
 		},
 	}
-	set.Flags().IntVar(&nominal, "nominal", int(proto.DefaultVToleranceNominal), "nominal tolerance in millivolts")
-	set.Flags().IntVar(&sag, "sag", 0, "sag term as a raw 16-bit value (units unknown)")
+	// Strings parsed by parseDecimalInt, not IntVar: pflag's integer flags call
+	// strconv.ParseInt(s, 0, …), so `--nominal 0750` would read as octal and
+	// commit 488 mV to non-volatile memory. Same defect and same fix as
+	// `authlock set` -- see parseDecimalInt for the whole argument.
+	set.Flags().StringVar(&nominalArg, "nominal", strconv.FormatUint(uint64(proto.DefaultVToleranceNominal), 10),
+		"nominal tolerance in millivolts (plain decimal)")
+	set.Flags().StringVar(&sagArg, "sag", "0", "sag term as a raw 16-bit value, plain decimal (units unknown)")
 	cmd.AddCommand(set)
 	return cmd
 }
@@ -537,13 +557,15 @@ func newCalibrateCommand(app *App) *cobra.Command {
 		Use:   "calibrate",
 		Short: "Read or write the ADC calibration",
 	})
-	var offset, scale int32
+	var offsetArg, scaleArg string
 	adc := &cobra.Command{
 		Use:   "adc --offset <int32> --scale <int32>",
 		Short: "Write the ADC calibration offset and scale",
-		Long: "adc writes the two signed 32-bit calibration values. Both default to 0 on the\n" +
-			"device, which implies the firmware reads 0 as \"use the built-in calibration\"\n" +
-			"rather than as a literal multiplier -- inference, not proof (SPEC.md §6.5).\n\n" +
+		Long: "adc writes the two signed 32-bit calibration values. Both read 0 on a factory\n" +
+			"unit that still measures correctly (raw 437 counts -> 5270 mV), so the firmware\n" +
+			"does read 0 as \"use the built-in calibration\" rather than as a literal\n" +
+			"multiplier -- measured, not inferred (SPEC.md §14.11). The formula it applies\n" +
+			"instead is device-side and still unknown.\n\n" +
 			"This is confirmed every time, or needs --yes: a wrong calibration makes every\n" +
 			"subsequent voltage reading silently wrong, which defeats the range check on\n" +
 			"`voltage set` (SPEC.md §13.5). The previous values are printed first, with the\n" +
@@ -555,6 +577,21 @@ func newCalibrateCommand(app *App) *cobra.Command {
 				haveScale := cmd.Flags().Changed("scale")
 				if !haveOffset && !haveScale {
 					return codedf(ExitUsage, "give at least one of --offset or --scale")
+				}
+				var offset, scale int32
+				if haveOffset {
+					v, err := parseDecimalInt(offsetArg, "--offset", "a signed 32-bit value", 32)
+					if err != nil {
+						return err
+					}
+					offset = int32(v)
+				}
+				if haveScale {
+					v, err := parseDecimalInt(scaleArg, "--scale", "a signed 32-bit value", 32)
+					if err != nil {
+						return err
+					}
+					scale = int32(v)
 				}
 				if app.DryRun {
 					if !haveOffset || !haveScale {
@@ -612,8 +649,15 @@ func newCalibrateCommand(app *App) *cobra.Command {
 			})
 		},
 	}
-	adc.Flags().Int32Var(&offset, "offset", proto.DefaultADCOffset, "signed 32-bit ADC count offset")
-	adc.Flags().Int32Var(&scale, "scale", proto.DefaultADCScale, "signed 32-bit ADC count scale")
+	// Strings parsed by parseDecimalInt rather than Int32Var, for the reason
+	// given there: pflag parses an integer flag with base 0, so `--offset 010`
+	// would write 8. A wrong calibration makes every later voltage reading
+	// silently wrong (SPEC.md §13.5), and --yes suppresses the prompt that
+	// would otherwise show the reinterpreted number.
+	adc.Flags().StringVar(&offsetArg, "offset", strconv.FormatInt(int64(proto.DefaultADCOffset), 10),
+		"signed 32-bit ADC count offset (plain decimal)")
+	adc.Flags().StringVar(&scaleArg, "scale", strconv.FormatInt(int64(proto.DefaultADCScale), 10),
+		"signed 32-bit ADC count scale (plain decimal)")
 	cmd.AddCommand(adc)
 
 	cmd.AddCommand(&cobra.Command{
@@ -727,7 +771,15 @@ func newLEDCommand(app *App) *cobra.Command {
 				if err := c.Session.SetLEDAlwaysOn(ctx, on); err != nil {
 					return fmt.Errorf("setting the LED setting: %w", err)
 				}
-				f.KV("led_always_on", "led always on", on, onOff(on))
+				// Annotated "(written)", exactly as `authlock set` is: this
+				// command does not spend a round trip reading the setting back,
+				// so the value below is what was asked for, not what the device
+				// is known to hold. The distinction is not pedantic -- a
+				// scratchpad-flagged write is acknowledged and echoed and still
+				// never commits (SPEC.md §14.4) -- and without the annotation
+				// this line is indistinguishable from `voltage set`'s, which
+				// does read back.
+				f.KV("led_always_on", "led always on", on, onOff(on)+"  (written)")
 				return nil
 			})
 		},
@@ -744,29 +796,22 @@ func newLEDCommand(app *App) *cobra.Command {
 //
 // This used to be strconv.ParseInt(arg, 0, 32), and base 0 is Go literal
 // syntax: a leading zero means octal, so "010" wrote level 8, and "0x10" and
-// "1_0" were accepted too. Those are exactly the shapes numberProblem in
-// parse.go was built to reject for voltages -- its comment carries the full
-// argument -- and the auth lock is the last place to be more lenient than a
-// voltage: it is the least understood command in the protocol, and a non-zero
-// level may not be reversible (SPEC.md §6.3, §14.8), so the byte written must
-// be beyond doubt the number the user typed. Base 10 makes "010" decimal 10.
+// "1_0" were accepted too. The auth lock is the last place to be more lenient
+// than a voltage: it is the least understood command in the protocol, and a
+// non-zero level may not be reversible (SPEC.md §6.3, §14.8), so the byte
+// written must be beyond doubt the number the user typed. parseDecimalInt in
+// parse.go now carries that grammar, and the argument for it, for every
+// device-write integer this CLI accepts.
 //
-// numberProblem itself is not reused here because its grammar is for scaled
-// quantities -- it admits a decimal point, which a wire byte cannot carry.
 // Range stays out of this function on purpose: CheckAuthLock owns the 0-255
 // bound, so enforcement lives in one place (SPEC.md §13, interlock 4), which
-// is why the sign and out-of-byte values parse here and are refused there.
-// The 32-bit size is not range policy but conversion safety: it makes the
-// int() below exact even where int is 32 bits, so an enormous typo fails the
-// parse rather than wrapping into a plausible-looking level.
+// is why the sign and out-of-byte values parse here and are refused there. The
+// 32-bit width is conversion safety, not range policy: it makes the int() below
+// exact even where int is 32 bits.
 func parseAuthLockLevel(arg string) (int, error) {
-	level64, err := strconv.ParseInt(strings.TrimSpace(arg), 10, 32)
+	level64, err := parseDecimalInt(arg, "auth lock level", "a single byte (0-255)", 32)
 	if err != nil {
-		if errors.Is(err, strconv.ErrRange) {
-			return 0, codedf(ExitUsage, "auth lock level %q is far outside a single byte (0-255)", arg)
-		}
-		return 0, codedf(ExitUsage,
-			"cannot parse auth lock level %q: not a plain decimal number (write 10, not 0x0a or 1_0)", arg)
+		return 0, err
 	}
 	return int(level64), nil
 }
@@ -776,12 +821,13 @@ func newAuthLockCommand(app *App) *cobra.Command {
 		Use:   "authlock",
 		Short: "Read or set the auth lock level",
 		Long: "The auth lock is the least understood command in the protocol. The write puts the\n" +
-			"level in the first payload byte while the vendor's reader takes the second, and the\n" +
-			"read path has zero callers so it was never exercised. Only level 0 (\"unlocked\") is\n" +
-			"named anywhere; what other levels gate, and how to leave one, is unknown\n" +
-			"(SPEC.md §6.3, §14.8).\n\n" +
-			"`get` therefore prints the whole response payload alongside the level, so that a\n" +
-			"bring-up session can settle which byte is which.",
+			"level in the first payload byte, and the read response carries two -- [0x16, level],\n" +
+			"the command code echoed again and then the level -- so the reader takes the second.\n" +
+			"That layout was measured on hardware and matches the vendor client (SPEC.md §14.8).\n" +
+			"Only level 0 (\"unlocked\") is named anywhere; what other levels gate, and how to\n" +
+			"leave one, is still unknown, and no level above 0 has ever been set (SPEC.md §6.3).\n\n" +
+			"`get` prints the whole response payload alongside the level, so a response that does\n" +
+			"not match that layout is visible rather than silently decoded.",
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "get",
@@ -804,8 +850,9 @@ func newAuthLockCommand(app *App) *cobra.Command {
 				f.KV("authlock_level", "auth lock level", level, fmt.Sprintf("%d", level))
 				f.KV("authlock_raw", "response payload", raw, proto.Hex(raw))
 				f.Note("")
-				f.Note("The level above is payload byte 1, matching the vendor client. If the response")
-				f.Note("really carries one byte, the level is byte 0 instead (SPEC.md §6.3).")
+				f.Note("The level above is payload byte 1. Hardware settled this: the response is")
+				f.Note("[0x16, level], so the vendor client's index was right and there was never an")
+				f.Note("off-by-one (SPEC.md §14.8). What levels above 0 gate is still untested.")
 				return nil
 			})
 		},

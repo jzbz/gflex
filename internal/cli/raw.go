@@ -24,9 +24,11 @@ func newRawCommand(app *App) *cobra.Command {
 			"Separators are ignored, so \"0208\", \"02 08\" and \"02:08\" are the same frame.\n\n" +
 			"This is the escape hatch for the parts of the protocol nobody has characterised:\n" +
 			"the four reserved codes, the two LED commands, the encrypt challenge and the host\n" +
-			"mode flag (SPEC.md §14.5-§14.7), and the scratchpad flag, which the vendor app\n" +
-			"never sets (SPEC.md §5.1). Anything beyond a plain documented read is confirmed\n" +
-			"first.\n\n" +
+			"mode flag (SPEC.md §14.5-§14.7). It also reaches the scratchpad flag, which the\n" +
+			"vendor app never sets and which one unit measured as validate-and-discard: the\n" +
+			"write is acknowledged and echoed back but never committed, so it looks like a\n" +
+			"success and stores nothing (SPEC.md §14.4). Anything beyond a plain documented\n" +
+			"read is confirmed first.\n\n" +
 			"There is no error response anywhere in this protocol: a frame the device does not\n" +
 			"like produces silence, which arrives as a timeout.",
 		Args: cobra.MinimumNArgs(1),
@@ -40,7 +42,22 @@ func newRawCommand(app *App) *cobra.Command {
 					return codedf(ExitUsage, "a frame needs at least %d bytes ([length, command]), got %d",
 						proto.PreambleLen, len(raw))
 				}
-				if int(raw[0]) != len(raw) {
+				// Parsed before the length gate so the gate can read the
+				// declared length off the frame rather than re-deriving it
+				// from raw[0]. Parse's only failure is the short-frame case,
+				// already refused above, so nothing is lost by moving it up.
+				parsed, err := proto.Parse(raw)
+				if err != nil {
+					return codedf(ExitUsage, "cannot parse the frame: %v", err)
+				}
+
+				// Frame.DeclaredValid is deliberately NOT the test here. It
+				// admits a declared length shorter than the buffer, which is a
+				// legitimate thing to RECEIVE -- a well-formed frame followed
+				// by padding (SPEC.md §5.2). What goes out has no padding, so
+				// byte[0] must equal the whole frame, which is the tighter
+				// question DeclaredLen answers directly.
+				if parsed.DeclaredLen != len(raw) {
 					if !anyLen {
 						return codedf(ExitUsage,
 							"the length byte is 0x%02x (%d) but you gave %d bytes.\n"+
@@ -59,11 +76,6 @@ func newRawCommand(app *App) *cobra.Command {
 							"--any-length needs --no-ack: a frame with a mismatched length byte is dropped by\n"+
 								"  the receiver, so waiting for a response would only time out")
 					}
-				}
-
-				parsed, err := proto.Parse(raw)
-				if err != nil {
-					return codedf(ExitUsage, "cannot parse the frame: %v", err)
 				}
 
 				if app.DryRun {
@@ -116,13 +128,16 @@ func emitRawResponse(f Formatter, resp proto.Frame) {
 	f.KV("scratchpad", "scratchpad flag", resp.Scratchpad, fmt.Sprintf("%t", resp.Scratchpad))
 	f.KV("payload", "payload", proto.Hex(resp.Payload), payloadDisplay(resp.Payload))
 	f.KV("payload_len", "payload length", len(resp.Payload), fmt.Sprintf("%d", len(resp.Payload)))
-	// Whether the device echoes the write and scratchpad flag bits at all is
-	// unknown: the vendor client masks them off before any comparison, so it
-	// never observes them (SPEC.md §14.13). Printing them is the point.
+	// The one unit measured CLEARS both flag bits on the way back: `tx 04 92 13
+	// 88` came home as `rx 04 12 13 88` (SPEC.md §14.13), which is why masking
+	// the received command byte is required rather than merely defensive. A set
+	// bit here therefore contradicts that measurement -- a different unit, a
+	// different firmware -- and is worth saying out loud. The vendor client
+	// masks before any comparison and so could never have seen it either way.
 	if resp.Write || resp.Scratchpad {
 		f.Note("")
-		f.Note("The device echoed a flag bit in the command byte. The vendor client masks these")
-		f.Note("off before looking, so this is new information (SPEC.md §14.13).")
+		f.Note("The device echoed a flag bit in the command byte. The one unit measured cleared")
+		f.Note("both bits, so this contradicts SPEC.md §14.13 and is worth recording.")
 	}
 }
 

@@ -41,6 +41,32 @@ func TestWrapErrnoClassification(t *testing.T) {
 	}
 }
 
+// The contract is "at most one class", not "exactly one": classify recognises a
+// fixed set of errnos and everything outside it carries no sentinel at all, so
+// a caller branching on them needs a default arm. Nothing pinned that in either
+// direction before, which is how the package doc came to claim the opposite.
+func TestWrapErrnoLeavesUnrecognisedErrnosUnclassified(t *testing.T) {
+	classes := []error{ErrPermission, ErrNoDevice, ErrBusy, ErrTimeout, ErrStall, ErrNotSupported}
+	// EOVERFLOW is recognised well enough to earn a hint but has no sentinel;
+	// EINVAL -- what usbfs answers for a bad interface number, and for an
+	// oversized transfer that got past MaxBulkTransferSize -- has neither.
+	for _, errno := range []unix.Errno{unix.EOVERFLOW, unix.EINVAL} {
+		err := wrapErrno("claim interface 0", "/dev/bus/usb/001/007", errno)
+		if !errors.Is(err, errno) {
+			t.Errorf("%v: raw errno lost in %v", errno, err)
+		}
+		for _, class := range classes {
+			if errors.Is(err, class) {
+				t.Errorf("%v was classified as %v", errno, class)
+			}
+		}
+	}
+	// The hint is the whole reason classify handles EOVERFLOW at all.
+	if err := wrapErrno("transfer", "/dev/bus/usb/001/007", unix.EOVERFLOW); !strings.Contains(err.Error(), "more data than") {
+		t.Errorf("EOVERFLOW lost its hint: %v", err)
+	}
+}
+
 // A permission failure has to say what to do about it: a missing udev rule is
 // the single most likely reason this package fails at all (SPEC.md §4.4).
 func TestWrapErrnoPermissionHint(t *testing.T) {

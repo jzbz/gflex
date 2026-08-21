@@ -169,9 +169,10 @@ func TestSelectInterface(t *testing.T) {
 	}
 }
 
-// The failure message has to say what the device did declare, because the
-// VFLEX's real descriptors are unknown (SPEC.md §14.3) and this error is how a
-// user reports them.
+// The failure message has to say what the device did declare. A shipped unit's
+// descriptors are on record (SPEC.md §14 Q3), but a device that reaches this
+// error is by definition declaring something else, and the error is the only
+// place that reaches the user.
 func TestSelectInterfaceErrorDescribesDescriptors(t *testing.T) {
 	cfg := &usbfs.Config{Interfaces: []usbfs.Interface{
 		{Number: 3, Alt: 2, Class: classAudio, SubClass: 0x01,
@@ -217,6 +218,15 @@ func TestBufSize(t *testing.T) {
 		{4, 4},
 		{0, defaultPacketSize}, // descriptor unreadable
 		{3, defaultPacketSize}, // smaller than one event packet
+		// Bits 12:11 are the transactions-per-microframe multiplier, not size
+		// (USB 2.0 §9.6.6), so a declared 0x1400 means a 1024-byte maximum.
+		// bufSize masks unconditionally rather than only for periodic
+		// endpoints: the bits are reserved-zero on a bulk endpoint anyway.
+		// Without the mask the last row would size a 65535-byte buffer, which
+		// usbfs.Transfer refuses outright as too large.
+		{0x1400, 1024},
+		{0x0800, defaultPacketSize}, // multiplier bits only, no size at all
+		{0xFFFF, 0x07FF},
 	}
 	for _, tc := range tests {
 		if got := bufSize(ep(0x81, attrBulk, tc.mps)); got != tc.want {
@@ -269,12 +279,4 @@ func TestOptionsDefaults(t *testing.T) {
 	if o.ReadTimeout != 1 || o.WriteTimeout != 2 {
 		t.Fatalf("withDefaults overrode explicit values: %+v", o)
 	}
-	var lines []string
-	o = Options{Log: func(s string) { lines = append(lines, s) }}.withDefaults()
-	o.logf("hello %d", 42)
-	if len(lines) != 1 || lines[0] != "hello 42" {
-		t.Fatalf("logf produced %v", lines)
-	}
-	// A nil Log must be a no-op, not a panic.
-	Options{}.logf("ignored")
 }

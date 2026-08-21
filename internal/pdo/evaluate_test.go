@@ -702,3 +702,28 @@ func TestEvaluateEPRAVSCoversSPRRequest(t *testing.T) {
 	}
 	wantMessage(t, m, "EPR AVS range")
 }
+
+// TestEvaluatePPSCoversAboveTheEPRThreshold is the EPR-side mirror of the same
+// SPEC.md §17 deviation: the vendor partitions candidates by the requested
+// voltage, so an above-20 V request never sees an SPR object. A PPS APDO's
+// max-voltage field is 8 bits of 100 mV and decodes to 25.5 V, so the class can
+// reach past the threshold even though it is an SPR class, and the branch that
+// checks for it before declaring the voltage unreachable had no test of its own
+// — every other PPS fixture in this file tops out at 11 V.
+func TestEvaluatePPSCoversAboveTheEPRThreshold(t *testing.T) {
+	l := simpleLog(t, fixed5V3A, pps3321V5A)
+
+	m := l.Evaluate(21, 3)
+	checkMatch(t, m, true, ModeSPRPPS, 5)
+	wantMessage(t, m, "no EPR capability reaches 21 V, but the PPS range 3.3-21.0 V covers it and supplies 5.00 A")
+	// The request is still above 20 V, so the cable advisory finish attaches to
+	// every EPR-voltage verdict must survive the SPR-class capability.
+	wantMessage(t, m, "eMarker-equipped 5 A EPR cable")
+
+	// One tenth of a volt further and nothing covers it: the branch answers only
+	// for what the decoded range actually reaches, and hands back to the EPR
+	// failure explanation otherwise.
+	m = l.Evaluate(21.1, 3)
+	checkMatch(t, m, false, ModeNone, 0)
+	wantMessage(t, m, eprRequiredMessage)
+}

@@ -19,10 +19,17 @@ import (
 // includeUnused additionally reads chip UUID, hardware id, manufacturing date,
 // the authorisation lock, both tolerance terms, the ADC calibration pair and
 // the voltage measurement. The vendor application never issues *any* of those
-// commands (SPEC.md §6, "Used" column), so whether the firmware answers them at
-// all is unverified. Each is therefore best-effort: a failure leaves the
-// corresponding field nil instead of failing the whole call, and a nil field
-// means "not read", never "zero".
+// commands (SPEC.md §6, "Used" column), but the firmware answers them: bring-up
+// recorded the three identity strings, the authorisation lock, both ADC terms
+// and the measurement, and read the sag tolerance as 0 on a factory unit
+// (SPEC.md §14 and its corrections block; only the nominal tolerance has no
+// recorded reading). That is one unit and one firmware revision, so each read
+// stays best-effort: a failure leaves the corresponding field nil instead of
+// failing the whole call, and a nil field means "not read", never "zero".
+//
+// Best-effort stops where no further read could succeed either. A cancelled
+// context or any other failure PermanentErr names ends the call with an error
+// rather than with a report full of holes; see the loop below.
 func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceInfo, error) {
 	info := &proto.DeviceInfo{}
 
@@ -144,7 +151,8 @@ func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceIn
 	}
 
 	for _, read := range optional {
-		if err := read(); err == nil {
+		err := read()
+		if err == nil {
 			continue
 		}
 		// Tolerating a failure is right for a command the firmware may not
@@ -164,6 +172,19 @@ func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceIn
 		// TestInfoCancellationBetweenReadsAbortsTheCall pins that composition.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("read device info: %w", ctxErr)
+		}
+		// The same argument covers the rest of what this package classifies as
+		// beyond recovery. A device unplugged part-way through these nine reads
+		// fails every remaining one instantly and identically, so tolerating the
+		// first would print exactly the report an operator cannot tell apart
+		// from a unit that simply declines the unused commands -- and exit 0
+		// while doing it. PermanentErr is the classifier the sibling loops
+		// already use (VoltageMv's ready retry, FullPDOLog's chunk retry), and
+		// it deliberately excludes ErrTimeout, which is precisely how firmware
+		// that does not implement one of these commands declines it. So the
+		// tolerance this block exists for is untouched.
+		if PermanentErr(err) {
+			return nil, fmt.Errorf("read device info: %w", err)
 		}
 	}
 
