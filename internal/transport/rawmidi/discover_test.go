@@ -550,7 +550,7 @@ func TestClassifyOpenError(t *testing.T) {
 		sentinel error
 		mentions []string
 	}{
-		{unix.EBUSY, ErrBusy, []string{"PipeWire", "--transport usb", path}},
+		{unix.EBUSY, ErrBusy, []string{"Chrome", "PipeWire", "--transport usb", path}},
 		{unix.EACCES, ErrPermission, []string{"gflex install-udev", path}},
 		{unix.EPERM, ErrPermission, []string{"gflex install-udev"}},
 		{unix.ENOENT, ErrNotFound, []string{"gflex devices"}},
@@ -581,6 +581,37 @@ func TestClassifyOpenError(t *testing.T) {
 	}
 	if !errors.Is(err, unix.EIO) {
 		t.Errorf("EIO lost from the chain: %v", err)
+	}
+}
+
+// The EBUSY text is the only diagnosis a user gets for a port they cannot open,
+// so its content is load-bearing rather than decorative. Two things are pinned
+// here. First, every holder that has actually been seen is named: on 2026-08-21
+// a Chrome tab running the vendor's web build (SPEC.md §1) held the port, and a
+// message listing only sound servers and DAWs sent that user looking for
+// software they were not running. Second, Chrome comes before the rest, because
+// for this device the vendor's own client is a Chrome web app and a reader stops
+// at the first plausible entry.
+func TestBusyErrorNamesEveryKnownHolder(t *testing.T) {
+	const path = "/dev/snd/midiC2D0"
+	msg := classifyOpenError(path, &fs.PathError{Op: "open", Path: path, Err: unix.EBUSY}).Error()
+
+	for _, holder := range []string{"Chrome", "Web MIDI", "PipeWire", "JACK", "DAW"} {
+		if !strings.Contains(msg, holder) {
+			t.Errorf("busy message drops the %s holder: %s", holder, msg)
+		}
+	}
+	for _, later := range []string{"PipeWire", "JACK", "DAW"} {
+		if strings.Index(msg, "Chrome") > strings.Index(msg, later) {
+			t.Errorf("Chrome is listed after %s; it is the likeliest holder for this "+
+				"device and belongs first: %s", later, msg)
+		}
+	}
+
+	// A named suspect is a guess until the user can check it. The sequencer
+	// client list is what turned the guess into a fact on hardware.
+	if !strings.Contains(msg, "/proc/asound/seq/clients") {
+		t.Errorf("busy message offers no way to identify the holder: %s", msg)
 	}
 }
 

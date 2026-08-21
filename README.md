@@ -109,10 +109,13 @@ the point of use:
 Normally the tool uses **ALSA rawmidi**, which needs no special permissions on a systemd desktop and
 doesn't disturb anything else using your sound hardware.
 
-If something else has already claimed the MIDI port — PipeWire, JACK, a DAW — the open fails with
-`EBUSY`, and `--transport usb` bypasses ALSA entirely by talking to the device's USB endpoints and
-building the 4-byte USB-MIDI event packets by hand. That path detaches `snd-usb-audio` for the
-duration and reattaches it on exit.
+If something else has already claimed the MIDI port — Chrome running the vendor's own web app,
+PipeWire, JACK, a DAW — the open fails with `EBUSY`, and `--transport usb` bypasses ALSA entirely by
+talking to the device's USB endpoints and building the 4-byte USB-MIDI event packets by hand. That
+path detaches `snd-usb-audio` for the duration and asks the kernel to rebind it on exit — but on the
+one host and kernel this was measured on, the MIDI node did not come back until the device was
+physically replugged, so treat `--transport usb` as a deliberate trade rather than a free fallback.
+See [Troubleshooting](#troubleshooting).
 
 Firmware update is a third case: in bootloader mode the device stops being a MIDI device altogether
 and exposes a vendor-class interface, so there's no MIDI framing at all — the same frames go out as
@@ -335,6 +338,13 @@ Global flags: `--port`, `--transport rawmidi|usb`, `--json`, `--timeout`, `--byt
 environment counterpart on purpose: both decide whether the device gets written to, and a
 `GFLEX_YES` left in a shell profile would pre-answer every safety confirmation for months.
 
+`--transport usb` has a cost worth knowing before you reach for it. It detaches `snd-usb-audio` from
+the device's MIDI interface for the duration, and on at least one host and kernel the ALSA MIDI node
+did not come back afterwards — `/dev/snd/midiC*D*` stayed gone until the device was physically
+replugged, even though the kernel accepted the request to rebind. Use it when rawmidi genuinely
+cannot be had; if the node is merely busy, closing whatever holds it (often a Chrome tab running the
+vendor's web app — see [Troubleshooting](#troubleshooting)) is the cheaper answer.
+
 `--byte-delay` paces successive messages, and defaults to **1 ms** rather than the 20 ms the
 vendor's app uses — the measurement behind that is in
 [Status and limitations](#status-and-limitations). `--byte-delay 0` is refused: zero pacing dropped
@@ -410,9 +420,21 @@ bootloader mode from an interrupted flash (slow-blinking white LED — use `gfle
 --recover`); or it genuinely isn't plugged in. Note the tool matches on USB vendor `0x37bf`, so a
 device that enumerates but isn't a VFLEX won't be picked up unless it's your only MIDI port.
 
-**"Device busy"** (exit 4). Something else holds the ALSA rawmidi node — PipeWire, JACK, or a DAW.
-rawmidi is exclusive per direction. Either stop the other client or use `--transport usb`, which
-bypasses ALSA entirely.
+**"Device busy"** (exit 4). Something else holds the ALSA rawmidi node, which is exclusive per
+direction. **Check the browser first.** The vendor ships a functionally identical web app at
+`https://vflex.app` that drives the device over Web MIDI in Chrome, so the most likely holder is a
+tab you left open — and it is the likeliest of all if you were comparing this tool against the
+vendor's. Chrome reaches the device through the ALSA sequencer, and the sequencer's kernel module is
+what opens the node on its behalf, so don't go looking for the browser among the processes holding
+`/dev/snd/midiC*D*`. Read `/proc/asound/seq/clients` instead: the `Werewolf VFLEX` port lists what
+it is connected to and connected from, one entry per direction, and that is the real holder.
+PipeWire, JACK and a DAW are the other candidates.
+
+Closing the other client is the fix. `--transport usb` also works — it bypasses ALSA entirely — but
+it is not free: on at least one host and kernel a single run of it left the device with no
+`/dev/snd/midiC*D*` node at all until it was physically unplugged and plugged back in, because
+reattaching `snd-usb-audio` to the MIDI interface alone does not recreate the node
+([SPEC.md §4.2](SPEC.md#42-fallback-and-bootloader-direct-usb-via-usbfs)). Prefer closing the tab.
 
 **"Permission denied"** (exit 6). `sudo gflex install-udev`, then unplug and replug. On a
 non-systemd or headless system the `uaccess` tag does nothing, so uncomment the `GROUP=` fallback in
@@ -504,15 +526,31 @@ Still unverified: firmware flashing end to end (no image to hand), the auth-lock
 the tolerance-sag units, and the six commands that are dead code in the vendor's app. Those, and the
 CRC algorithm, are the remaining §14 entries.
 
+**One known limitation, found the same day: `--transport usb` can cost you the ALSA MIDI port.**
+After one `gflex --transport usb info`, `/dev/snd/midiC2D*` disappeared and did not return until the
+device was physically replugged; sysfs showed the MIDIStreaming interface with no driver bound while
+the audio-control interface next to it stayed bound to `snd-usb-audio`. The reattach is not silently
+failing — the `USBDEVFS_CONNECT` ioctl returns success, because it means the kernel accepted a
+re-probe request, not that a driver bound. `snd-usb-audio` appears to bind the MIDI interface only
+while probing the whole audio function, so re-probing that interface on its own does not recreate
+the node. Measured on one host and one kernel, so the mechanism is inferred rather than established;
+the effect on the user is not. Details in
+[SPEC.md §4.2](SPEC.md#42-fallback-and-bootloader-direct-usb-via-usbfs).
+
 **What two units do and do not establish.** Both run firmware `APP.05.00.00` and carry manufacturing
 date `004apr26`, so they are plausibly from a single production batch, and both were measured on the
 same host. That is materially stronger than n=1 and it is what §14 asked for — but it is not
 evidence about a different firmware revision or a different USB controller, and nothing above should
-be read as such. Writes were re-tested only on unit 1 (0/30 failed, 0/30 read
-back wrong at 1 ms); re-testing writes on unit 2 would mean writing to someone else's device. What
-makes 1 ms a reasonable default rather than a gamble is the shape of the failure: too little pacing
-surfaces as a response timeout, which is visible and retryable, not as a silent wrong write — and
-the paths that can damage a load, `voltage`, `current` and `vlimit`, all verify by read-back.
+be read as such. Writes have now been re-tested at 1 ms on both units, and neither has lost one:
+0/30 failed and 0/30 read back wrong on unit 1, then the same on unit 2, which took 0.077 s per
+write plus read-back. Unit 2's run is the stronger of the two, because it wrote the current limit
+**alternating between 4900 and 5000 mA**, checked each read-back against the value just written, and
+afterwards restored 5000 mA and verified the restore separately. A write that never reaches the
+device reads back as the value it already held, so a test that writes the same number every time
+reports success in precisely the case where the write was lost; alternating removes that blind spot.
+What makes 1 ms a reasonable default rather than a gamble is the shape of the failure: too little
+pacing surfaces as a response timeout, which is visible and retryable, not as a silent wrong write —
+and the paths that can damage a load, `voltage`, `current` and `vlimit`, all verify by read-back.
 
 Reports from real hardware are still the most useful contribution — especially from a unit on a
 different firmware revision, a different batch, or a different USB controller, since that is where

@@ -294,7 +294,7 @@ func descriptorDevice(t *testing.T, blob []byte, vendorID uint16) *Device {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { f.Close() })
-	return &Device{f: f, ref: DeviceRef{Path: p, VendorID: vendorID}, claimed: map[int]bool{}}
+	return &Device{f: f, ref: DeviceRef{Path: p, VendorID: vendorID}, claimed: map[int]claimState{}}
 }
 
 // Enumeration reads idVendor from sysfs and then synthesises the node path from

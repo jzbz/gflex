@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jzbz/gflex/internal/usbfs"
 )
@@ -278,5 +279,61 @@ func TestOptionsDefaults(t *testing.T) {
 	o = Options{ReadTimeout: 1, WriteTimeout: 2}.withDefaults()
 	if o.ReadTimeout != 1 || o.WriteTimeout != 2 {
 		t.Fatalf("withDefaults overrode explicit values: %+v", o)
+	}
+}
+
+// releaseFake is a usbDevice that exists only to answer ReleaseInterface with a
+// chosen error. It is deliberately separate from transport_test.go's fake: what
+// is under test here is the sentence Close builds out of the release's verdict,
+// and nothing about reads, writes or call ordering.
+type releaseFake struct{ releaseErr error }
+
+func (f *releaseFake) Transfer(context.Context, uint8, []byte, time.Duration) (int, error) {
+	return 0, nil
+}
+func (f *releaseFake) ReleaseInterface(int) error { return f.releaseErr }
+func (f *releaseFake) Close() error               { return nil }
+
+func closingTransport(releaseErr error) *transport {
+	return newTransport(
+		&releaseFake{releaseErr: releaseErr},
+		usbfs.DeviceRef{Path: "/dev/bus/usb/001/007"},
+		usbfs.Interface{Number: 1, Class: classAudio, SubClass: subClassMIDIStreaming},
+		ep(0x81, attrBulk, 64), ep(0x01, attrBulk, 64),
+		Options{}.withDefaults(),
+	)
+}
+
+// Losing the ALSA MIDI port is the whole cost of --transport usb, and on the
+// kernel this was watched on releasing does not bring it back (usbfs verifies
+// the rebind against sysfs and reports ErrDriverNotRebound). When that is what
+// happened, Close has to name the remedy -- a replug -- rather than leave the
+// user hunting for what broke their MIDI port.
+func TestCloseReportsAnUnreboundDriver(t *testing.T) {
+	inner := fmt.Errorf("usbfs: the kernel driver detached to claim interface 1 is not bound again: %w",
+		usbfs.ErrDriverNotRebound)
+	err := closingTransport(inner).Close()
+
+	if !errors.Is(err, usbfs.ErrDriverNotRebound) {
+		t.Fatalf("Close error = %v, want one wrapping ErrDriverNotRebound", err)
+	}
+	if !strings.Contains(err.Error(), "replug") {
+		t.Errorf("Close error %q does not tell the user to replug", err)
+	}
+	if strings.Contains(err.Error(), "may stay") {
+		t.Errorf("Close error %q hedges about a state sysfs has already settled: %v", err, usbfs.ErrDriverNotRebound)
+	}
+}
+
+// The control: an ordinary release failure says nothing at all about whether
+// the driver came back, so that message must keep its hedge rather than assert
+// a replug the user may not need.
+func TestCloseHedgesWhenTheReleaseMerelyFailed(t *testing.T) {
+	err := closingTransport(syscall.EBUSY).Close()
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Close error = %v, want one wrapping EBUSY", err)
+	}
+	if !strings.Contains(err.Error(), "may stay missing") {
+		t.Errorf("Close error %q states more than a failed release establishes", err)
 	}
 }

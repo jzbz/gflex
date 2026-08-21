@@ -2,7 +2,10 @@ package usbfs
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -54,7 +57,7 @@ type scriptedIoctl struct {
 }
 
 func (s *scriptedIoctl) device() *Device {
-	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]bool{}}
+	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]claimState{}}
 	d.ioctlFn = func(op string, req uintptr, arg unsafe.Pointer, _ bool) (int, error) {
 		c := decodeIoctl(req, arg)
 		s.calls = append(s.calls, c)
@@ -64,6 +67,64 @@ func (s *scriptedIoctl) device() *Device {
 		return 0, nil
 	}
 	return d
+}
+
+// deviceWithSysfs is device() plus the sysfs tree the rebind check reads,
+// because that check asks the filesystem rather than the kernel and a scripted
+// ioctl alone cannot answer it. bound maps an interface number to whether a
+// driver is bound to it; an interface left out of the map gets no directory at
+// all, which is how a device that has left the bus looks.
+//
+// The layout mirrors the real one -- a device directory plus one
+// <device>:<bConfigurationValue>.<interface> directory per interface, with a
+// "driver" symlink where a driver is bound. enumerate_test.go's fakeSysfs builds
+// attribute files rather than symlinks and interfaces rather than devices, so
+// this is a sibling of it, not a use of it. The configuration number here is 1
+// and is deliberately not what the code under test looks for; it globs.
+func (s *scriptedIoctl) deviceWithSysfs(t *testing.T, bound map[int]bool) *Device {
+	t.Helper()
+	root := t.TempDir()
+	sys := filepath.Join(root, "1-1")
+	mkdirFixture(t, sys)
+	mkdirFixture(t, filepath.Join(root, "snd-usb-audio"))
+	for num, isBound := range bound {
+		mkdirFixture(t, interfaceDir(sys, num))
+		if isBound {
+			bindFixtureDriver(t, sys, num)
+		}
+	}
+	d := s.device()
+	d.ref.SysPath = sys
+	return d
+}
+
+func interfaceDir(sysPath string, num int) string {
+	return fmt.Sprintf("%s:1.%d", sysPath, num)
+}
+
+func mkdirFixture(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// bindFixtureDriver and unbindFixtureDriver stand in for the kernel binding and
+// unbinding a driver, so a scripted ioctl can move sysfs the way the real one
+// would -- or, for the case this all exists for, fail to.
+func bindFixtureDriver(t *testing.T, sysPath string, num int) {
+	t.Helper()
+	link := filepath.Join(interfaceDir(sysPath, num), "driver")
+	if err := os.Symlink(filepath.Join(filepath.Dir(sysPath), "snd-usb-audio"), link); err != nil && !os.IsExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func unbindFixtureDriver(t *testing.T, sysPath string, num int) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(interfaceDir(sysPath, num), "driver")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 }
 
 // saw reports whether the recorded trace contains a matching ioctl.
@@ -144,7 +205,7 @@ func TestClaimInterfaceFallbackRecordsTheDetach(t *testing.T) {
 	if err := d.ClaimInterface(1, true); err != nil {
 		t.Fatalf("ClaimInterface: %v", err)
 	}
-	if !d.claimed[1] {
+	if !d.claimed[1].detached {
 		t.Errorf("the fallback claim did not record its detach: %v", d.claimed)
 	}
 }
@@ -160,7 +221,7 @@ func TestReleaseInterfaceReattachesAfterAFailedRelease(t *testing.T) {
 		return nil
 	}}
 	d := s.device()
-	d.claimed[1] = true // claimed with a kernel driver detached
+	d.claimed[1] = claimState{detached: true} // claimed with a kernel driver detached
 
 	err := d.ReleaseInterface(1)
 	if !errors.Is(err, unix.EINVAL) {
@@ -179,7 +240,7 @@ func TestReleaseInterfaceReattachesAfterAFailedRelease(t *testing.T) {
 func TestReleaseInterfaceWithoutDetachNeverReattaches(t *testing.T) {
 	s := &scriptedIoctl{respond: func(ioctlCall) error { return nil }}
 	d := s.device()
-	d.claimed[2] = false
+	d.claimed[2] = claimState{}
 
 	if err := d.ReleaseInterface(2); err != nil {
 		t.Fatalf("ReleaseInterface: %v", err)
@@ -200,7 +261,7 @@ func TestReleaseInterfaceOnAVanishedDevice(t *testing.T) {
 		return nil
 	}}
 	d := s.device()
-	d.claimed[1] = true
+	d.claimed[1] = claimState{detached: true}
 
 	if err := d.ReleaseInterface(1); err != nil {
 		t.Fatalf("ReleaseInterface on a vanished device = %v, want nil", err)
@@ -223,8 +284,8 @@ func TestCloseReattachesEveryDetachedInterface(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.f = f
-	d.claimed[0] = true
-	d.claimed[1] = false
+	d.claimed[0] = claimState{detached: true}
+	d.claimed[1] = claimState{}
 
 	if err := d.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -234,5 +295,202 @@ func TestCloseReattachesEveryDetachedInterface(t *testing.T) {
 	}
 	if s.saw(ioctlIoctl, ioctlConnect, 1) {
 		t.Error("interface 1 was claimed without a detach and was reattached anyway")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Verifying the rebind.
+//
+// USBDEVFS_CONNECT answering success does not mean a driver bound; on the kernel
+// a VFLEX was driven on (2026-08-21, serial 58b4f621) it returned success and
+// left interface 1.1 with no driver, so /dev/snd/midiC2D* stayed gone until a
+// replug. The fake kernel below is scripted to behave that way: it drops the
+// driver symlink when the interface is claimed and, unless a test says
+// otherwise, does not put it back on USBDEVFS_CONNECT.
+// ---------------------------------------------------------------------------
+
+// unbindingKernel scripts sysfs to follow the ioctls: the claim unbinds, and
+// rebindOnConnect decides whether USBDEVFS_CONNECT binds anything back.
+func unbindingKernel(t *testing.T, sysPath *string, rebindOnConnect bool) func(ioctlCall) error {
+	return func(c ioctlCall) error {
+		switch {
+		case c.req == ioctlDisconnectClaim, c.req == ioctlIoctl && c.inner == ioctlDisconnect:
+			unbindFixtureDriver(t, *sysPath, c.iface)
+		case c.req == ioctlIoctl && c.inner == ioctlConnect:
+			if rebindOnConnect {
+				bindFixtureDriver(t, *sysPath, c.iface)
+			}
+		}
+		return nil
+	}
+}
+
+// The finding itself: every ioctl succeeds, and the interface is still
+// driverless afterwards. Reporting that is the only way the user learns that
+// their ALSA MIDI port is not coming back on its own.
+func TestReleaseInterfaceReportsADriverThatDidNotRebind(t *testing.T) {
+	var sys string
+	s := &scriptedIoctl{}
+	s.respond = unbindingKernel(t, &sys, false)
+	d := s.deviceWithSysfs(t, map[int]bool{1: true})
+	sys = d.ref.SysPath
+
+	if err := d.ClaimInterface(1, true); err != nil {
+		t.Fatalf("ClaimInterface: %v", err)
+	}
+	err := d.ReleaseInterface(1)
+	if !errors.Is(err, ErrDriverNotRebound) {
+		t.Fatalf("ReleaseInterface err = %v, want one wrapping ErrDriverNotRebound", err)
+	}
+	if !s.saw(ioctlIoctl, ioctlConnect, 1) {
+		t.Error("the verdict was reached without ever asking the kernel to reattach")
+	}
+	if !strings.Contains(err.Error(), "replug") {
+		t.Errorf("error %q does not tell the user to replug, which is the only remedy", err)
+	}
+}
+
+// The control that keeps the check from being a permanent complaint: a kernel
+// that does rebind must produce no error at all. It also proves the check reads
+// sysfs *after* the reattach, since the driver is unbound for the whole span
+// between the claim and the connect.
+func TestReleaseInterfaceAcceptsADriverThatRebound(t *testing.T) {
+	var sys string
+	s := &scriptedIoctl{}
+	s.respond = unbindingKernel(t, &sys, true)
+	d := s.deviceWithSysfs(t, map[int]bool{1: true})
+	sys = d.ref.SysPath
+
+	if err := d.ClaimInterface(1, true); err != nil {
+		t.Fatalf("ClaimInterface: %v", err)
+	}
+	if err := d.ReleaseInterface(1); err != nil {
+		t.Fatalf("ReleaseInterface = %v, want nil: the driver is bound again", err)
+	}
+}
+
+// The false alarm this must not raise. The bootloader claims a vendor-class
+// interface that no driver was ever bound to, with detach requested all the
+// same, and it is expected to stay unbound after the release -- so the firmware
+// path must come through silent. Nothing distinguishes this from the case above
+// except what sysfs said before the claim, which is why that is read then.
+func TestReleaseInterfaceSaysNothingAboutAnInterfaceThatNeverHadADriver(t *testing.T) {
+	var sys string
+	s := &scriptedIoctl{}
+	s.respond = unbindingKernel(t, &sys, false)
+	d := s.deviceWithSysfs(t, map[int]bool{2: false})
+	sys = d.ref.SysPath
+
+	if err := d.ClaimInterface(2, true); err != nil {
+		t.Fatalf("ClaimInterface: %v", err)
+	}
+	if err := d.ReleaseInterface(2); err != nil {
+		t.Fatalf("ReleaseInterface = %v, want nil: this interface never had a driver to lose", err)
+	}
+	if !s.saw(ioctlIoctl, ioctlConnect, 2) {
+		t.Error("the reattach was skipped; the check may gate the ioctl rather than its verdict")
+	}
+}
+
+// The pre-3.4 fallback detaches and claims in two steps, and has to carry the
+// same knowledge through to the release -- otherwise the finding would go
+// unreported on exactly the kernels least likely to rebind cleanly.
+func TestReleaseInterfaceReportsAnUnreboundDriverAfterTheFallbackClaim(t *testing.T) {
+	var sys string
+	s := &scriptedIoctl{}
+	kernel := unbindingKernel(t, &sys, false)
+	s.respond = func(c ioctlCall) error {
+		if c.req == ioctlDisconnectClaim {
+			return unix.ENOTTY // a kernel older than 3.4: forces the fallback
+		}
+		return kernel(c)
+	}
+	d := s.deviceWithSysfs(t, map[int]bool{1: true})
+	sys = d.ref.SysPath
+
+	if err := d.ClaimInterface(1, true); err != nil {
+		t.Fatalf("ClaimInterface: %v", err)
+	}
+	if !s.saw(ioctlIoctl, ioctlDisconnect, 1) {
+		t.Fatal("the fallback was not taken, so this proves nothing about it")
+	}
+	if err := d.ReleaseInterface(1); !errors.Is(err, ErrDriverNotRebound) {
+		t.Fatalf("ReleaseInterface err = %v, want one wrapping ErrDriverNotRebound", err)
+	}
+}
+
+// Not being able to tell is not a failure. A Device built from a hand-made
+// DeviceRef has no SysPath, and a device that has left the bus takes its sysfs
+// directory with it; neither is a driver that refused to bind, and reporting
+// either as one would put a replug instruction in front of users whose MIDI port
+// is fine.
+func TestReleaseInterfaceStaysSilentWhenSysfsCannotAnswer(t *testing.T) {
+	tests := []struct {
+		name    string
+		sysPath func(t *testing.T, d *Device)
+	}{
+		{
+			name:    "no sysfs path at all",
+			sysPath: func(*testing.T, *Device) {},
+		},
+		{
+			name: "the device left the bus",
+			sysPath: func(t *testing.T, d *Device) {
+				// A device directory with no interface directory under it: the
+				// glob matches nothing, which is a different answer from
+				// matching a directory that holds no driver symlink.
+				root := t.TempDir()
+				d.ref.SysPath = filepath.Join(root, "1-1")
+				mkdirFixture(t, d.ref.SysPath)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &scriptedIoctl{respond: func(ioctlCall) error { return nil }}
+			d := s.device()
+			tc.sysPath(t, d)
+			// hadDriver set by hand: even told that a driver was there, an
+			// unanswerable sysfs must not become a verdict.
+			d.claimed[1] = claimState{detached: true, hadDriver: true}
+
+			if err := d.ReleaseInterface(1); err != nil {
+				t.Fatalf("ReleaseInterface = %v, want nil when the binding state cannot be read", err)
+			}
+			if !s.saw(ioctlIoctl, ioctlConnect, 1) {
+				t.Error("the reattach itself was skipped")
+			}
+		})
+	}
+}
+
+// The interface directory is found by globbing, because the configuration
+// number in its name is whatever the device has selected and is not always
+// readable. A device sitting in configuration 2 must be read as accurately as
+// one in configuration 1.
+func TestInterfaceDriverBoundGlobsTheConfigurationNumber(t *testing.T) {
+	root := t.TempDir()
+	sys := filepath.Join(root, "1-1")
+	mkdirFixture(t, filepath.Join(root, "snd-usb-audio"))
+	mkdirFixture(t, sys)
+	// Configuration 2, interface 1, driver bound.
+	dir := fmt.Sprintf("%s:2.1", sys)
+	mkdirFixture(t, dir)
+	if err := os.Symlink(filepath.Join(root, "snd-usb-audio"), filepath.Join(dir, "driver")); err != nil {
+		t.Fatal(err)
+	}
+	// Interface 10 of the same configuration, unbound: it must not be mistaken
+	// for interface 1 by a glob that matched loosely.
+	mkdirFixture(t, fmt.Sprintf("%s:2.10", sys))
+
+	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007", SysPath: sys}, claimed: map[int]claimState{}}
+	if bound, known := d.interfaceDriverBound(1); !known || !bound {
+		t.Errorf("interfaceDriverBound(1) = %v, %v; want bound and known", bound, known)
+	}
+	if bound, known := d.interfaceDriverBound(10); !known || bound {
+		t.Errorf("interfaceDriverBound(10) = %v, %v; want unbound and known", bound, known)
+	}
+	if bound, known := d.interfaceDriverBound(3); known || bound {
+		t.Errorf("interfaceDriverBound(3) = %v, %v; want cannot-tell for an interface with no directory", bound, known)
 	}
 }

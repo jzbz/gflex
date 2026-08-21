@@ -295,7 +295,26 @@ Why this is the right default here:
 Caveats to design for:
 
 - rawmidi is opened **exclusively per direction**. Handle `EBUSY` with a message naming the likely
-  culprit (PipeWire, JACK, a DAW) and pointing at `--transport usb`.
+  culprits (PipeWire, JACK, a DAW) and pointing at `--transport usb` — with the caveat in §4.2 that
+  that transport can cost the ALSA node until a replug, so closing the other client is the better
+  first answer.
+- **A browser is one of those culprits, and the likeliest one for this device.** The vendor ships a
+  functionally identical web build at `https://vflex.app` (§1) that drives the unit over Web MIDI in
+  Chrome, so anyone comparing this tool against the vendor's own has both open at once. Chrome
+  reaches the device through `snd_seq_midi`, which opens the rawmidi node on behalf of an ALSA
+  *sequencer* client — the node's opener is the kernel module, not the browser process, so the
+  holder shows up in `/proc/asound/seq/clients` rather than as a process holding the
+  `/dev/snd/midiC*D*` node. Observed on 2026-08-21, with `gflex info` failing `EBUSY`:
+
+  ```
+  Client  24 : "Werewolf VFLEX" [Kernel Legacy]
+    Port   0 : "Werewolf VFLEX MIDI 1" (RWeX) [In/Out]
+      Connecting To: 128:0        <- Chrome (input)
+      Connected From: 129:1       <- Chrome (output)
+  ```
+
+  Both directions were taken, which is why no open succeeded. An `EBUSY` message that names only
+  DAWs and sound servers sends the user hunting for software they do not have.
 - Use `O_NONBLOCK` + poll/epoll via `golang.org/x/sys/unix`, or a dedicated blocking reader
   goroutine — either is fine for a CLI.
 
@@ -341,6 +360,35 @@ the race where udev re-binds in between; the older `USBDEVFS_DISCONNECT` + `CLAI
 the fallback on kernels that lack it. **While detached the ALSA card and its `/dev/snd/midiC*D*`
 node disappear**, so any DAW or PipeWire client loses the port. Always reattach on exit —
 `USBDEVFS_CONNECT` is what rebinds the driver, and closing the fd does not do it for you.
+
+> **⚠ Reattaching does not bring the MIDI node back, and the ioctl does not report that.** Measured
+> on 2026-08-21 on one host and one kernel: after a single `gflex --transport usb info`,
+> `/dev/snd/midiC2D*` disappeared and never returned; sysfs showed interface `1.1` (MIDIStreaming)
+> with **no driver bound** while `1.0` stayed bound to `snd-usb-audio`. Only a physical replug
+> restored it. The ioctl is not the problem: a standalone probe issued `USBDEVFS_CONNECT` on that
+> interface and it returned **success** while the interface stayed unbound. `USBDEVFS_CONNECT` means
+> "the re-probe request was accepted", not "a driver bound", so its return value cannot be used to
+> confirm recovery. `snd-usb-audio` appears to bind the MIDI interface only while probing the whole
+> audio function, so re-probing `1.1` alone, with `1.0` still bound, does not always recreate the
+> card's rawmidi node.
+>
+> **The outcome is not deterministic, which is the part that matters.** A later run on the same host
+> and the same unit did rebind: `1.1` came back bound to `snd-usb-audio` -- but as an *additional*
+> rawmidi device, `/dev/snd/midiC2D1`, alongside the original `midiC2D0`, both live and both
+> addressing the same unit. So a release ends one of three ways: the node returns as it was, the
+> node returns under a new number and leaves a stale-looking sibling, or no node returns at all. The
+> middle case is why `gflex info` can suddenly refuse with "several candidate MIDI ports look like a
+> VFLEX" for a single physical device -- that ambiguity is manufactured by this tool's own detach,
+> not by the hardware. What decides which outcome occurs was not established.
+>
+> One host, one kernel, one unit -- the mechanism above is inferred from those observations and
+> should not be generalised to other kernels. The consequence for the CLI is concrete under all
+> three outcomes: `--transport usb` can leave the user's ALSA MIDI port gone until they replug, or
+> leave two nodes where there was one, which is why it is the second answer to an `EBUSY` (§4.1) and
+> not the first, and why using it deserves a warning rather than silence. The
+> implementation verifies rather than trusts: after the reattach it reads the interface's `driver`
+> link from sysfs and reports `usbfs.ErrDriverNotRebound` when nothing is bound, because the
+> ioctl's own success return cannot carry that answer.
 
 ### 4.3 Go MIDI libraries — recommendation: use none
 
@@ -1102,7 +1150,8 @@ and `gflex install-udev` writes it to `/etc/udev/rules.d/70-gflex.rules`, which 
 location for a manual install; a distro package should ship the same file under
 `/usr/lib/udev/rules.d/` instead, so that a local edit still wins. No release tooling
 (goreleaser/nfpm, deb/rpm/apk) exists yet — `go build` is the only supported route today. The
-PipeWire/JACK `EBUSY` → `--transport usb` escape route is documented in the README.
+`EBUSY` → `--transport usb` escape route is documented in the README, along with its cost (§4.2) and
+with the browser-holds-the-node case (§4.1) that a PipeWire/JACK-only message would misdiagnose.
 
 ---
 
@@ -1185,7 +1234,7 @@ excursion. The originals are kept below for provenance; nothing has been deleted
 | 11 | ADC calibration | Offset and scale both read **0** on a factory unit, and `CMD_VMEASURE` still returns a sensible calibrated value (raw 437 counts → 5270 mV). Confirms the inference that firmware treats 0 as "use built-in calibration". The formula itself is still device-side and unknown. |
 | 13 | Does the device echo the flag bits? | **No — it clears them.** `tx 04 92 13 88` (write flag set) → `rx 04 12 13 88`. Masking the received command byte with `CmdCodeMask` is required, not merely defensive. |
 | 14 | Unsolicited frames? | **None.** Twelve seconds idle on a connected unit produced nothing. The device speaks only when spoken to. Repeated on a second unit (`58b4f621`, §14.15): twelve seconds idle, zero frames. |
-| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe — and this is now corroborated on a second unit.** Failure rates over plain `gflex info` (6 commands each — the count `internal/session/info_test.go` pins; 7 would be `info --all`, which adds the chip UUID); every failure was a response timeout. *Unit 1* (`81a0bcc3`): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**; `info` end to end 0.38 s at 20 ms, 0.04 s at 1 ms; writes at 1 ms 0/30 failed, 0/30 wrong read-back. *Unit 2* (`58b4f621`, obtained 2026-08-21; same firmware `APP.05.00.00`, same mfg date `004apr26`, same host, rawmidi): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 4/120 (3.3%)**; `info` 0.391 s at 20 ms, 0.045 s at 1 ms, 0.043 s at 100 µs, 0.202 s at 1 ns. Writes were **not** re-tested on unit 2 — that needs permission to write to someone's device — so the write figures above are unit 1 only. **The default moved from 20 ms to 1 ms** (§3.1, §11, §17): 240 `info` runs across the two units with no failure, and going lower buys nothing measurable — 100 µs came in 0.002 s ahead of 1 ms, inside the noise, because the wall time is already the device's turnaround. 1 ns is where both units lose frames, which is why `--byte-delay 0` stays refused. Two units from one apparent batch on one host is what this question asked for and is materially stronger than n=1; it is still not evidence about another firmware revision or another USB controller. |
+| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe — and this is now corroborated on a second unit.** Failure rates over plain `gflex info` (6 commands each — the count `internal/session/info_test.go` pins; 7 would be `info --all`, which adds the chip UUID); every failure was a response timeout. *Unit 1* (`81a0bcc3`): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**; `info` end to end 0.38 s at 20 ms, 0.04 s at 1 ms; writes at 1 ms 0/30 failed, 0/30 wrong read-back. *Unit 2* (`58b4f621`, obtained 2026-08-21; same firmware `APP.05.00.00`, same mfg date `004apr26`, same host, rawmidi): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 4/120 (3.3%)**; `info` 0.391 s at 20 ms, 0.045 s at 1 ms, 0.043 s at 100 µs, 0.202 s at 1 ns. Writes at 1 ms on unit 2: **0/30 failed, 0/30 wrong read-back**, 0.077 s per write plus read-back. That instrument was `CMD_CURRENT_LIMIT_MA` **alternating 4900/5000 mA**, each read-back checked against the value just written, with the limit restored to 5000 mA afterwards and the restore verified independently. The alternation is not incidental: a no-op write that is dropped in transit reads back as the value the device already held, so a fixed-value write test scores a success in exactly the case where the write failed. Unit 2's write figure is therefore slightly stronger evidence than unit 1's, not merely a match for it. **The default moved from 20 ms to 1 ms** (§3.1, §11, §17): 240 `info` runs across the two units with no failure, and going lower buys nothing measurable — 100 µs came in 0.002 s ahead of 1 ms, inside the noise, because the wall time is already the device's turnaround. 1 ns is where both units lose frames, which is why `--byte-delay 0` stays refused. Two units from one apparent batch on one host is what this question asked for and is materially stronger than n=1; it is still not evidence about another firmware revision or another USB controller. |
 | — | `SelectedPDOID` semantics (§8) | **1-based USB-PD object position.** A unit targeting 5 V against a charger whose PDO 0 is the 5 V fixed supply reported `selected pdo: 1`. |
 
 ### Corrections this produced

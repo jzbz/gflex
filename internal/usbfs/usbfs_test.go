@@ -166,7 +166,7 @@ func TestOpenRejectsEmptyPath(t *testing.T) {
 }
 
 func TestTransferRejectsOversizedBuffer(t *testing.T) {
-	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]bool{}}
+	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]claimState{}}
 	if _, err := d.Transfer(context.Background(), 0x81, make([]byte, MaxBulkTransferSize+1), time.Second); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("err = %v, want ErrTooLarge", err)
 	}

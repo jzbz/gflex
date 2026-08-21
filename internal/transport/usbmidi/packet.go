@@ -4,8 +4,9 @@
 // This is the escape route for the two cases the default ALSA rawmidi transport
 // cannot serve (SPEC.md §4.1, §4.2):
 //
-//   - rawmidi is opened exclusively per direction, so PipeWire, JACK or a DAW
-//     holding the substream makes it fail with EBUSY;
+//   - rawmidi is opened exclusively per direction, so a Chrome tab using Web
+//     MIDI (the vendor ships one), PipeWire, JACK or a DAW holding the
+//     substream makes it fail with EBUSY;
 //   - a caller wants exclusive, deterministically paced access to the device.
 //
 // The cost is real: claiming the interface detaches snd-usb-audio, and while it

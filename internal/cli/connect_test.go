@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/session"
 	"github.com/jzbz/gflex/internal/transport/rawmidi"
 	"github.com/jzbz/gflex/internal/usbfs"
 )
@@ -240,5 +242,56 @@ func TestSleepCtxPositiveDurationHonoursCancellation(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("sleepCtx slept %v on a cancelled context", elapsed)
+	}
+}
+
+// closeErrTransport is a transport whose only interesting behaviour is the
+// error it returns from Close.
+type closeErrTransport struct{ err error }
+
+func (closeErrTransport) WriteMIDI([]byte) error         { return nil }
+func (closeErrTransport) ReadMIDI(p []byte) (int, error) { return 0, nil }
+func (closeErrTransport) Name() string                   { return "test" }
+func (t closeErrTransport) Close() error                 { return t.err }
+
+// The rebind diagnostic has to reach stderr from Close itself, because every
+// command closes with `defer c.Close()` and discards the error -- so a fix that
+// only returns it is a fix nobody ever sees. This is the test that would fail if
+// the reporting in conn.Close were deleted while the sentinel kept propagating.
+func TestConnCloseReportsAnUnreboundDriver(t *testing.T) {
+	var buf bytes.Buffer
+	tr := closeErrTransport{err: fmt.Errorf("releasing interface 1: %w", usbfs.ErrDriverNotRebound)}
+	c := &conn{
+		Session: session.New(tr, session.Options{}),
+		Desc:    "test",
+		stderr:  &buf,
+	}
+	if err := c.Close(); !errors.Is(err, usbfs.ErrDriverNotRebound) {
+		t.Fatalf("Close() = %v, want it to wrap usbfs.ErrDriverNotRebound", err)
+	}
+	got := buf.String()
+	if got == "" {
+		t.Fatal("Close() reported nothing; a discarded error is a diagnostic the user never sees")
+	}
+	for _, want := range []string{"warning", "unplug", "--transport usb"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the warning does not mention %q:\n%s", want, got)
+		}
+	}
+}
+
+// An ordinary close error must stay silent: a close failure is not a command
+// failure, and a warning printed on every unremarkable close is one nobody
+// reads by the time it matters.
+func TestConnCloseIsSilentForOrdinaryErrors(t *testing.T) {
+	var buf bytes.Buffer
+	c := &conn{
+		Session: session.New(closeErrTransport{err: errors.New("some other close failure")}, session.Options{}),
+		Desc:    "test",
+		stderr:  &buf,
+	}
+	_ = c.Close()
+	if got := buf.String(); got != "" {
+		t.Errorf("expected silence for an ordinary close error, got:\n%s", got)
 	}
 }

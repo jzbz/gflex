@@ -28,7 +28,8 @@ const (
 	// ExitNoDevice indicates no VFLEX could be found on the selected transport.
 	ExitNoDevice = 3
 	// ExitBusy indicates the device node exists but is held by another process.
-	// ALSA rawmidi is opened exclusively per direction, so PipeWire, JACK or a
+	// ALSA rawmidi is opened exclusively per direction, so a Chrome tab using Web
+	// MIDI -- the vendor ships one (SPEC.md §1) -- or PipeWire, JACK or a
 	// DAW holding the port produces this (SPEC.md §4.1).
 	ExitBusy = 4
 	// ExitTimeout indicates the device did not answer within the response
@@ -225,8 +226,11 @@ func isCommandLineError(err error) bool {
 func exitHint(code int) string {
 	switch code {
 	case ExitBusy:
-		return "the ALSA rawmidi node is opened exclusively per direction; PipeWire, JACK or a DAW\n" +
-			"may be holding it. Try: gflex --transport usb <command>"
+		return "the ALSA rawmidi node is opened exclusively per direction; a Chrome tab using\n" +
+			"Web MIDI (the vendor's own web app is one), PipeWire, JACK or a DAW may be holding\n" +
+			"it. Check with: cat /proc/asound/seq/clients\n" +
+			"Closing that client is the better fix; --transport usb is the fallback, and on at\n" +
+			"least one kernel it costs the ALSA MIDI port until the device is replugged (§4.2)."
 	case ExitPermission:
 		return "no permission to open the device node. Try: sudo gflex install-udev\n" +
 			"then unplug and replug the VFLEX."

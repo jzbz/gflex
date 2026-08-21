@@ -37,10 +37,22 @@ func classifyOpenError(path string, err error) error {
 	switch {
 	case errors.Is(err, unix.EBUSY):
 		// rawmidi substreams are opened exclusively per direction, and we open
-		// O_RDWR, so either direction being taken yields EBUSY. On a desktop
-		// the holder is almost always the session sound server.
-		return fmt.Errorf("%w: %s is already open. ALSA rawmidi allows one client per direction, "+
-			"so another MIDI client is holding it (PipeWire/WirePlumber, JACK, or a DAW). "+
+		// O_RDWR, so either direction being taken yields EBUSY. Chrome heads the
+		// holder list because the vendor ships a functionally identical web build
+		// at vflex.app (SPEC.md §1) driven over Web MIDI, and comparing gflex
+		// against that build is the likeliest reason for two clients to want the
+		// port at once. On 2026-08-21 it was the actual holder on a second unit:
+		// /proc/asound/seq/clients showed the VFLEX port connected to and from a
+		// sequencer client named "Chrome", the kernel's snd_seq_midi having taken
+		// the rawmidi node on its behalf. Naming only sound servers and DAWs sent
+		// that user hunting software they were not running. The old "is already
+		// open" clause makes room for the check: "another client already holds
+		// it" says the same thing one sentence later.
+		return fmt.Errorf("%w: %s. ALSA rawmidi allows one client per direction, so another MIDI "+
+			"client already holds it -- a Chrome tab using Web MIDI (the vendor's web app at "+
+			"vflex.app is one), PipeWire/WirePlumber, JACK, or a DAW. "+
+			"/proc/asound/seq/clients lists what is connected to the port, and a Chrome tab "+
+			"shows up there as a client named \"Chrome\". "+
 			"Stop or disconnect that client, or retry with --transport usb: %w", ErrBusy, path, err)
 
 	case errors.Is(err, fs.ErrPermission):

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -15,6 +16,30 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// ErrDriverNotRebound reports that a kernel driver this process detached is
+// still not bound to the interface after USBDEVFS_CONNECT returned success.
+//
+// The two are not the same thing, and that is the whole point of this sentinel.
+// USBDEVFS_CONNECT means "the re-probe request was accepted" -- the kernel calls
+// device_attach() on the interface and reports whether the *call* worked, not
+// whether any driver claimed it. A driver that declines, or that cannot bind an
+// interface in isolation, leaves the interface unbound behind a successful
+// ioctl.
+//
+// That is exactly what a VFLEX does. Driving a second unit (serial 58b4f621) on
+// 2026-08-21, `gflex --transport usb info` left /dev/snd/midiC2D* gone and it
+// never came back: sysfs showed interface 1.1 (MIDIStreaming) with no driver
+// bound while 1.0 stayed bound to snd-usb-audio, and a standalone probe issued
+// USBDEVFS_CONNECT on 1.1 and got success while the interface stayed unbound.
+// snd-usb-audio appears to bind the MIDI interface only while probing the whole
+// audio function, so re-probing 1.1 alone does not recreate the card's rawmidi
+// node. Only a physical replug restored it.
+//
+// Nothing in this package can undo that, so an error carrying this sentinel is a
+// report rather than a failure to retry: the remedy to offer the user is to
+// replug the device.
+var ErrDriverNotRebound = errors.New("usbfs: the detached kernel driver did not rebind; replug the device")
 
 // Transfer sizing and timing limits.
 const (
@@ -39,6 +64,18 @@ const (
 	// maxDescriptorBytes bounds the descriptor read. Real blobs are a few
 	// hundred bytes; this only stops a runaway loop.
 	maxDescriptorBytes = 64 * 1024
+
+	// driverRebindSettle bounds how long attachDriver keeps looking for a driver
+	// on an interface it has just asked the kernel to re-probe, and
+	// driverRebindPoll is how often it looks. USB drivers are probed
+	// synchronously from device_attach(), so on the kernel ErrDriverNotRebound
+	// was observed on the answer is already final when the ioctl returns; the
+	// wait is insurance against a kernel that probes asynchronously, where
+	// reading the gap between the ioctl and the bind as a failure would tell a
+	// user to replug a device that was about to come back on its own. It is only
+	// ever paid on the path that is about to report a problem.
+	driverRebindSettle = 50 * time.Millisecond
+	driverRebindPoll   = 10 * time.Millisecond
 )
 
 // Device is an open usbfs handle.
@@ -59,11 +96,30 @@ type Device struct {
 	ioctlFn func(op string, req uintptr, arg unsafe.Pointer, retryEINTR bool) (int, error)
 
 	mu sync.Mutex
-	// claimed maps an interface number to whether this process detached a
-	// kernel driver in order to claim it, which is what tells ReleaseInterface
-	// whether it owes the system a reattach.
-	claimed map[int]bool
+	// claimed maps an interface number to what claiming it took away, which is
+	// what tells ReleaseInterface what it owes the system back.
+	claimed map[int]claimState
 	cfg     *Config
+}
+
+// claimState is what one claimed interface owes when it is released.
+type claimState struct {
+	// detached records that the claim asked the kernel to unbind whatever driver
+	// held the interface, which is what makes the release owe a USBDEVFS_CONNECT.
+	detached bool
+	// hadDriver records that sysfs showed a driver actually bound to the
+	// interface immediately before the claim.
+	//
+	// It is deliberately not the same fact as detached. A claim with detach
+	// requested succeeds whether or not anything was bound -- the bootloader's
+	// vendor-class interface has no driver at all and is claimed the same way --
+	// and once the claim has happened there is no way to tell the two apart. Yet
+	// that difference is precisely what decides whether an interface left
+	// unbound after the reattach is a regression worth reporting
+	// (ErrDriverNotRebound, snd-usb-audio in application mode) or the expected
+	// resting state that reporting would turn into a false alarm on the firmware
+	// path. So it is read before anything is detached, and carried here.
+	hadDriver bool
 }
 
 // Open opens the usbfs node named by ref.
@@ -78,7 +134,7 @@ func Open(ref DeviceRef) (*Device, error) {
 	if err != nil {
 		return nil, wrapErrno("open", ref.Path, err)
 	}
-	return &Device{f: f, ref: ref, claimed: make(map[int]bool)}, nil
+	return &Device{f: f, ref: ref, claimed: make(map[int]claimState)}, nil
 }
 
 // String renders the device for diagnostics.
@@ -213,9 +269,15 @@ func (d *Device) readRawDescriptors() ([]byte, error) {
 // Detaching has a visible cost on a VFLEX in application mode: while
 // snd-usb-audio is detached the ALSA card and its /dev/snd/midiC*D* node
 // disappear, so any DAW or PipeWire client loses the port. Always Close (or
-// ReleaseInterface) so the driver is put back.
+// ReleaseInterface) so the driver is put back -- and note that on the kernel
+// ErrDriverNotRebound records, putting it back does not always work: the port
+// then stays missing until the device is replugged, and the release says so.
 func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
 	if detachKernelDriver {
+		// Read before anything is detached: afterwards "we unbound it" and
+		// "nothing was ever bound" look identical, and only the first makes an
+		// interface still unbound after the reattach a problem. See claimState.
+		hadDriver, _ := d.interfaceDriverBound(num)
 		// EXCEPT_DRIVER with "usbfs" means "detach whatever driver is bound
 		// unless it is usbfs itself". That is the right filter when the bound
 		// driver's name is not known ahead of time -- which is the case here,
@@ -223,7 +285,7 @@ func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
 		// nothing at all in bootloader mode.
 		err := d.claimDetaching(num, disconnectClaimExceptDriver, "usbfs")
 		if err == nil {
-			d.markClaimed(num, true)
+			d.markClaimed(num, claimState{detached: true, hadDriver: hadDriver})
 			return nil
 		}
 		// Only an unimplemented ioctl justifies the racy fallback. usbfs
@@ -234,12 +296,12 @@ func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
 		if !errors.Is(err, ErrNotSupported) {
 			return err
 		}
-		return d.detachThenClaim(num)
+		return d.detachThenClaim(num, hadDriver)
 	}
 	if err := d.claim(num); err != nil {
 		return err
 	}
-	d.markClaimed(num, false)
+	d.markClaimed(num, claimState{})
 	return nil
 }
 
@@ -257,7 +319,7 @@ func (d *Device) ClaimInterface(num int, detachKernelDriver bool) error {
 // user's ALSA MIDI port would stay missing until the device was replugged.
 // The reattach therefore happens here, immediately, rather than being left to a
 // cleanup path that has no way to know it is owed.
-func (d *Device) detachThenClaim(num int) error {
+func (d *Device) detachThenClaim(num int, hadDriver bool) error {
 	if err := d.detachDriver(num); err != nil {
 		return err
 	}
@@ -267,15 +329,15 @@ func (d *Device) detachThenClaim(num int) error {
 		// the claim failure rather than replacing it -- the claim failure is
 		// what the caller asked about, the rebind failure is what the user has
 		// to act on.
-		if aerr := d.attachDriver(num); aerr != nil && !errors.Is(aerr, ErrNoDevice) {
+		if aerr := d.attachDriver(num, hadDriver); aerr != nil && !errors.Is(aerr, ErrNoDevice) {
 			return errors.Join(err, fmt.Errorf(
 				"usbfs: interface %d could not be claimed and the kernel driver detached to claim it "+
-					"could not be reattached (the ALSA MIDI port will stay missing until the device "+
+					"is not bound again (the ALSA MIDI port will stay missing until the device "+
 					"is replugged): %w", num, aerr))
 		}
 		return err
 	}
-	d.markClaimed(num, true)
+	d.markClaimed(num, claimState{detached: true, hadDriver: hadDriver})
 	return nil
 }
 
@@ -288,6 +350,13 @@ func (d *Device) detachThenClaim(num int) error {
 // default rawmidi transport stops working and the failure looks like broken
 // hardware. Closing the fd does not rebind it; only USBDEVFS_CONNECT does.
 //
+// It is also not enough. USBDEVFS_CONNECT can return success and leave the
+// interface with no driver on it, which is what a VFLEX was observed doing
+// (ErrDriverNotRebound), so the result is checked against sysfs rather than
+// assumed and the returned error tells the user to replug. That check runs only
+// where a driver was seen bound before the claim, so the bootloader's
+// vendor-class interface -- which has no driver to lose -- cannot trip it.
+//
 // The reattach is therefore attempted whatever USBDEVFS_RELEASEINTERFACE
 // answered, and the bookkeeping entry is dropped only afterwards. A release
 // failing for any reason outside the ErrNoDevice set says nothing about whether
@@ -296,7 +365,7 @@ func (d *Device) detachThenClaim(num int) error {
 // entry is gone by then.
 func (d *Device) ReleaseInterface(num int) error {
 	d.mu.Lock()
-	detached := d.claimed[num]
+	st := d.claimed[num]
 	d.mu.Unlock()
 
 	n := uint32(num)
@@ -311,13 +380,19 @@ func (d *Device) ReleaseInterface(num int) error {
 	}
 
 	var attachErr error
-	if detached && !gone {
+	if st.detached && !gone {
 		// ENODATA (no driver wanted the interface) is already swallowed by
 		// attachDriver; ErrNoDevice here means the device vanished between the
 		// two ioctls, which again leaves nothing to rebind.
-		if err := d.attachDriver(num); err != nil && !errors.Is(err, ErrNoDevice) {
-			attachErr = fmt.Errorf("usbfs: the kernel driver detached to claim interface %d could not be "+
-				"reattached (the ALSA MIDI port will stay missing until the device is replugged): %w", num, err)
+		//
+		// "is not bound again" rather than "could not be reattached" because
+		// this now covers two different things: an ioctl that failed, and an
+		// ioctl that succeeded while leaving the interface driverless
+		// (ErrDriverNotRebound). The user's next move is the same either way,
+		// and the wrapped error says which happened.
+		if err := d.attachDriver(num, st.hadDriver); err != nil && !errors.Is(err, ErrNoDevice) {
+			attachErr = fmt.Errorf("usbfs: the kernel driver detached to claim interface %d is not bound "+
+				"again (the ALSA MIDI port will stay missing until the device is replugged): %w", num, err)
 		}
 	}
 
@@ -428,9 +503,9 @@ func (d *Device) Transfer(ctx context.Context, endpoint uint8, data []byte, time
 // internals
 // ---------------------------------------------------------------------------
 
-func (d *Device) markClaimed(num int, detached bool) {
+func (d *Device) markClaimed(num int, st claimState) {
 	d.mu.Lock()
-	d.claimed[num] = detached
+	d.claimed[num] = st
 	d.mu.Unlock()
 }
 
@@ -467,15 +542,83 @@ func (d *Device) detachDriver(num int) error {
 	return err
 }
 
-// attachDriver asks the kernel to rebind the in-tree driver for the interface.
-func (d *Device) attachDriver(num int) error {
+// attachDriver asks the kernel to rebind the in-tree driver for the interface
+// and, when verify is set, checks that one actually did.
+//
+// The ioctl's own answer is not the answer the user cares about: USBDEVFS_CONNECT
+// reports that the re-probe was accepted, not that a driver bound, and on a
+// VFLEX those come apart (ErrDriverNotRebound). sysfs is the only place that
+// says which happened, so it is read afterwards and an interface still sitting
+// there driverless is reported rather than passed off as success.
+//
+// verify must be true only where a driver was seen bound before this process
+// detached it. An interface that never had one -- the bootloader's vendor-class
+// interface -- is expected to stay unbound, and reporting that would be a false
+// alarm on the firmware path.
+func (d *Device) attachDriver(num int, verify bool) error {
 	err := d.interfaceIoctl(num, ioctlConnect, fmt.Sprintf("reattach kernel driver to interface %d", num))
 	// ENODATA here means no driver wanted the interface -- nothing to rebind,
 	// which is not a failure.
 	if err != nil && errors.Is(err, unix.ENODATA) {
-		return nil
+		err = nil
 	}
-	return err
+	if err != nil || !verify {
+		return err
+	}
+	if bound, known := d.driverRebound(num); known && !bound {
+		return fmt.Errorf("%w: the kernel accepted the re-probe of interface %d on %s, but sysfs shows "+
+			"no driver bound to it", ErrDriverNotRebound, num, d.ref.Path)
+	}
+	return nil
+}
+
+// driverRebound is interfaceDriverBound with a short settle window, for use
+// right after a re-probe was requested. See driverRebindSettle for why the wait
+// exists; an interface that is already bound, or a binding state that cannot be
+// determined at all, returns at once and waits for nothing.
+func (d *Device) driverRebound(num int) (bound, known bool) {
+	deadline := time.Now().Add(driverRebindSettle)
+	for {
+		bound, known = d.interfaceDriverBound(num)
+		if bound || !known || !time.Now().Before(deadline) {
+			return bound, known
+		}
+		time.Sleep(driverRebindPoll)
+	}
+}
+
+// interfaceDriverBound reports whether a kernel driver is bound to interface num
+// right now, and whether that could be determined at all.
+//
+// An interface's sysfs directory is the device's own directory suffixed with
+// ":<bConfigurationValue>.<interface>" -- /sys/bus/usb/devices/5-1.4.4:1.1 for
+// interface 1 of a VFLEX in configuration 1 -- and a bound interface has a
+// "driver" symlink inside it while an unbound one has none. The configuration
+// number is whatever the device currently has selected and is not always
+// readable (see Configuration), so the directory is globbed rather than assumed
+// to be 1. Any match answers: sysfs only exposes interfaces of the active
+// configuration, so at most one configuration's directories are present.
+//
+// "Cannot tell" is a distinct answer from "no driver" and every caller must
+// treat it as such. A Device opened from a hand-built DeviceRef carries no
+// SysPath at all, and a device unplugged mid-call takes its sysfs directory with
+// it; neither is a driver that failed to bind.
+func (d *Device) interfaceDriverBound(num int) (bound, known bool) {
+	if d.ref.SysPath == "" {
+		return false, false
+	}
+	dirs, err := filepath.Glob(fmt.Sprintf("%s:*.%d", d.ref.SysPath, num))
+	if err != nil || len(dirs) == 0 {
+		return false, false
+	}
+	for _, dir := range dirs {
+		// Lstat, not Stat: the question is whether the symlink is there, not
+		// whether whatever it points at can be reached.
+		if _, err := os.Lstat(filepath.Join(dir, "driver")); err == nil {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // interfaceIoctl runs USBDEVFS_IOCTL, the wrapper that targets one interface

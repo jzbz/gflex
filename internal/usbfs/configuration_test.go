@@ -196,7 +196,7 @@ func sysfsDevice(t *testing.T, attr string) *Device {
 			t.Fatal(err)
 		}
 	}
-	return &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007", SysPath: dir}, claimed: map[int]bool{}}
+	return &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007", SysPath: dir}, claimed: map[int]claimState{}}
 }
 
 func TestSysfsConfiguration(t *testing.T) {
@@ -225,7 +225,7 @@ func TestSysfsConfiguration(t *testing.T) {
 		})
 	}
 	// No sysfs path at all: the GET_CONFIGURATION fallback's reason for existing.
-	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]bool{}}
+	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]claimState{}}
 	if _, ok := d.sysfsConfiguration(); ok {
 		t.Error("a DeviceRef with no SysPath reported a configuration")
 	}
@@ -258,7 +258,7 @@ func TestConfigurationUnknownIsDistinct(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]bool{}, f: f}
+	d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]claimState{}, f: f}
 	_, err = d.Configuration(context.Background())
 	if !errors.Is(err, ErrConfigUnknown) {
 		t.Fatalf("Configuration err = %v, want ErrConfigUnknown", err)

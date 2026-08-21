@@ -213,7 +213,16 @@ func Open(ref usbfs.DeviceRef) (proto.Transport, error) {
 // the claim atomically (USBDEVFS_DISCONNECT_CLAIM), closing the race where udev
 // rebinds the driver in between. While the interface is claimed the ALSA card
 // and its /dev/snd/midiC*D* node are gone from the rest of the system, so any
-// PipeWire or DAW client loses the port until Close (SPEC.md §4.2).
+// PipeWire or DAW client loses the port (SPEC.md §4.2).
+//
+// It may not come back at Close, and on the one kernel this has been watched on
+// it did not: snd-usb-audio binds the MIDIStreaming interface only as part of
+// probing the whole audio function, so re-probing that interface alone leaves it
+// driverless and the rawmidi node gone until the device is replugged
+// (usbfs.ErrDriverNotRebound, observed 2026-08-21 on serial 58b4f621). Close
+// detects that and says so; nothing here can prevent it. This transport is the
+// opt-in --transport usb path, not the default, which is what keeps the cost off
+// users who never ask for it.
 func OpenWithOptions(ref usbfs.DeviceRef, opts Options) (proto.Transport, error) {
 	opts = opts.withDefaults()
 
@@ -504,18 +513,34 @@ func (t *transport) ReadMIDI(p []byte) (int, error) {
 
 // Close releases the interface and closes the device.
 //
-// Releasing is what makes snd-usb-audio rebind, restoring the ALSA card and the
-// /dev/snd/midiC*D* node that claiming took away. It is attempted even if the
-// device handle is in a bad state, and its error is reported rather than
-// swallowed, because a silently skipped release leaves the user's MIDI port
-// missing until they replug the device.
+// Releasing asks the kernel to rebind snd-usb-audio, which is the only chance
+// the ALSA card and the /dev/snd/midiC*D* node that claiming took away have of
+// coming back. It is attempted even if the device handle is in a bad state, and
+// its error is reported rather than swallowed, because a silently skipped
+// release leaves the user's MIDI port missing until they replug the device.
+//
+// Releasing does not guarantee the node returns, and on the kernel this was
+// watched on it did not (usbfs.ErrDriverNotRebound; see OpenWithOptions). That
+// case is not a silent one: usbfs verifies the rebind against sysfs, and the
+// error below turns the verdict into the instruction the user needs, which is to
+// replug the device rather than to go looking for what broke their MIDI port.
 func (t *transport) Close() error {
 	t.closeOnce.Do(func() {
 		t.closed.Store(true)
 		t.cancel() // refuse any transfer not yet submitted
 		var errs []error
 		if err := t.dev.ReleaseInterface(t.iface.Number); err != nil {
-			errs = append(errs, fmt.Errorf("usbmidi: release interface %d (the ALSA MIDI port may stay missing until replug): %w", t.iface.Number, err))
+			// The same sentence in two certainties, because the two cases carry
+			// different ones. A release that merely failed says nothing about
+			// where the driver ended up, so the note hedges; a release carrying
+			// ErrDriverNotRebound has already read sysfs and found the interface
+			// driverless, so the hedge would be false modesty. Only this layer
+			// knows the driver by name.
+			note := "the ALSA MIDI port may stay missing until replug"
+			if errors.Is(err, usbfs.ErrDriverNotRebound) {
+				note = "snd-usb-audio did not rebind; the ALSA MIDI port stays missing until replug"
+			}
+			errs = append(errs, fmt.Errorf("usbmidi: release interface %d (%s): %w", t.iface.Number, note, err))
 		}
 		if err := t.dev.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("usbmidi: close %s: %w", t.ref.Path, err))

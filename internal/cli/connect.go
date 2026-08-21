@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"strconv"
 	"strings"
@@ -24,15 +25,40 @@ type conn struct {
 	Session *session.Session
 	// Desc identifies the endpoint for diagnostics, e.g. a device node path.
 	Desc string
+	// stderr is where Close reports the one failure the caller cannot.
+	//
+	// Every command closes with `defer c.Close()` and discards the result, and
+	// that is right: a close error must never surface as a command failure,
+	// because the command already succeeded (SPEC.md §17, on ErrReadBack). The
+	// cost of that convention is that a close error nobody reads is a close
+	// error nobody sees, which is fine for every close error but one.
+	stderr io.Writer
 }
 
 // Close releases the device. The session owns the framer, which owns the
 // transport, so this is the only close the caller needs.
+//
+// It writes one diagnostic straight to stderr rather than relying on the return
+// value, because usbfs.ErrDriverNotRebound is not a report about this command:
+// it says the kernel driver this process displaced to use --transport usb did
+// not come back, so the user's ALSA MIDI port is gone until they replug the
+// device, and every later gflex run on the default transport will fail to find
+// it. Returning that to a caller who discards close errors -- which all of them
+// do, correctly -- would leave the user with a broken device and no explanation
+// (SPEC.md §4.2).
 func (c *conn) Close() error {
 	if c == nil || c.Session == nil {
 		return nil
 	}
-	return c.Session.Close()
+	err := c.Session.Close()
+	if err != nil && c.stderr != nil && errors.Is(err, usbfs.ErrDriverNotRebound) {
+		fmt.Fprintf(c.stderr,
+			"warning: the kernel driver this process detached to claim the device did not rebind.\n"+
+				"  The ALSA MIDI port is gone until the device is unplugged and plugged back in, so\n"+
+				"  commands without --transport usb will not find it (SPEC.md §4.2).\n"+
+				"  %v\n", err)
+	}
+	return err
 }
 
 // connect resolves the transport, builds a session and returns it ready to use.
@@ -56,7 +82,7 @@ func (a *App) connect(ctx context.Context, f Formatter) (*conn, error) {
 	if a.Verbose {
 		f.Diag("connected: %s", desc)
 	}
-	return &conn{Session: s, Desc: desc}, nil
+	return &conn{Session: s, Desc: desc, stderr: a.stderr}, nil
 }
 
 // traceFunc builds the -v frame tracer. Frames are printed as raw hex plus the
@@ -188,7 +214,8 @@ func (a *App) warnSolePortFallback(p rawmidi.PortInfo) {
 }
 
 // openUSB opens the device through usbfs, bypassing ALSA entirely. This is the
-// escape route when PipeWire, JACK or a DAW holds the rawmidi node, which is
+// escape route when another MIDI client -- a Chrome tab using Web MIDI, or
+// PipeWire, JACK or a DAW -- holds the rawmidi node, which is
 // opened exclusively per direction (SPEC.md §4.1).
 func (a *App) openUSB(ctx context.Context) (proto.Transport, string, error) {
 	if a.Port == "" {
@@ -320,8 +347,11 @@ func (a *App) searchReport(_ context.Context) string {
 	sb.WriteString("\nmost likely fixes:\n")
 	sb.WriteString("  1. permissions -- the node exists but is not readable by you:\n")
 	sb.WriteString("       sudo gflex install-udev      (then unplug and replug the VFLEX)\n")
-	sb.WriteString("  2. busy -- PipeWire, JACK or a DAW holds the rawmidi node exclusively:\n")
-	sb.WriteString("       gflex --transport usb <command>\n")
+	sb.WriteString("  2. busy -- another MIDI client holds the rawmidi node exclusively. A Chrome tab\n")
+	sb.WriteString("     using Web MIDI is the likeliest one for this device, since the vendor ships a\n")
+	sb.WriteString("     Chrome web app; PipeWire, JACK and DAWs do it too:\n")
+	sb.WriteString("       cat /proc/asound/seq/clients   (a Web MIDI tab shows up as \"Chrome\")\n")
+	sb.WriteString("       gflex --transport usb <command>   (fallback; may cost the MIDI port until replug)\n")
 	sb.WriteString("  3. wrong port -- more than one candidate, or an unrecognised port name:\n")
 	sb.WriteString("       gflex devices                (then pass --port with one of the paths)\n")
 	return sb.String()
