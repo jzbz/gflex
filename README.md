@@ -504,9 +504,12 @@ answers corrected the documentation. Highlights:
 
 - The **USB product ID is `0x800F`**, and the vendor's own udev rule had it right all along.
 - The device **clears the write/scratchpad flag bits** in its echo, so masking on receive is
-  required rather than merely defensive.
-- The **scratchpad flag makes a write validate-and-discard**: acknowledged, echoed back, never
-  committed.
+  required rather than merely defensive. Confirmed on both units.
+- The **scratchpad flag makes a write validate-and-discard** — acknowledged, never committed —
+  confirmed on both units and on two different commands. What the *response* carries turned out to
+  be per-command rather than a property of the flag: on one unit, minutes apart, a scratchpad write
+  of `CMD_VOLTAGE_MV` answered with the value sent while one of `CMD_CURRENT_LIMIT_MA` answered with
+  the value the device kept, and neither was stored. The remaining 27 commands are uncharacterised.
 - **The inter-message delay now defaults to 1 ms, down from the vendor's 20 ms.** The second unit
   reproduced the first unit's pacing measurements, which is exactly what
   [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21) question 15 named

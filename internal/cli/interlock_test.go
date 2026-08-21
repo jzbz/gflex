@@ -314,10 +314,13 @@ func TestCheckRawFrame(t *testing.T) {
 	if d := CheckRawFrame(scratch); !d.Confirm || !containsAny(d.Warnings, "scratchpad") {
 		t.Errorf("the scratchpad flag must be called out; got confirm=%v warnings=%q", d.Confirm, d.Warnings)
 	}
-	// And it must say what the flag actually does. Bring-up measured it as
-	// validate-and-discard -- acknowledged, echoed back, never committed
-	// (SPEC.md §14.4) -- which is the one thing a user needs to be told here,
-	// because the frame will look like it worked.
+	// And it must say what the flag actually does. Both units measured it as
+	// validate-and-discard -- acknowledged, never committed (SPEC.md §14.4) --
+	// which is the one thing a user needs to be told here, because the frame
+	// will look like it worked. Deliberately NOT pinned: what the response
+	// carries. That is per-command rather than a property of the flag (18
+	// answers with the value sent, 19 with the value kept), so asserting one
+	// of them here would pin a detail the firmware does not hold to.
 	if d := CheckRawFrame(scratch); !containsAny(d.Warnings, "never committed") {
 		t.Errorf("the scratchpad warning does not say the write will not take effect: %q", d.Warnings)
 	}

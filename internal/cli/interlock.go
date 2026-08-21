@@ -365,10 +365,14 @@ func CheckFlash(pages int, version string, crcKnown, force bool) Decision {
 // Reads of documented commands are harmless. A write frame stores something in
 // non-volatile memory with no range checking whatsoever, an undocumented
 // command code does something nobody has characterised (SPEC.md §14.5), and the
-// scratchpad flag is never set by the vendor app: on the one unit measured it
-// makes a write validate and then vanish -- acknowledged, echoed back, never
-// committed (SPEC.md §14.4). That last one still warrants a prompt precisely
-// because it succeeds: the user gets a clean response and no stored value.
+// scratchpad flag is never set by the vendor app: on both units measured it
+// makes a write validate and then vanish -- acknowledged, never committed
+// (SPEC.md §14.4). That last one still warrants a prompt precisely because it
+// succeeds: the user gets a clean response and no stored value. What the
+// response *carries* is command-dependent and deliberately not promised here --
+// CMD_VOLTAGE_MV answers with the value you asked for, CMD_CURRENT_LIMIT_MA
+// with the value it kept -- so the warning says what is true of every command
+// tested rather than what was true of the first one.
 func CheckRawFrame(f proto.Frame) Decision {
 	var d Decision
 	var reasons []string
@@ -382,9 +386,12 @@ func CheckRawFrame(f proto.Frame) Decision {
 		reasons = append(reasons, fmt.Sprintf("command code %d is outside the known table", uint8(f.Cmd)))
 	}
 	if f.Scratchpad {
-		reasons = append(reasons, "the scratchpad flag is set; the vendor app never sets it, and on the "+
-			"one unit measured such a write is acknowledged and echoed back but never committed, so "+
-			"this frame will look like it succeeded and change nothing (SPEC.md §14.4)")
+		reasons = append(reasons, "the scratchpad flag is set; the vendor app never sets it, and on "+
+			"both units measured such a write is acknowledged but never committed, so this frame will "+
+			"look like it succeeded and change nothing. Do not read the response as confirmation: "+
+			"what it carries varies by command -- a scratchpad write of CMD_VOLTAGE_MV answers with "+
+			"the value you sent, one of CMD_CURRENT_LIMIT_MA with the value the device kept, and "+
+			"neither was stored (SPEC.md §14.4)")
 	}
 	// Some commands are disruptive with no write flag set, so the checks above
 	// miss them entirely. `raw 02 14` is the clearest case: a plain read frame,
