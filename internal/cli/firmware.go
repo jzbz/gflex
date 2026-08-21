@@ -179,12 +179,15 @@ func newFirmwareFetchCommand(app *App) *cobra.Command {
 		},
 	}
 	fl := cmd.Flags()
+	// No decorative back quotes: cobra reads the first back-quoted span as the
+	// value placeholder, so `firmware flash --help` rendered as though the flag
+	// took that as its argument. The quoted word names the value instead.
 	fl.StringVar(&wsURL, "ws-url", bootloader.DefaultWSURL,
-		"WebSocket endpoint to ask; must be wss:// or https:// (see `firmware flash --help`)")
+		"WebSocket endpoint `url` to ask; must be wss:// or https:// (see firmware flash --help)")
 	fl.DurationVar(&timeout, "fetch-timeout", bootloader.DefaultFetchTimeout,
 		"budget for the whole download (SPEC.md §10.3)")
 	fl.StringVarP(&outPath, "out", "o", "",
-		"save the image here, in a form `firmware flash <file>` reads back")
+		"save the image to `file`, in a form firmware flash <file> reads back")
 	fl.BoolVar(&raw, "raw", false,
 		"save the service's reply verbatim instead of parsing it; needs -o, and is for diagnosing a payload this tool cannot read")
 	return cmd

@@ -1,0 +1,219 @@
+name: Release
+
+# Tags only, and only tags starting with v. A release is a deliberate act: the
+# pushed tag is the single input to this workflow -- its name becomes the
+# version stamped into the binaries, the name of the GitHub release, and part of
+# every asset filename. Nothing here runs on a branch push, so the way to cut a
+# release is to push a tag and the way to not cut one is to not push a tag.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read-only by default. The one job that needs to write says so itself, below.
+permissions:
+  contents: read
+
+# Deliberately not cancel-in-progress, unlike ci.yml. There a superseded run is
+# just wasted minutes; here an interrupted run can leave a published release
+# with only half its assets attached, which is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Actions are pinned by commit SHA with the version in a trailing comment, for
+# the reasons ci.yml spells out at length -- a major tag is mutable, Dependabot
+# keeps the SHAs current. That matters more here than there: this workflow holds
+# a token that can write to the repository and publish artifacts under the
+# project's name. The runner images are again deliberately NOT pinned, and
+# ubuntu-24.04-arm is a label choice rather than a pin: it is the only arm64 one.
+
+jobs:
+  build:
+    name: build linux/${{ matrix.goarch }}
+    strategy:
+      # One architecture failing should not hide the state of the other; both
+      # results are wanted before anything is published.
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: ubuntu-latest
+          - goarch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Tracks the toolchain in go.mod, exactly as ci.yml does, so a
+          # release is built with the Go the tree declares.
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: version from tag
+        run: |
+          version="${GITHUB_REF_NAME}"
+          # The trigger above matches any tag starting with v, which includes
+          # things that are not versions at all. Refusing them here is cheaper
+          # than deleting a published release later.
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::tag $version is not vMAJOR.MINOR.PATCH[-PRERELEASE]; refusing to release from it"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "BIN=gflex-$version-linux-${{ matrix.goarch }}" >> "$GITHUB_ENV"
+
+      # CGO_ENABLED=0 makes cross-compiling these two targets trivial, so this
+      # could be one job on one runner. It is two because of what comes after
+      # the build: ldd only tells the truth about a binary the host can load, so
+      # a cross-built arm64 binary would sail through the static check no matter
+      # what it was linked against, and the binary could not be run at all. Both
+      # runners are free for public repositories, so each binary is built and
+      # exercised on the architecture it targets.
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          if [ "$(go env GOARCH)" != "${{ matrix.goarch }}" ]; then
+            echo "::error::runner is $(go env GOARCH), expected ${{ matrix.goarch }}; the checks below need a native build"
+            exit 1
+          fi
+          # The build date is the tagged commit's date, not the time of the
+          # build. Together with -trimpath and a version that comes from the
+          # tag, that leaves nothing in the binary that changes between two
+          # builds of the same tag; a wall-clock stamp would be the one thing
+          # standing in the way of reproducing a release.
+          builddate="$(git log -1 --format=%cI)"
+          # These three variables exist in internal/cli/version.go for exactly
+          # this. The import path has to be spelled in full and a typo in it
+          # fails silently -- the linker drops an -X for an unknown symbol -- so
+          # the "version stamp" step below reads the values back out.
+          pkg=github.com/jzbz/gflex/internal/cli
+          go build -trimpath \
+            -ldflags "-X ${pkg}.Version=${VERSION} -X ${pkg}.Commit=${GITHUB_SHA} -X ${pkg}.BuildDate=${builddate}" \
+            -o "$BIN" ./cmd/gflex
+
+      # The same check ci.yml makes, applied to the file that will actually be
+      # published. The whole premise of the pure-Go usbfs binding is that
+      # everything, firmware update included, ships in one static binary; a
+      # release asset that turns out to be dynamically linked quietly gives that
+      # away, and it would be found on a user's machine rather than here.
+      - name: static, cgo-free binary
+        run: |
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::error::$BIN is dynamically linked; CGO_ENABLED=0 build regressed"
+            exit 1
+          fi
+
+      - name: version stamp
+        run: |
+          chmod +x "$BIN"
+          "./$BIN" version
+          if ! "./$BIN" version --json | grep -qF "\"version\": \"${VERSION}\""; then
+            echo "::error::$BIN does not report ${VERSION}; the -X import path or a variable name is wrong"
+            exit 1
+          fi
+
+      # ci.yml's smoke test, run against the release binary itself: --dry-run
+      # touches no device, and this frame is pinned by testdata/golden/frames.json.
+      # It is the cheapest possible proof that the file being uploaded is a
+      # working gflex on this architecture and not just an ELF that starts.
+      - name: smoke
+        run: |
+          out="$("./$BIN" voltage set 12V --dry-run 2>/dev/null)"
+          echo "$out"
+          echo "$out" | grep -q '04 92 2e e0' || {
+            echo "::error::set-voltage frame did not match the golden vector"
+            exit 1
+          }
+
+      # Hashed here, next to the checks above, so that the digest published to
+      # users is the digest of a binary this job saw pass them.
+      - name: checksum
+        run: sha256sum "$BIN" > "$BIN.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gflex-linux-${{ matrix.goarch }}
+          path: |
+            ${{ env.BIN }}
+            ${{ env.BIN }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    # The one non-default permission in this file, and the step that needs it is
+    # "create release": it creates the GitHub release for the pushed tag and
+    # uploads the assets, both of which are writes to this repository. Every
+    # other step in the workflow runs under the read-only default at the top.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gflex-linux-*
+          merge-multiple: true
+          path: dist
+
+      # No checkout in this job on purpose: nothing here reads the source tree,
+      # and GH_REPO below gives gh the repository context it would otherwise
+      # have taken from the clone.
+
+      - name: checksums
+        working-directory: dist
+        run: |
+          # Re-checking the per-job digests is what ties the bytes users
+          # download to the bytes that passed the static and smoke checks, over
+          # an artifact round trip that this job does not otherwise inspect.
+          sha256sum -c ./*.sha256
+          rm -f ./*.sha256
+          # The glob deliberately names only the binaries, so SHA256SUMS cannot
+          # end up listing itself.
+          sha256sum -- gflex-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+        working-directory: dist
+        run: |
+          # A hyphen is the semver pre-release separator, so v0.2.0-rc1 is
+          # published as a prerelease and v0.2.0 is not.
+          extra=()
+          case "$VERSION" in
+            *-*) extra+=(--prerelease) ;;
+          esac
+          # No backticks anywhere in this body: the heredoc is unquoted so that
+          # $VERSION expands, which also makes backticks command substitution.
+          # Indented lines are Markdown code blocks and need none.
+          notes=$(cat <<EOF
+          Static Linux binaries. They are cgo-free and depend on nothing at runtime -- no shared
+          libraries, no Go toolchain, no browser.
+
+              sha256sum -c SHA256SUMS
+              install -m 0755 gflex-$VERSION-linux-amd64 ~/.local/bin/gflex
+
+          The USB transport and every firmware operation need a udev rule; run **gflex install-udev**
+          or see the README's Install section.
+
+          What has been verified on real hardware and what has not is set out in the README's
+          "Status and limitations", and the protocol itself in SPEC.md.
+          EOF
+          )
+          # --verify-tag because gh will otherwise happily create a tag that
+          # does not exist; the tag that triggered this run must be the one the
+          # release is attached to.
+          gh release create "$VERSION" \
+            --verify-tag \
+            --title "$VERSION" \
+            --notes "$notes" \
+            --generate-notes \
+            "${extra[@]}" \
+            gflex-* SHA256SUMS

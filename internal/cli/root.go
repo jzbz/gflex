@@ -166,7 +166,11 @@ func NewRootCommand(app *App) *cobra.Command {
 	})
 
 	pf := root.PersistentFlags()
-	pf.StringVar(&app.Port, "port", "", "device node path or port-name substring (see `gflex devices`)")
+	// The back-quoted word is not emphasis: cobra's UnquoteUsage takes the first
+	// back-quoted span as the flag's VALUE PLACEHOLDER. Quoting "gflex devices"
+	// here rendered as `--port gflex devices` on all 36 help screens, since this
+	// flag is persistent. Quote the placeholder itself or nothing at all.
+	pf.StringVar(&app.Port, "port", "", "device node `path` or port-name substring (see gflex devices)")
 	pf.StringVar(&app.Transport, "transport", transportRawMIDI, "link to the device: rawmidi|usb")
 	pf.BoolVar(&app.AsJSON, "json", false, "emit a single JSON object on stdout; diagnostics go to stderr")
 	pf.DurationVar(&app.Timeout, "timeout", proto.DefaultTimeout, "per-command response timeout")

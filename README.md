@@ -150,10 +150,45 @@ protocol testable without hardware — `internal/transport/fake` is a scripted i
 
 ## Install
 
-Requires Go 1.26+ to build. There are no runtime dependencies — the result is a single static
-binary.
+However you get it, gflex is one static, cgo-free binary with no runtime dependencies: no shared
+libraries, no Go toolchain, no browser, nothing to install beside it. Whichever route you take,
+finish with [Permissions](#permissions) below — the USB path and every firmware operation need a
+udev rule.
+
+### Download a binary
+
+Every release attaches Linux binaries for **amd64** and **arm64**, built and checked on the
+architecture they target, plus a `SHA256SUMS` file listing both:
+[github.com/jzbz/gflex/releases](https://github.com/jzbz/gflex/releases).
+
+`uname -m` says which one you want — `x86_64` is amd64, `aarch64` is arm64. Download it and
+`SHA256SUMS` alongside it, then:
 
 ```bash
+sha256sum --ignore-missing -c SHA256SUMS
+install -m 0755 gflex-*-linux-amd64 ~/.local/bin/gflex
+gflex version
+```
+
+(`--ignore-missing` because the file lists both architectures and you have one of them.)
+
+### Install with Go
+
+```bash
+CGO_ENABLED=0 go install github.com/jzbz/gflex/cmd/gflex@latest
+```
+
+Requires Go 1.26+. `CGO_ENABLED=0` is what makes the result static: gflex imports `net` to reach the
+vendor's firmware service, and a cgo-enabled build links that against the system resolver.
+
+Every package here lives under `internal/`, so the module exposes no importable Go API — the version
+number promises nothing but the CLI.
+
+### Build from source
+
+```bash
+git clone https://github.com/jzbz/gflex
+cd gflex
 CGO_ENABLED=0 go build -o ~/.local/bin/gflex ./cmd/gflex
 ```
 
@@ -326,6 +361,7 @@ you care about with `-v` in another, which traces the session's own frames as we
 | `gflex authlock get \| set` | Read or set the auth lock (effect undocumented — see SPEC §14) |
 | `gflex scan` | Guided capture of a power source's PD capabilities |
 | `gflex pdo dump \| clear` | Re-decode or erase the stored capability log |
+| `gflex version` | Print gflex's own version, commit and platform |
 | `gflex firmware version \| fetch \| bootloader \| flash` | Firmware version, download this unit's image without flashing, enter the bootloader, flash an image |
 | `gflex raw <hex...>` | Send a frame verbatim — the escape hatch |
 | `gflex monitor` | Print inbound decoded frames live |
@@ -484,7 +520,7 @@ interoperability is protected in many jurisdictions (EU Directive 2009/24/EC Art
 §1201(f)), but that's general context rather than legal advice.
 
 Where the implementation deliberately departs from what the vendor's app does — and it does, in
-nineteen places, mostly because the vendor's behaviour is unsafe — those are catalogued in
+twenty places, mostly because the vendor's behaviour is unsafe — those are catalogued in
 [SPEC.md §17](SPEC.md#17-where-the-implementation-deliberately-differs-from-this-spec).
 
 ---
@@ -498,7 +534,7 @@ strings, the inverted LED byte, the HIGH-before-LOW voltage limits, and the full
 including its serial-latch invariant. No decode had to be corrected afterwards. The second was
 brought up to settle the pacing question below, and matched the first on everything re-measured.
 
-Nine of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
+Ten of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
 are now answered from measurement — plus one the original list did not contain — and three of the
 answers corrected the documentation. Highlights:
 
@@ -550,7 +586,7 @@ assembled wrongly from the vendor's chunk map would not have matched.
 Note what was flashed was the same version already installed — the service serves a unit's current
 image, so this exercised the path rather than delivering an update.
 
-Still unverified: the auth-lock levels beyond 0, the auth-lock levels beyond 0,
+Still unverified: the auth-lock levels beyond 0,
 the tolerance-sag units, and the six commands that are dead code in the vendor's app. Those, and the
 CRC algorithm, are the remaining §14 entries.
 

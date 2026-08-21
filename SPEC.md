@@ -9,9 +9,10 @@ functionally identical web build served from `https://vflex.app`, and the vendor
 unit was obtained on 2026-08-21 and driven by this tool, and §14 records what that measured. Every
 claim below is either **VERIFIED** against decompiled source (with a citation), **MEASURED** on that
 unit, or explicitly marked **UNKNOWN** / **INFERRED**. Nothing here is a guess presented as fact —
-§14 answers nine of the sixteen questions the analysis could not settle and lists the seven that
-still need a second unit, a firmware image, or a deliberate bootloader excursion. Where the body and
-§14 ever disagree, §14 was measured and the body was inferred.
+§14 answers ten of the sixteen questions the analysis could not settle and lists the six that remain
+— none of which a second unit could settle, since a second unit was obtained and a bootloader
+excursion performed. Where the body and §14 ever disagree, §14 was measured and the body was
+inferred.
 
 **Contents:** [0 Provenance](#0-provenance-and-method) · [1 The device](#1-what-the-vflex-actually-is)
 · [2 Scope](#2-scope) · [3 Transport](#3-transport--usb-midi-with-nibble-framing)
@@ -1032,6 +1033,12 @@ gflex scan [--voltage <v> --current <a>] [--no-prompt] [--wait <d>] [--settle <d
                                          guided PDO capture wizard
 gflex pdo       dump [--raw] | clear
 gflex firmware  version
+                fetch [-o <file>] [--raw] [--ws-url <u>] [--fetch-timeout <d>]
+                                         download this unit's image and report it;
+                                         writes nothing to the device. -o saves it in
+                                         a form `flash <file>` reads back; --raw saves
+                                         the service's reply verbatim, for a payload
+                                         this tool cannot parse (§10.3)
                 bootloader               jump and stop
                 flash [file] [--recover] [--fetch] [--ws-url <u>] [--fetch-timeout <d>]
                                          [--crc <byte>] [--force] [--ack-mode]
@@ -1225,11 +1232,12 @@ one interlock that needs a second key uses a self-describing name rather than a 
 
 ## 14. Open questions — mostly resolved on hardware, 2026-08-21
 
-**Bring-up happened.** A real unit — serial `81a0bcc3`, firmware `APP.05.00.00`, PID `0x800F` — was
-attached and driven by this tool for the first time. **Nine** of the sixteen questions below are now
-answered from measurement rather than inference — 1, 2, 3, 4, 8, 11, 13, 14 and 15 — and one
-question the original list did not contain, the meaning of `SelectedPDOID`, was settled alongside
-them. Seven remain open: 5, 6, 7, 9, 10, 12 and 16. The answers are collected in the table
+**Bring-up happened, then happened again.** A real unit — serial `81a0bcc3`, firmware
+`APP.05.00.00`, PID `0x800F` — was attached and driven by this tool for the first time, and a second
+unit, `58b4f621`, followed. **Ten** of the sixteen questions below are now answered from measurement
+rather than inference — 1, 2, 3, 4, 8, 11, 13, 14, 15 and 16 — and one question the original list did
+not contain, the meaning of `SelectedPDOID`, was settled alongside them. Six remain open: 5, 6, 7, 9,
+10 and 12, and none of them is answerable with another unit. The answers are collected in the table
 immediately below, which is what marks a question resolved; there is no separate marker in the
 preserved list further down. Three of the answers corrected this document; one corrected the code.
 
