@@ -349,7 +349,11 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 	}
 
 	// A flat array of numbers is the whole image rather than a list of pages.
-	if first := bytes.TrimSpace(elems[0]); len(first) > 0 && first[0] != '[' && first[0] != '"' {
+	// Objects are page elements (see decodePage), so they must not fall into
+	// this branch: the vendor service sends exactly that shape, and reading it
+	// as a byte list is how `firmware flash --fetch` failed against the real
+	// endpoint with "cannot unmarshal object into Go value of type json.Number".
+	if first := bytes.TrimSpace(elems[0]); len(first) > 0 && first[0] != '[' && first[0] != '"' && first[0] != '{' {
 		b, err := decodeByteArray(trimmed)
 		if err != nil {
 			return nil, err
@@ -385,7 +389,67 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 		}
 		pages = append(pages, page)
 	}
+	if err := orderByPageID(elems, pages); err != nil {
+		return nil, err
+	}
 	return pages, nil
+}
+
+// orderByPageID reorders pages into pg_id order, when the elements carry one.
+//
+// The vendor service numbers its pages explicitly, and array position is not
+// the same promise as a stated page id: JSON preserves array order, but nothing
+// says the server builds the array in flash order, and a page written to the
+// wrong address is not a failure that announces itself -- a wrongly assembled
+// image can flash and even verify cleanly (SPEC.md §10.2), because the CRC is
+// computed by the device over what it was given.
+//
+// So when ids are present they are the authority, and they must form exactly
+// 0..n-1: a gap means a page is missing, a duplicate means one overwrites
+// another, and either would otherwise be discovered by a user with a brick.
+// Elements without an id are left in array order, which is all a payload that
+// never claimed page numbers can offer.
+func orderByPageID(elems []json.RawMessage, pages [][]byte) error {
+	ids := make([]int, len(elems))
+	for i, e := range elems {
+		if trimmed := bytes.TrimSpace(e); len(trimmed) == 0 || trimmed[0] != '{' {
+			return nil // not the object shape; array order is all there is
+		}
+		var wp wirePage
+		if err := json.Unmarshal(e, &wp); err != nil || wp.PageID == nil {
+			return nil // no stated id, so nothing to order by
+		}
+		ids[i] = *wp.PageID
+	}
+	seen := make(map[int]bool, len(ids))
+	for i, id := range ids {
+		if id < 0 || id >= len(ids) {
+			return fmt.Errorf("%w: page id %d is outside 0..%d, so the image is not a contiguous "+
+				"run of pages (element %d)", ErrBadPageLength, id, len(ids)-1, i)
+		}
+		if seen[id] {
+			return fmt.Errorf("%w: page id %d appears more than once, so one page would overwrite "+
+				"another (element %d)", ErrBadPageLength, id, i)
+		}
+		seen[id] = true
+	}
+	ordered := make([][]byte, len(pages))
+	for i, id := range ids {
+		ordered[id] = pages[i]
+	}
+	copy(pages, ordered)
+	return nil
+}
+
+// wirePage is the page shape the vendor's firmware service sends: an explicit
+// page id and a map from chunk index to that chunk's bytes.
+//
+// Measured against the production endpoint on 2026-08-21 (SPEC.md §10.3): 165
+// pages, ids 0..164, each with chunk keys "0".."7" of 40 bytes, i.e. 320-byte
+// pages rather than the 512 a raw .bin is assumed to use.
+type wirePage struct {
+	PageID *int                       `json:"pg_id"`
+	Chunks map[string]json.RawMessage `json:"chunks"`
 }
 
 // decodePage converts one page element: an array of byte values, or a base64 or
@@ -404,8 +468,74 @@ func decodePage(raw json.RawMessage) ([]byte, error) {
 			return nil, fmt.Errorf("%w: page string: %w", ErrBadPageLength, err)
 		}
 		return decodeByteString(s)
+	case '{':
+		return decodeChunkedPage(trimmed)
 	default:
-		return nil, fmt.Errorf("%w: page is neither an array nor a string", ErrBadPageLength)
+		return nil, fmt.Errorf("%w: page is neither an array, a string nor a {pg_id, chunks} object", ErrBadPageLength)
+	}
+}
+
+// decodeChunkedPage assembles one page from the vendor service's chunk map.
+//
+// The chunks arrive keyed by index as an object, and JSON object member order
+// is not meaningful, so the keys are sorted numerically rather than iterated:
+// ranging a Go map here would assemble the page in a different order on every
+// run, and produce an image that flashes cleanly and boots into nothing.
+//
+// Exactly ChunksPerPage chunks are required, numbered 0..ChunksPerPage-1. That
+// is the same rule the rest of the package already enforces from the other
+// direction -- SplitPage divides a page into exactly that many, and Validate
+// refuses a page length that is not divisible by it -- expressed on the shape
+// the wire happens to use. A short or gappy chunk map would otherwise yield a
+// short page, which is precisely the wrongly-split image that can flash and
+// verify cleanly (SPEC.md §10.2, §14.12).
+func decodeChunkedPage(raw json.RawMessage) ([]byte, error) {
+	var wp wirePage
+	if err := json.Unmarshal(raw, &wp); err != nil {
+		return nil, fmt.Errorf("%w: page object: %w", ErrBadPageLength, err)
+	}
+	if len(wp.Chunks) == 0 {
+		return nil, fmt.Errorf("%w: page object carries no chunks", ErrBadPageLength)
+	}
+	if len(wp.Chunks) != ChunksPerPage {
+		return nil, fmt.Errorf("%w: page has %d chunks, want exactly %d",
+			ErrBadPageLength, len(wp.Chunks), ChunksPerPage)
+	}
+	out := make([]byte, 0, ChunksPerPage*64)
+	for i := 0; i < ChunksPerPage; i++ {
+		key := strconv.Itoa(i)
+		elem, ok := wp.Chunks[key]
+		if !ok {
+			return nil, fmt.Errorf("%w: page has no chunk %q; chunks must be numbered 0..%d",
+				ErrBadPageLength, key, ChunksPerPage-1)
+		}
+		b, err := decodeChunk(elem)
+		if err != nil {
+			return nil, fmt.Errorf("%w (chunk %d)", err, i)
+		}
+		out = append(out, b...)
+	}
+	return out, nil
+}
+
+// decodeChunk converts one chunk: an array of byte values, or a base64/hex
+// string, matching what decodePage accepts for a whole page.
+func decodeChunk(raw json.RawMessage) ([]byte, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("%w: empty chunk", ErrBadPageLength)
+	}
+	switch trimmed[0] {
+	case '[':
+		return decodeByteArray(trimmed)
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return nil, fmt.Errorf("%w: chunk string: %w", ErrBadPageLength, err)
+		}
+		return decodeByteString(s)
+	default:
+		return nil, fmt.Errorf("%w: chunk is neither an array nor a string", ErrBadPageLength)
 	}
 }
 

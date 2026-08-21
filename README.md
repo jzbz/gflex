@@ -326,7 +326,7 @@ you care about with `-v` in another, which traces the session's own frames as we
 | `gflex authlock get \| set` | Read or set the auth lock (effect undocumented — see SPEC §14) |
 | `gflex scan` | Guided capture of a power source's PD capabilities |
 | `gflex pdo dump \| clear` | Re-decode or erase the stored capability log |
-| `gflex firmware version \| bootloader \| flash` | Firmware version, enter the bootloader, flash an image |
+| `gflex firmware version \| fetch \| bootloader \| flash` | Firmware version, download this unit's image without flashing, enter the bootloader, flash an image |
 | `gflex raw <hex...>` | Send a frame verbatim — the escape hatch |
 | `gflex monitor` | Print inbound decoded frames live |
 | `gflex install-udev [--print]` | Install (or show) the udev rule |
@@ -525,7 +525,18 @@ answers corrected the documentation. Highlights:
 - The **vendor-class interface is present while the application is running**, which the spec had not
   anticipated. `firmware flash --recover` now refuses a unit that still presents a MIDI interface.
 
-Still unverified: firmware flashing end to end (no image to hand), the auth-lock levels beyond 0,
+The vendor firmware service now works end to end. `gflex firmware fetch` downloads the image the
+service holds for a unit and reports it without touching the device — and doing that for the first
+time found that `flash --fetch` had never worked: the real payload is an array of `{pg_id, chunks}`
+objects with the chunks keyed by index, and the parser read a non-array first element as a flat byte
+list, so it failed with *"cannot unmarshal object into Go value of type json.Number"*. The measured
+shape is now in [SPEC.md §10.3](SPEC.md#103-firmware-image-delivery), along with the real page
+geometry: 320-byte pages of 8×40, not the 512 assumed for a raw `.bin`. Note also that the service
+returned `APP.05.00.00` for a unit already running it — it serves the current image for a serial, so
+a fetch is not by itself an update.
+
+Still unverified: firmware flashing end to end (an image is now to hand, but no unit has been
+flashed), the auth-lock levels beyond 0,
 the tolerance-sag units, and the six commands that are dead code in the vendor's app. Those, and the
 CRC algorithm, are the remaining §14 entries.
 

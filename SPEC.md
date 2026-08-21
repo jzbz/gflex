@@ -944,7 +944,27 @@ Fetched *after* the device is already in bootloader mode, over a WebSocket:
 - Production: `wss://vflex-nestjs-prod-ylaqjkd4na-uc.a.run.app/bootloader`
   (derived from the REST API URL; the `wss://api.vflex.app/bootloader` constant is a fallback)
 - Client sends the **plain serial-number string** on open; the server replies with one JSON blob.
-- Schema: `{ app_bin | app_bin_data | firmware: <array of pages>, app_version: string, crc: <u8> }`
+- Schema, as **inferred** from the client bundle: `{ app_bin | app_bin_data | firmware: <array of
+  pages>, app_version: string, crc: <u8> }`
+- Schema, as **measured** against the production endpoint on 2026-08-21 for serial `58b4f621`
+  (255,117 bytes of JSON):
+
+  ```json
+  { "app_bin": [ { "pg_id": 0, "chunks": { "0": [40 bytes], "...": [], "7": [40 bytes] } }, ... ],
+    "crc": 48, "app_version": "APP.05.00.00", "release": "RELEASE.04.00.00" }
+  ```
+
+  165 pages, `pg_id` 0..164, every page carrying exactly `ChunksPerPage` (8) chunks of 40 bytes:
+  **320-byte pages**, not the 512 a raw `.bin` is assumed to use (§10.2). Three things the inferred
+  schema did not have. A page is an **object** with an explicit id, not a bare array; the chunks
+  arrive as a **map** keyed by index rather than in order, so member order carries no meaning and
+  the keys must be sorted numerically; and there is a fourth key, `release`, distinct from
+  `app_version`. The implementation read a non-`[`, non-`"` first element as a flat array of byte
+  values, so `--fetch` failed against the real service with *"cannot unmarshal object into Go value
+  of type json.Number"* -- meaning that path had never worked. It now accepts this shape, orders
+  pages by `pg_id` and refuses a chunk map that is short, gappy or duplicated, because a wrongly
+  assembled image can flash and even verify cleanly: the device computes the CRC over whatever it
+  was given.
 - 15000 ms timeout. **No HTTP fallback and no local `.bin` path exist in the client.**
 - No server-side auth was observed — only client-side UI gating. Unverified.
 

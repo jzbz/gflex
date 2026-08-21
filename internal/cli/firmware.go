@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -57,7 +58,8 @@ func newFirmwareCommand(app *App) *cobra.Command {
 		Use:   "firmware",
 		Short: "Read the firmware version, enter the bootloader, or flash an image",
 	})
-	cmd.AddCommand(newFirmwareVersionCommand(app), newFirmwareBootloaderCommand(app), newFirmwareFlashCommand(app))
+	cmd.AddCommand(newFirmwareVersionCommand(app), newFirmwareFetchCommand(app),
+		newFirmwareBootloaderCommand(app), newFirmwareFlashCommand(app))
 	return cmd
 }
 
@@ -106,6 +108,146 @@ func newFirmwareVersionCommand(app *App) *cobra.Command {
 			})
 		},
 	}
+}
+
+// newFirmwareFetchCommand downloads the image the vendor service holds for this
+// unit and reports what it is, without flashing anything.
+//
+// `flash --fetch` exists already, but it is all or nothing: it downloads and
+// then rewrites the device in the same breath, and it refuses --dry-run because
+// fetching needs the serial and a dry run must not read from the device
+// (SPEC.md §13.8). That leaves no way to answer the question anyone sensible
+// asks first -- what would you put on my device? -- without agreeing to the one
+// irreversible operation this tool performs.
+//
+// So this command reads exactly one thing from the unit, its serial number, and
+// otherwise only talks to the network. It writes nothing to the device, sends no
+// bootloader frame, and cannot leave the unit anywhere it was not already.
+func newFirmwareFetchCommand(app *App) *cobra.Command {
+	var (
+		wsURL   string
+		timeout time.Duration
+		outPath string
+		raw     bool
+	)
+	cmd := &cobra.Command{
+		Use:   "fetch",
+		Short: "Download this unit's firmware image and report it, without flashing",
+		Long: "fetch reads the unit's serial number, asks the vendor service for the image it\n" +
+			"holds for that serial, and prints what came back: version, page geometry and the\n" +
+			"expected CRC.\n\n" +
+			"Nothing is written to the device. The only device access is the serial read, which\n" +
+			"is what the service is keyed on -- note that it therefore leaves this unit's serial\n" +
+			"number with the vendor, exactly as the vendor's own app does.\n\n" +
+			"With -o the image is saved in a form `firmware flash <file>` can read back, so an\n" +
+			"update can be inspected first, applied later, and re-applied without the network if\n" +
+			"a flash has to be retried.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return app.run(cmd, func(ctx context.Context, f Formatter) error {
+				serial, err := app.readSerialQuietly(ctx, f)
+				if err != nil {
+					return err
+				}
+				f.KV("serial_num", "serial", serial, serial)
+				if raw {
+					// The unparsed path exists because the parsed one can fail
+					// on a payload that is perfectly fine -- it is the vendor's
+					// shape, not ours, and SPEC.md §10.3 describes it from a
+					// single observation. When it does, the bytes are the only
+					// thing that makes the difference diagnosable.
+					msg, err := bootloader.FetchRaw(ctx, wsURL, serial, timeout)
+					if err != nil {
+						return fmt.Errorf("fetching the image for serial %s: %w", serial, err)
+					}
+					f.KV("bytes", "payload", len(msg), fmt.Sprintf("%d bytes (unparsed)", len(msg)))
+					if outPath == "" {
+						return codedf(ExitUsage, "--raw needs -o: the payload is not something to print")
+					}
+					if err := os.WriteFile(outPath, msg, 0o644); err != nil {
+						return fmt.Errorf("writing %s: %w", outPath, err)
+					}
+					f.KV("path", "saved", outPath, outPath)
+					return nil
+				}
+				fw, err := bootloader.Fetch(ctx, wsURL, serial, timeout)
+				if err != nil {
+					return fmt.Errorf("fetching the image for serial %s: %w", serial, err)
+				}
+				return app.reportFetched(f, fw, outPath)
+			})
+		},
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&wsURL, "ws-url", bootloader.DefaultWSURL,
+		"WebSocket endpoint to ask; must be wss:// or https:// (see `firmware flash --help`)")
+	fl.DurationVar(&timeout, "fetch-timeout", bootloader.DefaultFetchTimeout,
+		"budget for the whole download (SPEC.md §10.3)")
+	fl.StringVarP(&outPath, "out", "o", "",
+		"save the image here, in a form `firmware flash <file>` reads back")
+	fl.BoolVar(&raw, "raw", false,
+		"save the service's reply verbatim instead of parsing it; needs -o, and is for diagnosing a payload this tool cannot read")
+	return cmd
+}
+
+// reportFetched prints what the service returned and optionally saves it.
+func (a *App) reportFetched(f Formatter, fw *bootloader.Firmware, outPath string) error {
+	f.KV("fw_id", "image version", fw.Version, orUnknown(fw.Version))
+	f.KV("pages", "pages", len(fw.Pages), fmt.Sprintf("%d", len(fw.Pages)))
+	f.KV("page_size", "page size", fw.PageSize(), fmt.Sprintf("%d bytes", fw.PageSize()))
+	f.KV("total_bytes", "total", fw.TotalBytes(), fmt.Sprintf("%d bytes", fw.TotalBytes()))
+	if fw.CRCKnown {
+		f.KV("crc", "expected crc", fw.CRC, fmt.Sprintf("0x%02x", fw.CRC))
+	} else {
+		// An image with no CRC cannot be verified after flashing, and SPEC.md
+		// §10.5 is explicit that an unverified image is the one thing never to
+		// jump back into. Say so here rather than at the point of no return.
+		f.KV("crc", "expected crc", nil, "none -- this image cannot be verified after flashing")
+	}
+	if outPath == "" {
+		return nil
+	}
+	data, err := marshalFirmware(fw)
+	if err != nil {
+		return err
+	}
+	// 0o644 rather than 0o600: a firmware image is not a secret, and a file the
+	// user cannot read back with ordinary tooling defeats the point of saving it.
+	if err := os.WriteFile(outPath, data, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", outPath, err)
+	}
+	f.KV("path", "saved", outPath, outPath)
+	return nil
+}
+
+// marshalFirmware renders a fetched image in the JSON shape ParseImage accepts,
+// so that what is saved is something the flash path can actually read back.
+//
+// The pages are written as an array of arrays, which is the shape that carries
+// its own page split -- writing a flat byte list instead would discard the
+// geometry and leave the reader guessing at --page-size, on the one path where
+// a wrong split can flash and even verify cleanly (SPEC.md §10.2).
+func marshalFirmware(fw *bootloader.Firmware) ([]byte, error) {
+	doc := map[string]any{
+		"app_version": fw.Version,
+		"page_size":   fw.PageSize(),
+		"app_bin":     fw.Pages,
+	}
+	if fw.CRCKnown {
+		doc["crc"] = fw.CRC
+	}
+	data, err := json.MarshalIndent(doc, "", " ")
+	if err != nil {
+		return nil, fmt.Errorf("rendering the image: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "(the image carried no version string)"
+	}
+	return s
 }
 
 func newFirmwareBootloaderCommand(app *App) *cobra.Command {

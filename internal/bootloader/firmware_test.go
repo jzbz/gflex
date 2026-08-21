@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -697,4 +698,189 @@ func TestFirmwareVersionIsSanitised(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The vendor service's page shape
+// ---------------------------------------------------------------------------
+
+// chunkedPayload renders the shape the production firmware service actually
+// sends, measured 2026-08-21: app_bin as an array of {pg_id, chunks} objects
+// where chunks is a MAP from chunk index to that chunk's bytes.
+func chunkedPayload(t *testing.T, pages [][]byte, ids []int) []byte {
+	t.Helper()
+	type pg struct {
+		PageID int            `json:"pg_id"`
+		Chunks map[string]any `json:"chunks"`
+	}
+	out := make([]pg, 0, len(pages))
+	for i, page := range pages {
+		if len(page)%ChunksPerPage != 0 {
+			t.Fatalf("test page %d is %d bytes, not divisible by %d", i, len(page), ChunksPerPage)
+		}
+		n := len(page) / ChunksPerPage
+		chunks := make(map[string]any, ChunksPerPage)
+		for c := 0; c < ChunksPerPage; c++ {
+			vals := make([]int, n)
+			for j, b := range page[c*n : (c+1)*n] {
+				vals[j] = int(b)
+			}
+			chunks[strconv.Itoa(c)] = vals
+		}
+		out = append(out, pg{PageID: ids[i], Chunks: chunks})
+	}
+	doc := map[string]any{"app_bin": out, "crc": 0x30, "app_version": "APP.05.00.00"}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func seqPage(t *testing.T, start, n int) []byte {
+	t.Helper()
+	p := make([]byte, n)
+	for i := range p {
+		p[i] = byte((start + i) % 256)
+	}
+	return p
+}
+
+// The regression test for the defect this shape caused: `firmware flash --fetch`
+// could never have worked against the real service. normalisePages decided that
+// a first element which is not '[' or '"' meant a flat array of byte values, so
+// an object element went to decodeByteArray and failed with "cannot unmarshal
+// object into Go value of type json.Number" -- which is exactly what the
+// production endpoint returned.
+func TestParseVendorChunkedPages(t *testing.T) {
+	want := [][]byte{seqPage(t, 0, 320), seqPage(t, 100, 320)}
+	fw, err := ParseImage(chunkedPayload(t, want, []int{0, 1}), LoadOptions{})
+	if err != nil {
+		t.Fatalf("ParseImage: %v", err)
+	}
+	if len(fw.Pages) != 2 {
+		t.Fatalf("pages = %d, want 2", len(fw.Pages))
+	}
+	for i := range want {
+		if !bytes.Equal(fw.Pages[i], want[i]) {
+			t.Errorf("page %d does not round-trip", i)
+		}
+	}
+	// 8 chunks of 40 bytes is the real geometry, and it is not the 512-byte
+	// default a raw .bin is assumed to use.
+	if fw.PageSize() != 320 {
+		t.Errorf("PageSize() = %d, want 320", fw.PageSize())
+	}
+	if !fw.CRCKnown || fw.CRC != 0x30 {
+		t.Errorf("crc = %#x known=%v, want 0x30 known", fw.CRC, fw.CRCKnown)
+	}
+	if fw.Version != "APP.05.00.00" {
+		t.Errorf("version = %q", fw.Version)
+	}
+}
+
+// The chunk map is an object, and JSON object member order carries no meaning.
+// Assembling by ranging the decoded map would produce a different image on
+// every run -- one that flashes cleanly and boots into nothing.
+func TestChunkedPageIgnoresMemberOrder(t *testing.T) {
+	page := seqPage(t, 7, 320)
+	n := len(page) / ChunksPerPage
+	var sb strings.Builder
+	sb.WriteString(`{"app_bin":[{"pg_id":0,"chunks":{`)
+	// Emit the members in reverse, which is a legal document and the opposite
+	// of the order the page must be assembled in.
+	for c := ChunksPerPage - 1; c >= 0; c-- {
+		if c != ChunksPerPage-1 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `"%d":[`, c)
+		for j, b := range page[c*n : (c+1)*n] {
+			if j > 0 {
+				sb.WriteString(",")
+			}
+			fmt.Fprintf(&sb, "%d", b)
+		}
+		sb.WriteString("]")
+	}
+	sb.WriteString(`}}]}`)
+
+	fw, err := ParseImage([]byte(sb.String()), LoadOptions{})
+	if err != nil {
+		t.Fatalf("ParseImage: %v", err)
+	}
+	if !bytes.Equal(fw.Pages[0], page) {
+		t.Error("the page was assembled in document order rather than by chunk index")
+	}
+}
+
+// A page id is a statement about where the page belongs in flash, and array
+// position is a different promise. Honouring the id is what stops a reordered
+// payload from being written to the wrong addresses -- an image that can flash
+// and even verify cleanly, because the device computes the CRC over what it was
+// given (SPEC.md 10.2).
+func TestChunkedPagesAreOrderedByPageID(t *testing.T) {
+	first, second := seqPage(t, 0, 320), seqPage(t, 200, 320)
+	// Supplied in reverse: element 0 claims to be page 1.
+	payload := chunkedPayload(t, [][]byte{second, first}, []int{1, 0})
+	fw, err := ParseImage(payload, LoadOptions{})
+	if err != nil {
+		t.Fatalf("ParseImage: %v", err)
+	}
+	if !bytes.Equal(fw.Pages[0], first) || !bytes.Equal(fw.Pages[1], second) {
+		t.Error("pages were left in array order instead of pg_id order")
+	}
+}
+
+func TestChunkedPageRejectsBadGeometry(t *testing.T) {
+	page := seqPage(t, 0, 320)
+	for _, tc := range []struct {
+		name, doc, want string
+	}{
+		{
+			name: "a missing chunk index",
+			doc:  `{"app_bin":[{"pg_id":0,"chunks":{"0":[1],"1":[2],"2":[3],"3":[4],"4":[5],"5":[6],"6":[7],"8":[9]}}]}`,
+			want: "no chunk",
+		},
+		{
+			name: "too few chunks",
+			doc:  `{"app_bin":[{"pg_id":0,"chunks":{"0":[1],"1":[2]}}]}`,
+			want: "want exactly",
+		},
+		{
+			name: "no chunks at all",
+			doc:  `{"app_bin":[{"pg_id":0,"chunks":{}}]}`,
+			want: "no chunks",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseImage([]byte(tc.doc), LoadOptions{})
+			if err == nil {
+				t.Fatal("accepted a malformed page")
+			}
+			if !errors.Is(err, ErrBadPageLength) {
+				t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("a duplicate page id", func(t *testing.T) {
+		payload := chunkedPayload(t, [][]byte{page, page}, []int{0, 0})
+		if _, err := ParseImage(payload, LoadOptions{}); err == nil {
+			t.Fatal("accepted two pages claiming the same address")
+		} else if !strings.Contains(err.Error(), "more than once") {
+			t.Errorf("error = %v", err)
+		}
+	})
+
+	t.Run("a page id outside the run", func(t *testing.T) {
+		payload := chunkedPayload(t, [][]byte{page, page}, []int{0, 7})
+		if _, err := ParseImage(payload, LoadOptions{}); err == nil {
+			t.Fatal("accepted a gappy page run")
+		} else if !strings.Contains(err.Error(), "contiguous") {
+			t.Errorf("error = %v", err)
+		}
+	})
 }

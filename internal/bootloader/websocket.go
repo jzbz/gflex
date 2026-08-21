@@ -500,19 +500,23 @@ const DefaultWSURL = "wss://vflex-nestjs-prod-ylaqjkd4na-uc.a.run.app/bootloader
 // exchange (SPEC.md §10.3).
 const DefaultFetchTimeout = 15 * time.Second
 
-// Fetch downloads a firmware image from the vendor's WebSocket service.
+// FetchRaw downloads the payload the vendor's WebSocket service holds for a
+// serial, and returns it exactly as it arrived.
 //
 // The protocol is trivial: connect, send the plain serial-number string as a
-// single text frame, and read one JSON message back. The reply is decoded with
-// the same normalisation LoadFile applies, so the page encoding the server
-// happens to use does not matter.
+// single text frame, and read one JSON message back.
+//
+// Nothing here interprets the reply. That is the point: the payload shape is an
+// observation about somebody else's server, not a contract it owes us, so a
+// caller that cannot parse what came back needs the bytes rather than an error
+// about them.
 //
 // wsURL may be empty, in which case DefaultWSURL is used; timeout may be zero
 // for DefaultFetchTimeout. It must name a TLS endpoint — see insecureWSScheme
 // for why, and for the one spelling that says otherwise on purpose. Callers who
 // want to work offline should prefer LoadFile — the local file is the primary
 // input and this service is a convenience (SPEC.md §10.3).
-func Fetch(ctx context.Context, wsURL, serial string, timeout time.Duration) (*Firmware, error) {
+func FetchRaw(ctx context.Context, wsURL, serial string, timeout time.Duration) ([]byte, error) {
 	if wsURL == "" {
 		wsURL = DefaultWSURL
 	}
@@ -545,12 +549,29 @@ func Fetch(ctx context.Context, wsURL, serial string, timeout time.Duration) (*F
 		}
 		return nil, fmt.Errorf("bootloader: fetching firmware for %q: %w", serial, err)
 	}
+	// Best effort: tell the server we are done. A failure here is irrelevant,
+	// we already have the payload.
+	_ = c.writeFrame(opClose, closePayload(1000, ""))
+	return msg, nil
+}
+
+// Fetch downloads and parses the image the service holds for serial.
+//
+// It is FetchRaw plus ParseImage, split that way because the two failures are
+// not the same failure. A transport error means the service could not be
+// reached; a parse error means it answered with something this package does not
+// understand, and the only useful thing to do with that is look at it. Keeping
+// the raw payload reachable is what makes a shape change diagnosable instead of
+// merely fatal (SPEC.md §10.3 describes the shape as of one observation; the
+// service is free to change it, and did not consult us).
+func Fetch(ctx context.Context, wsURL, serial string, timeout time.Duration) (*Firmware, error) {
+	msg, err := FetchRaw(ctx, wsURL, serial, timeout)
+	if err != nil {
+		return nil, err
+	}
 	fw, err := ParseImage(msg, LoadOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("bootloader: firmware payload for %q: %w", serial, err)
+		return nil, fmt.Errorf("bootloader: firmware payload for %q (%d bytes): %w", serial, len(msg), err)
 	}
-	// Best effort: tell the server we are done. A failure here is irrelevant,
-	// we already have the image.
-	_ = c.writeFrame(opClose, closePayload(1000, ""))
 	return fw, nil
 }
