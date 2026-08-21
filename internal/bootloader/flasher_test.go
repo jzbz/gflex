@@ -976,3 +976,44 @@ func TestVerifyAbortsWhenTheDeviceLeavesTheBus(t *testing.T) {
 		t.Errorf("sent %d frames, want 2 (one round); a gone device earns no retry round", n)
 	}
 }
+
+// TestInApplicationModeUsesTheMIDIInterface pins the application-vs-bootloader
+// discriminator against descriptors measured from a real VFLEX.
+//
+// The device (APP.05.00.00, PID 0x800F, observed 2026-08-21) exposes its
+// vendor-class 0xFF interface WHILE RUNNING THE APPLICATION, which is why
+// picking by class alone is not enough -- see InApplicationMode.
+func TestInApplicationModeUsesTheMIDIInterface(t *testing.T) {
+	// Verbatim from the real unit: audio control, MIDIStreaming, vendor class.
+	appMode := &usbfs.Config{Interfaces: []usbfs.Interface{
+		{Number: 0, Class: 0x01, SubClass: 0x01},
+		{Number: 1, Class: 0x01, SubClass: 0x03, Endpoints: []usbfs.Endpoint{
+			{Address: 0x02, Attributes: 0x02}, {Address: 0x83, Attributes: 0x02}}},
+		{Number: 2, Class: 0xFF, SubClass: 0x00, Endpoints: []usbfs.Endpoint{
+			{Address: 0x01, Attributes: 0x02}, {Address: 0x81, Attributes: 0x02}}},
+	}}
+	if !InApplicationMode(appMode) {
+		t.Error("a unit presenting a MIDIStreaming interface must read as application mode")
+	}
+	// PickBootloaderInterface still finds the vendor interface -- which is
+	// exactly the hazard the guard exists for, so pin that too.
+	if _, ok := PickBootloaderInterface(appMode); !ok {
+		t.Error("PickBootloaderInterface should still select the vendor interface; " +
+			"the guard, not the picker, is what refuses application mode")
+	}
+
+	// Bootloader mode: SPEC.md §10.1 says the MIDI interface is gone.
+	blMode := &usbfs.Config{Interfaces: []usbfs.Interface{
+		{Number: 0, Class: 0xFF, SubClass: 0x00, Endpoints: []usbfs.Endpoint{
+			{Address: 0x01, Attributes: 0x02}, {Address: 0x81, Attributes: 0x02}}},
+	}}
+	if InApplicationMode(blMode) {
+		t.Error("a unit with no MIDI interface must read as bootloader mode")
+	}
+	if _, ok := PickBootloaderInterface(blMode); !ok {
+		t.Error("the bootloader interface must still be selectable")
+	}
+	if InApplicationMode(nil) {
+		t.Error("a nil config must not read as application mode")
+	}
+}

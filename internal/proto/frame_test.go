@@ -334,7 +334,7 @@ func TestStringLen(t *testing.T) {
 		c    Cmd
 		want int
 	}{
-		{CmdSerialNumber, 8}, {CmdChipUUID, 8}, {CmdHardwareID, 8},
+		{CmdSerialNumber, 8}, {CmdChipUUID, 16}, {CmdHardwareID, 8},
 		{CmdFirmwareVersion, 12}, {CmdMfgDate, 8},
 	} {
 		n, ok := StringLen(tc.c)

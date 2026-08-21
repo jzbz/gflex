@@ -452,27 +452,32 @@ fifteen places, mostly because the vendor's behaviour is unsafe — those are ca
 
 ## Status and limitations
 
-**This has never touched a VFLEX.** The protocol was recovered from the vendor's shipped application
-and cross-checked against the vendor's manual, but no part of it has been exercised against real
-hardware. It builds, it is heavily tested against a scripted in-memory device, and the framing is
-pinned by golden vectors — none of which is the same as working.
+**Verified on hardware, 2026-08-21.** A real unit — firmware `APP.05.00.00`, PID `0x800F` — was
+driven by this tool for the first time, and the protocol worked on the first attempt: the
+nibble-encoded MIDI framing, the big-endian scalars, the identity strings, the inverted LED byte,
+the HIGH-before-LOW voltage limits, and the full PD capability scan including its serial-latch
+invariant. No decode had to be corrected afterwards.
 
-Treat the first session with a real unit as bring-up, not as use. Start with `gflex devices` and
-`gflex info`, keep the X-Connector unloaded, and read [SPEC.md §14](SPEC.md#14-open-questions--resolve-these-during-hardware-bring-up),
-which lists the sixteen genuinely undetermined things and how to resolve each. The ones most likely
-to matter in practice:
+Ten of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
+are now answered from measurement, and three of the answers corrected the documentation. Highlights:
 
-- The **USB product ID** is unknown — device matching is on vendor ID 0x37BF alone
-- The **MIDI port name** the device advertises is unknown, so discovery is anchored on the vendor ID
-- **Eight commands** are never issued by the vendor's app and have no documented payload format or
-  effect; `gflex raw` is the only way to send one, and it says so and asks first
-- The **auth-lock** levels, the **tolerance sag** units, and the **firmware CRC algorithm** are all
-  undetermined
-- Whether the vendor's **20 ms inter-message delay** is required or merely defensive is unknown;
-  it's the default and `--byte-delay` can change it
+- The **USB product ID is `0x800F`**, and the vendor's own udev rule had it right all along.
+- The device **clears the write/scratchpad flag bits** in its echo, so masking on receive is
+  required rather than merely defensive.
+- The **scratchpad flag makes a write validate-and-discard**: acknowledged, echoed back, never
+  committed.
+- The vendor's **20 ms inter-message delay is ~20× more conservative than necessary** — 1 ms was
+  clean across 120 reads and 30 writes — but zero delay is *not* safe (2.5% frame loss). The default
+  stays 20 ms until that is corroborated on a second unit; `--byte-delay 1ms` is ~10× faster.
+- The **vendor-class interface is present while the application is running**, which the spec had not
+  anticipated. `firmware flash --recover` now refuses a unit that still presents a MIDI interface.
 
-Reports from real hardware are the most useful contribution right now — `gflex monitor` and
-`gflex info --all --json` output especially.
+Still unverified: firmware flashing end to end (no image to hand), the auth-lock levels beyond 0,
+the tolerance-sag units, and the six commands that are dead code in the vendor's app. Those, and the
+CRC algorithm, are the remaining §14 entries.
+
+Reports from real hardware are still the most useful contribution — especially from a *second* unit,
+since every measurement above is n=1 on one host.
 
 ---
 

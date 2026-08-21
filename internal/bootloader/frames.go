@@ -57,6 +57,19 @@ const maxBootloaderFrameLen = proto.MaxEncodableFrameLen
 // and so bounds the usable page size at MaxChunkSize * ChunksPerPage.
 const MaxChunkSize = maxBootloaderFrameLen - proto.PreambleLen - writeChunkHeaderLen
 
+// ErrApplicationMode reports that the device found on the bus is running its
+// application rather than sitting in the bootloader. See InApplicationMode.
+var ErrApplicationMode = errors.New("bootloader: device is in application mode")
+
+// AllowApplicationMode disables the InApplicationMode guard in claim.
+//
+// It exists for the case the guard cannot anticipate: a firmware that keeps its
+// MIDI interface alive in the bootloader would make the guard refuse a genuine
+// recovery. Nothing in this repository sets it -- it is a deliberate escape
+// hatch for an operator who has confirmed with the LED (slow white blink) that
+// the unit really is in the bootloader.
+var AllowApplicationMode = false
+
 // ErrFrameTooLong reports a frame whose total length will not fit the one-byte
 // length field.
 var ErrFrameTooLong = errors.New("bootloader: frame exceeds the one-byte length field")

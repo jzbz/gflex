@@ -17,7 +17,7 @@ could not determine and which therefore need a bring-up session with a real devi
 · [8 Data model](#8-device-data-model) · [9 PD scan](#9-power-supply-capability-scan)
 · [10 Firmware](#10-firmware-update) · [11 CLI](#11-cli-surface)
 · [12 Architecture](#12-architecture) · [13 Safety](#13-safety-interlocks)
-· [14 Open questions](#14-open-questions--resolve-these-during-hardware-bring-up)
+· [14 Hardware answers](#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
 · [15 Vectors](#15-golden-test-vectors) · [16 Reproducing](#16-reproducing-the-analysis)
 · [17 Deliberate deviations](#17-where-the-implementation-deliberately-differs-from-this-spec)
 
@@ -1096,7 +1096,71 @@ one interlock that needs a second key uses a self-describing name rather than a 
 
 ---
 
-## 14. Open questions — resolve these during hardware bring-up
+## 14. Open questions — mostly resolved on hardware, 2026-08-21
+
+**Bring-up happened.** A real unit — serial `81a0bcc3`, firmware `APP.05.00.00`, PID `0x800F` — was
+attached and driven by this tool for the first time. Ten of the sixteen questions below are now
+answered from measurement rather than inference, and they are marked **RESOLVED** with what was
+observed. Three of the answers corrected this document; one corrected the code.
+
+The single most important result is not in the list: **the protocol works.** Every frame this
+document describes round-tripped on the first attempt — the nibble-encoded MIDI framing, the
+big-endian scalars, the HIGH-before-LOW vlimit order, the inverted LED byte, the identity string
+layouts, the 90-byte PDO blob and its little-endian header, and the full capability scan including
+the serial-latch invariant. No decode had to be corrected after contact with hardware.
+
+What remains open needs either a second unit, a firmware image, or a deliberate bootloader
+excursion. The originals are kept below for provenance; nothing has been deleted.
+
+### Answered on hardware
+
+| # | Question | Measured answer |
+|---|---|---|
+| 1 | USB product ID | **`0x800F`** in application mode. The vendor's own udev rule had this right; it was dismissed here because it appeared nowhere in the app. Its `SUBSYSTEM=="hidraw"` is still wrong. |
+| 2 | Advertised MIDI port name | **`Werewolf VFLEX`**; ALSA card id `VFLEX`, node `/dev/snd/midiC2D0`. The `"vflex"` substring match works. Type is Legacy — no UMP. |
+| 3 | Descriptor layout | Three interfaces: `1.0` audio control (01/01), `1.1` **MIDIStreaming (01/03)** with **bulk** EP `0x02` OUT / `0x83` IN, 64-byte packets, and `1.2` **vendor class (0xFF)** with bulk EP `0x01`/`0x81`. Both driven by `snd-usb-audio` except 1.2, which is unbound. No interrupt endpoints, no UMP alt setting. |
+| 4 | `CMD_FLAG_SCRATCHPAD` (0x40) | **Validate-and-discard.** A scratchpad write of 6000 mV was acknowledged and echoed back (`tx 04 d2 17 70` → `rx 04 12 17 70`), yet `voltage get` still returned 5000. A scratchpad *read* returns the same value as a normal read. The flag makes a write not take effect. |
+| 8 | AUTHLOCK read layout | **The vendor client was right.** `tx 02 16` → `rx 04 16 16 00`: a two-byte payload of `[0x16, level]` — the command code echoed a second time, then the level. Reading `payload[1]` was never an off-by-one. Levels beyond 0 remain untested. |
+| 11 | ADC calibration | Offset and scale both read **0** on a factory unit, and `CMD_VMEASURE` still returns a sensible calibrated value (raw 437 counts → 5270 mV). Confirms the inference that firmware treats 0 as "use built-in calibration". The formula itself is still device-side and unknown. |
+| 13 | Does the device echo the flag bits? | **No — it clears them.** `tx 04 92 13 88` (write flag set) → `rx 04 12 13 88`. Masking the received command byte with `CmdCodeMask` is required, not merely defensive. |
+| 14 | Unsolicited frames? | **None.** Twelve seconds idle on a connected unit produced nothing. The device speaks only when spoken to. |
+| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe.** Failure rates over `info` (7 commands each): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**, each failure a response timeout. Writes at 1 ms: 0/30 failed, 0/30 wrong read-back. So the vendor's 20 ms is roughly 20× more conservative than needed and 1 ms is ~10× faster end to end (`info` 0.38 s → 0.04 s) — but the device does drop frames when pushed at full rate. Measured on one unit, one host; the default stays 20 ms until that is corroborated. |
+| — | `SelectedPDOID` semantics (§8) | **1-based USB-PD object position.** A unit targeting 5 V against a charger whose PDO 0 is the 5 V fixed supply reported `selected pdo: 1`. |
+
+### Corrections this produced
+
+- **§6.4's string-length table was wrong.** `CMD_CHIP_UUID` returns **16** bytes, not 8 (`rx 12 09 …`,
+  `1732abcd7fc0bcc1`). Harmless in practice — the decoder slices `bytes[2:frame[0]]` — but the
+  vendor client's own write guard would have refused a correct 16-character UUID, one more sign that
+  path was never exercised. Measured lengths: serial 8, chip uuid 16, hardware id 8
+  (`VFLEX...`), firmware version 12 (`APP.05.00.00`), mfg date 8 (`004apr26`).
+- **§10.1's bootloader assumption was wrong, and this one mattered.** The vendor-class 0xFF interface
+  is present *while the application is running* — it is interface 1.2 above, unbound, alongside MIDI.
+  This document assumed it appeared only after the jump. `PickBootloaderInterface` selects by class,
+  so it would have chosen that interface on a perfectly healthy unit and `firmware flash --recover`
+  would have streamed WRITE_CHUNK frames at a device that never entered the bootloader. The code now
+  refuses when a MIDIStreaming interface is present (`bootloader.InApplicationMode`), which is the
+  discriminator §10.1 does get right: a unit in the bootloader presents no MIDI interface.
+- **The LED table (§1.1) is confirmed at both ends.** Solid green on a PD charger that could supply
+  the configured voltage; and configuring 9 V while attached to a host port that cannot supply it
+  left the stored value at 9000 mV with `CMD_VMEASURE` still reading 5270 mV — the negotiation-failed
+  state.
+- **§4.4's permission split is confirmed empirically.** `/dev/snd/midiC2D0` carries a `uaccess` ACL
+  (`crw-rw----+`) with no rule installed, so the default rawmidi path needs no udev rule at all;
+  `/dev/bus/usb/005/017` is `crw-rw-r--` with no ACL, so `--transport usb` and every firmware
+  operation do need one.
+
+### Still open
+
+Questions **5** (commands 4–7, 13, 14), **6** (`CMD_ENCRYPT_MSG`), **7** (`CMD_IOS_HOST_MODE_FLAG`),
+**9** (`VTOLERANCE_SAG_PER_MA` units — it reads 0 on a factory unit, so nothing can be inferred about
+its scale), **10** (whether the 750 mV tolerance is symmetric — needs a variable load), **12** (the
+CRC algorithm — needs a firmware image) and **16** (bootloader re-enumeration — needs a deliberate
+excursion) are unchanged. Question 5's probes remain the ones to run last and with nothing attached.
+
+---
+
+The original text follows, unedited.
 
 These are genuinely undetermined, not merely unresearched. Each was chased to exhaustion across the
 web bundle, the APK (including a Hermes string-table parse), and the manual.

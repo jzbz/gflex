@@ -29,6 +29,15 @@ env:
   # Pinned rather than @latest: a new staticcheck release can add checks, and a
   # green tree turning red because a tool moved is a failure that teaches
   # nothing. Bump this deliberately.
+  #
+  # It is coupled to the Go version in go.mod, which is what setup-go installs
+  # above. staticcheck reads the compiler's export data, and a release only
+  # understands the Go it was built against or older: v0.7.0 handles Go 1.26 and
+  # fails on 1.27 with "export data version 4 is greater than maximum supported
+  # version 2" -- an alarming-looking error that says nothing about the code.
+  # (Observed locally 2026-08-21 when the host toolchain moved to 1.27 while
+  # go.mod still said 1.26.) So: bumping the go directive means bumping this
+  # too, in the same commit.
   STATICCHECK_VERSION: v0.7.0
 
 jobs:

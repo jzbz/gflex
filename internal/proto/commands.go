@@ -115,9 +115,19 @@ const (
 // The vendor client only consults this table on an unreachable write path, so
 // treat these as expectations rather than guarantees: decode using the frame's
 // own declared length.
+// Measured against a real unit (firmware APP.05.00.00, 2026-08-21): serial
+// "81a0bcc3" (8), chip uuid "1732abcd7fc0bcc1" (16), hardware id "VFLEX..." (8),
+// firmware "APP.05.00.00" (12), mfg date "004apr26" (8).
+//
+// CMD_CHIP_UUID is 16, not the 8 the vendor client's own table claims -- its
+// write guard would have refused a correct 16-character UUID, which is one more
+// sign that path was never exercised. Nothing here decodes by these lengths
+// (DecodeString takes bytes[2:frame[0]]), which is why the wrong value was
+// harmless; they are expectations for a caller that wants to sanity-check a
+// reply, and StringLen is the only reader.
 var stringLen = map[Cmd]int{
 	CmdSerialNumber:    8,
-	CmdChipUUID:        8,
+	CmdChipUUID:        16,
 	CmdHardwareID:      8,
 	CmdFirmwareVersion: 12,
 	CmdMfgDate:         8,

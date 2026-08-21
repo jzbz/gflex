@@ -597,6 +597,19 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 		dev.Close()
 		return nil, usbfs.Interface{}, fmt.Errorf("bootloader: reading descriptors of %s: %w", ref.Path, err)
 	}
+	// A unit still running its application also exposes a vendor-class interface
+	// (see InApplicationMode), so picking by class alone would select a healthy
+	// device and let a --recover flash write to it. Refuse unless the caller
+	// says otherwise; the jump path never trips this, because by the time it
+	// reconnects the MIDI interface is gone.
+	if !AllowApplicationMode && InApplicationMode(cfg) {
+		dev.Close()
+		return nil, usbfs.Interface{}, fmt.Errorf("%w: %s is running its application, not the bootloader "+
+			"(it still presents a MIDI interface). A unit in the bootloader blinks its LED slowly in "+
+			"white; put it there with `gflex firmware bootloader`, or flash without --recover and let "+
+			"the jump happen as part of the update", ErrApplicationMode, ref.Path)
+	}
+
 	iface, ok := PickBootloaderInterface(cfg)
 	if !ok {
 		dev.Close()
@@ -628,6 +641,46 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 		1, uint16(iface.Number), nil, controlTimeout)
 	return dev, iface, nil
 }
+
+// InApplicationMode reports whether cfg belongs to a unit that is running its
+// application rather than sitting in the bootloader.
+//
+// The signal is the MIDIStreaming interface (USB Audio class 0x01, subclass
+// 0x03). SPEC.md §10.1 records that a unit in bootloader mode presents no MIDI
+// interface at all, so its presence means the application is running.
+//
+// This exists because the obvious signal does NOT work: a real VFLEX
+// (APP.05.00.00, PID 0x800F, observed 2026-08-21) exposes its vendor-class
+// 0xFF interface with both bulk endpoints WHILE THE APPLICATION IS RUNNING --
+// interface 1.2, unbound, alongside the MIDI interface on 1.1. SPEC.md §10.1
+// had assumed that interface only appears after the jump, so
+// PickBootloaderInterface alone will happily select it on a perfectly healthy
+// unit and `firmware flash --recover` would then stream WRITE_CHUNK frames at
+// a device that never entered the bootloader.
+//
+// The check fails safe in both directions: MIDI present means refuse (correct
+// for an application-mode unit), MIDI absent means proceed (correct for a
+// bootloader). Should some future firmware keep MIDI alive in the bootloader,
+// this refuses a legitimate recovery rather than permitting a dangerous flash,
+// and the caller can override.
+func InApplicationMode(cfg *usbfs.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, i := range cfg.Interfaces {
+		if i.Class == usbAudioClass && i.SubClass == midiStreamingSubClass {
+			return true
+		}
+	}
+	return false
+}
+
+// The USB Audio class and its MIDIStreaming subclass, which together identify
+// the interface a VFLEX speaks the application protocol over.
+const (
+	usbAudioClass         uint8 = 0x01
+	midiStreamingSubClass uint8 = 0x03
+)
 
 // PickBootloaderInterface returns the first interface alt setting that is
 // vendor-class and has both an IN and an OUT endpoint, matching the vendor
