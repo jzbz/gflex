@@ -30,13 +30,17 @@ const readBufSize = 512
 // altogether: the node is opened O_NONBLOCK so the read parks in the netpoller,
 // and a zero-byte read from an os.File surfaces as io.EOF, never as (0, nil).
 //
-// It is not free when it does fire. The device does not pace what it sends:
-// SPEC.md §14 Q15's timings put a whole multi-message response inside a few
-// milliseconds, so an inbound byte can certainly be waiting sooner than 2 ms --
-// the outbound ByteDelay says nothing about the inbound direction. The cost is
-// bounded at one stall per response-arrival edge, which is noise against the
-// 20 ms default ByteDelay but worth revisiting if a low --byte-delay ever
-// becomes the default.
+// It is not free when it does fire, and it is no longer small next to the
+// pacing. The device does not pace what it sends: SPEC.md §14 Q15's timings put
+// a whole multi-message response inside a few milliseconds, so an inbound byte
+// can certainly be waiting sooner than 2 ms -- the outbound ByteDelay says
+// nothing about the inbound direction. With the default ByteDelay now 1 ms
+// (SPEC.md §14.15), 2 ms is larger than a whole outbound gap rather than noise
+// against it, so on usbmidi a quiet spell can cost more than the pacing does.
+// It is still bounded at one stall per response-arrival edge, and the real
+// bound is narrower than that: the branch cannot be reached at all on the
+// default rawmidi transport, for the reason above. Shrink it only alongside a
+// measurement of usbmidi's zero-length-IN behaviour, which nothing here has.
 const idleBackoff = 2 * time.Millisecond
 
 // defaultCloseGrace bounds how long Close waits for the reader goroutine to
@@ -79,8 +83,11 @@ type Framer struct {
 }
 
 // New returns a Framer over t. byteDelay is the pause inserted between outbound
-// MIDI messages; pass proto.ByteDelay (20 ms) to match the vendor client. Zero
-// disables pacing.
+// MIDI messages; pass proto.ByteDelay (1 ms) for the tool's default, or 20 ms
+// to match the vendor client exactly. Zero disables pacing entirely; the
+// closest thing SPEC.md §14.15 measured, 1 ns, dropped 2.5% and 3.3% of
+// commands on the two units, so the CLI refuses zero and only tests should ask
+// for it here.
 //
 // The caller keeps ownership of nothing: Close closes t.
 func New(t proto.Transport, byteDelay time.Duration) *Framer {

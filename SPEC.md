@@ -163,10 +163,19 @@ This is the protocol's 7-bit-safety mechanism. Both emitted data bytes are alway
 Timing: the reference client sleeps `midiPacketDelayMs = 20 ms` after the start marker and after
 each data byte, with **no** trailing delay after the end marker. A frame of N bytes therefore costs
 N+2 MIDI messages and (N+1) × 20 ms ≈ 100 ms for a 4-byte frame. The 20 ms is **defensive padding,
-not a firmware requirement** — a bisection on one unit ran 1 ms clean over 120 reads and 30 writes,
-while full rate dropped 2.5% of frames (measured, §14.15). Make it a `--byte-delay` flag defaulting
-to 20 ms anyway: n=1 on one host is not enough to move a default that costs nothing to keep, and the
-measurement says the floor is somewhere between "1 ms" and "none", not that there is no floor.
+not a firmware requirement** — bisections on two units each ran 1 ms clean over 120 `info`
+invocations, plus 30 writes on the first unit (writes were not re-run on the second), while full
+rate dropped 2.5% and 3.3% of frames (measured, §14.15).
+
+Make it a `--byte-delay` flag defaulting to **1 ms**. An earlier draft of this section kept the
+vendor's 20 ms on the grounds that n=1 on one host was not enough to move a default; the second unit
+measured on 2026-08-21 was the corroboration §14.15 asked for, and it retired that objection. 1 ms
+is also where lowering stops paying: 100 µs ran `info` in 0.043 s against 1 ms's 0.045 s, a
+difference inside the noise, because by then the wall time is the device's turnaround and not our
+pacing. So the floor is real, it sits somewhere between "1 ms" and "none", and the flag refuses
+`--byte-delay 0` (§11) rather than let anyone find it by accident. Both units carry firmware
+`APP.05.00.00` and manufacturing date `004apr26` and were driven from the same host, so this says
+nothing about a different firmware revision or a different USB controller.
 
 ### 3.2 ⚠ The Note-On velocity-0 hazard
 
@@ -968,8 +977,14 @@ gflex version
 ```
 
 Global flags: `--port <name|path>`, `--transport rawmidi|usb` (default `rawmidi`), `--json`,
-`--timeout` (default 5s), `--byte-delay` (default 20ms), `-v/--verbose` (hex TX/RX), `--dry-run`,
+`--timeout` (default 5s), `--byte-delay` (default 1ms), `-v/--verbose` (hex TX/RX), `--dry-run`,
 `-y/--yes`.
+
+`--byte-delay 0` is **refused**, for two reasons that happen to agree. A zero duration is
+indistinguishable from the flag being left unset, so honouring it would silently pace a caller who
+asked for no pacing at all; and near-zero pacing is the one setting §14.15 measured as lossy — 1 ns
+dropped 2.5% and 3.3% of responses on the two units tested, while 100 µs was no faster than the 1 ms
+default end to end. The error says that rather than naming a faster value to try.
 
 **There is no global `--force`.** An earlier draft of this section listed one alongside `--yes`,
 and it was dropped deliberately: `--force` already means something specific and narrow on
@@ -1169,8 +1184,8 @@ excursion. The originals are kept below for provenance; nothing has been deleted
 | 8 | AUTHLOCK read layout | **The vendor client was right.** `tx 02 16` → `rx 04 16 16 00`: a two-byte payload of `[0x16, level]` — the command code echoed a second time, then the level. Reading `payload[1]` was never an off-by-one. Levels beyond 0 remain untested. |
 | 11 | ADC calibration | Offset and scale both read **0** on a factory unit, and `CMD_VMEASURE` still returns a sensible calibrated value (raw 437 counts → 5270 mV). Confirms the inference that firmware treats 0 as "use built-in calibration". The formula itself is still device-side and unknown. |
 | 13 | Does the device echo the flag bits? | **No — it clears them.** `tx 04 92 13 88` (write flag set) → `rx 04 12 13 88`. Masking the received command byte with `CmdCodeMask` is required, not merely defensive. |
-| 14 | Unsolicited frames? | **None.** Twelve seconds idle on a connected unit produced nothing. The device speaks only when spoken to. |
-| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe.** Failure rates over plain `gflex info` (6 commands each — the count `internal/session/info_test.go` pins; 7 would be `info --all`, which adds the chip UUID): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**, each failure a response timeout. Writes at 1 ms: 0/30 failed, 0/30 wrong read-back. So the vendor's 20 ms is roughly 20× more conservative than needed and 1 ms is ~10× faster end to end (`info` 0.38 s → 0.04 s) — but the device does drop frames when pushed at full rate. Measured on one unit, one host; the default stays 20 ms until that is corroborated. |
+| 14 | Unsolicited frames? | **None.** Twelve seconds idle on a connected unit produced nothing. The device speaks only when spoken to. Repeated on a second unit (`58b4f621`, §14.15): twelve seconds idle, zero frames. |
+| 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe — and this is now corroborated on a second unit.** Failure rates over plain `gflex info` (6 commands each — the count `internal/session/info_test.go` pins; 7 would be `info --all`, which adds the chip UUID); every failure was a response timeout. *Unit 1* (`81a0bcc3`): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**; `info` end to end 0.38 s at 20 ms, 0.04 s at 1 ms; writes at 1 ms 0/30 failed, 0/30 wrong read-back. *Unit 2* (`58b4f621`, obtained 2026-08-21; same firmware `APP.05.00.00`, same mfg date `004apr26`, same host, rawmidi): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 4/120 (3.3%)**; `info` 0.391 s at 20 ms, 0.045 s at 1 ms, 0.043 s at 100 µs, 0.202 s at 1 ns. Writes were **not** re-tested on unit 2 — that needs permission to write to someone's device — so the write figures above are unit 1 only. **The default moved from 20 ms to 1 ms** (§3.1, §11, §17): 240 `info` runs across the two units with no failure, and going lower buys nothing measurable — 100 µs came in 0.002 s ahead of 1 ms, inside the noise, because the wall time is already the device's turnaround. 1 ns is where both units lose frames, which is why `--byte-delay 0` stays refused. Two units from one apparent batch on one host is what this question asked for and is materially stronger than n=1; it is still not evidence about another firmware revision or another USB controller. |
 | — | `SelectedPDOID` semantics (§8) | **1-based USB-PD object position.** A unit targeting 5 V against a charger whose PDO 0 is the 5 V fixed supply reported `selected pdo: 1`. |
 
 ### Corrections this produced
@@ -1407,6 +1422,7 @@ mechanism and there is nothing a test could hold still.
 | 9.5 | Candidates partitioned by requested voltage (`if V > 20`) | Any object whose decoded range covers the request is considered | An EPR AVS range routinely starts at 15 V. Partitioning hid it, so an 18 V request against a 140 W charger was answered "not achievable" — from a log that plainly covered it. |
 | 9.5 | Compatibility judged against a cloud record; `.enabled` ignored | Judged against the actual scan | The scan is ground truth and cannot disagree with the hardware in front of the user. Also sidesteps the vendor's `.amps`/`.enabled` inconsistency. |
 | 9.1 | A short PDO chunk is appended as-is | Rejected and retried | The blob is positionally decoded little-endian: appending a short chunk does not look corrupt, it looks like *a different power supply*. |
+| 3.1 | Every MIDI message paced by `midiPacketDelayMs = 20 ms` | **1 ms** by default, via `--byte-delay`; `0` refused (§11) | The 20 ms is the vendor's padding, not a firmware requirement. Two units ran 120 `info` invocations each at 1 ms with no failure, and 20 ms costs roughly 9× on every command — 0.38 s and 0.391 s per `info` against 0.04 s and 0.045 s (§14.15). What the extra 19 ms buys is not measured safety; it is spent on every command in the tool. Both units share firmware `APP.05.00.00`, mfg date `004apr26` and one host, so the sample is a batch, not the product — but a unit that needed more pacing would fail as a response timeout, which is visible and retryable, and the three settings that can damage a load (voltage, current, vlimit) verify by read-back. |
 | 3.3 | Malformed frames dropped silently; the command just times out | Reported through a drop hook, surfaced by `gflex monitor` | The spec itself says "Log it." It is also the evidence that would settle §14.13 and §14.14. |
 | 7 | 500 ms + 800 ms settle, then a ~25 s fixed backoff chain | No fixed settle; adaptive backoff against a ~10 s budget | The settle suits a long-lived app session; 1.3 s on every CLI invocation does not. The *persistence* is kept — without it a freshly plugged unit fails. A ready device pays nothing. |
 | 7 | `ensureCurrentLimitMa(5000)` on every connect | Not done | A CLI that silently rewrites your current limit during `voltage get` would be a bug, not parity. |
@@ -1414,13 +1430,19 @@ mechanism and there is nothing a test could hold still.
 | 8 | `device_data` never cleared on disconnect | **No cache at all**: `Session` holds no decoded device fields and every accessor issues a fresh read | Latent staleness bug; not worth reproducing. A one-shot CLI has nothing to cache across, so there is no invalidation path either — anyone adding a cache is adding invalidation with it, not inheriting one. |
 | 6.4 | Identity strings UTF-8-decoded over the whole frame, then sliced by *character* | `bytes[2:len]`, sanitised | The vendor's decode misaligns on any byte ≥ 0x80. |
 | 6.5 | No range validation of any kind | Full interlocks (§13) | The vendor writes whatever 16-bit value it is given. Ours is the only guard. |
-| 6.5 | "After a write, always issue an explicit read-back" — stated as universal | Read-back on `voltage`, `current` and `vlimit`; **not** on `led`, `authlock`, `tolerance` or `calibrate` | A read-back is a second round trip: a two-byte read frame is three MIDI messages and 3 × `--byte-delay` before the device answers, so at the 20 ms default it roughly doubles the cost of a one-setting write. It earns that on the three settings that can damage a load or lock a user out of their own envelope. It does not earn it on an LED preference, a lock level nothing yet reads, a tolerance term whose units are still unknown (§14.9), or a calibration pair the very next `gflex measure` will expose. Where a read-back is skipped, what is printed is the value that was *written*: it is never presented as a confirmation of what the device now holds. |
+| 6.5 | "After a write, always issue an explicit read-back" — stated as universal | Read-back on `voltage`, `current` and `vlimit`; **not** on `led`, `authlock`, `tolerance` or `calibrate` | A read-back is a second round trip: a two-byte read frame is three MIDI messages and 3 × `--byte-delay` before the device answers. Under the vendor's 20 ms that pacing alone was the cost, and it roughly doubled a one-setting write; at the 1 ms default (§3.1) the pacing is 3 ms and what is being spent is the round trip itself — `info` ran 6 commands in 0.045 s at 1 ms (§14.15), about 7.5 ms each — so a read-back still roughly doubles the write, for a different reason. It earns that on the three settings that can damage a load or lock a user out of their own envelope. It does not earn it on an LED preference, a lock level nothing yet reads, a tolerance term whose units are still unknown (§14.9), or a calibration pair the very next `gflex measure` will expose. Where a read-back is skipped, what is printed is the value that was *written*: it is never presented as a confirmation of what the device now holds. |
 | 8, 6.2 | `--json` field `led_disable_during_operation`, u8, inverted | `led_always_on`, bool, already un-inverted | §6.2 warns that the wire name gets read backwards; a JSON key meaning the opposite of what it says is that trap in machine-readable form. A consumer reading the vendor's name and honouring it would invert the setting. |
 | 3.4 | Fall back to the only MIDI port on the system, whatever it is | Fallback refused when discovery has positively identified the port as some **other** vendor's | Discovery walks sysfs for every port, so a non-zero vendor ID that is not Tundra Labs' is knowledge, not ignorance. The fallback exists for "the tool cannot tell what this is", which is not the same as "the tool can tell, and it is a synthesizer" — and taking it would start writing protocol frames at that synthesizer. `--port` still says "yes, that one, I mean it". |
 | 10.3 | `--fetch` over whatever URL it is given; the vendor client has no scheme rule | `ws://` and `http://` refused; TLS required, or the explicit `ws+insecure://` downgrade | The image and the CRC it is checked against arrive in the same document, so a cleartext fetch authenticates neither. The downgrade is spelled out in full for the same reason as `--ignore-device-limits` (§11): a second key nobody types out of habit, left in the shell history of the run it applied to. |
 
 ### Resolved since this document was written
 
+- **§3.1's 20 ms pacing default is settled** (§14.15). §14.15 named its own precondition — the
+  measurement repeated on a second unit — and a second unit was driven on 2026-08-21. Both were
+  clean over 120 `info` invocations at 1 ms and both dropped frames at 1 ns, so the default moved
+  from the vendor's 20 ms to 1 ms and `--byte-delay 0` stays refused. The two units share a firmware
+  revision, a manufacturing date and a host, so what is settled is the default, not the question of
+  how another batch or another USB controller behaves.
 - **§9.4's SPR AVS field-order caveat is settled.** The 15 V/20 V assignment *does* match the
   published USB-PD 3.2 layout — bits 19:10 bound the 15–20 V band, bits 9:0 the 9–15 V band. The
   "may be swapped" warning no longer applies; the band-aware decode depends on this ordering.

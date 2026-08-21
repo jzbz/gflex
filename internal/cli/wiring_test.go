@@ -58,8 +58,10 @@ func newFakeTree(t *testing.T, dev *fake.Device) *fakeTree {
 }
 
 // run executes one invocation, as `gflex` would. --byte-delay is pinned to the
-// smallest positive value so a test does not pay the vendor's 20 ms per MIDI
-// message (SPEC.md §3.1); zero would be read as "use the default" (SPEC.md §11).
+// smallest positive value so a test pays no pacing per MIDI message (SPEC.md
+// §3.1) -- not the 1 ms default and not the 20 ms the vendor client uses.
+// Zero would be read as "use the default" (SPEC.md §11), and the CLI refuses it
+// for exactly that reason.
 func (tr *fakeTree) run(t *testing.T, args ...string) error {
 	t.Helper()
 	root := NewRootCommand(tr.app)

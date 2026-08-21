@@ -481,3 +481,26 @@ func TestRootWithNoArgumentsPrintsHelp(t *testing.T) {
 		}
 	}
 }
+
+// The default pacing is a measured value, not a taste: SPEC.md §14.15 records
+// two units at 0 failures in 120 six-command trials each at 1 ms, and 2.5% and
+// 3.3% loss at 1 ns. Nothing else in the tree asserts what the flag actually
+// defaults to, so a stray edit to proto.ByteDelay -- or a literal typed into the
+// flag registration instead of the constant -- would change the pacing of every
+// command in the tool with no test to notice.
+func TestByteDelayDefaultTracksTheMeasuredConstant(t *testing.T) {
+	root := NewRootCommand(newApp())
+	fl := root.PersistentFlags().Lookup("byte-delay")
+	if fl == nil {
+		t.Fatal("no --byte-delay flag")
+	}
+	if want := proto.ByteDelay.String(); fl.DefValue != want {
+		t.Errorf("--byte-delay default %q, want %q (proto.ByteDelay)", fl.DefValue, want)
+	}
+	// The measurement says 1 ms; a change to the constant should be a decision
+	// with new numbers behind it, not a side effect of editing something else.
+	if proto.ByteDelay != time.Millisecond {
+		t.Errorf("proto.ByteDelay = %s, want 1ms; SPEC.md §14.15 is the record that justifies it, "+
+			"so update that section in the same change", proto.ByteDelay)
+	}
+}

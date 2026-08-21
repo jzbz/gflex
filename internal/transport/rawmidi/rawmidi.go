@@ -35,8 +35,19 @@ import (
 
 // idlePoll is the retry interval used only on the degraded path where the
 // kernel refused to register the descriptor with Go's netpoller (see port).
-// It is an order of magnitude below the protocol's 20 ms inter-message delay,
-// so it cannot become the bottleneck.
+//
+// It used to be justified as "an order of magnitude below the protocol's 20 ms
+// inter-message delay, so it cannot become the bottleneck". That stopped being
+// true when the default pacing moved to 1 ms (SPEC.md §14.15): 2 ms is now twice
+// a whole outbound gap, not a tenth of one, so on this path a quiet spell can
+// cost more than the pacing does.
+//
+// It is left at 2 ms anyway, because the path it guards is the one place that
+// cannot be measured from here. It runs only when the netpoller registration
+// failed, which no shipped configuration has produced -- the healthy path parks
+// in the netpoller and never polls at all -- so there is no observation to tune
+// against, and a smaller value would trade unmeasured latency for a spin on a
+// descriptor that is already misbehaving. Measure that path before shrinking it.
 const idlePoll = 2 * time.Millisecond
 
 // port is an open rawmidi device node.

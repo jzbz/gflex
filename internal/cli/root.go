@@ -171,8 +171,8 @@ func NewRootCommand(app *App) *cobra.Command {
 	pf.BoolVar(&app.AsJSON, "json", false, "emit a single JSON object on stdout; diagnostics go to stderr")
 	pf.DurationVar(&app.Timeout, "timeout", proto.DefaultTimeout, "per-command response timeout")
 	pf.DurationVar(&app.ByteDelay, "byte-delay", proto.ByteDelay,
-		"delay between MIDI messages; the vendor app's 20ms is the default, and one unit measured "+
-			"clean at 1ms (SPEC.md §14.15)")
+		"delay between MIDI messages; 1ms by default, measured clean on two units, against the "+
+			"vendor app's 20ms (SPEC.md §14.15)")
 	pf.BoolVarP(&app.Verbose, "verbose", "v", false, "trace TX/RX frames as hex on stderr")
 	pf.BoolVar(&app.DryRun, "dry-run", false, "print the frames and MIDI bytes that would be sent, and send nothing")
 	pf.BoolVarP(&app.Yes, "yes", "y", false, "assume yes for every safety confirmation (SPEC.md §13)")
@@ -261,19 +261,22 @@ func (a *App) applyEnv(cmd *cobra.Command) error {
 		return codedf(ExitUsage, "--byte-delay cannot be negative, got %s", a.ByteDelay)
 	}
 	if a.ByteDelay == 0 {
-		// session.Options treats a zero ByteDelay as "unset" and substitutes the
-		// vendor's 20 ms, so accepting 0 here would silently do the opposite of
-		// what the user asked. The bisection recorded in SPEC.md §14.15 makes
-		// this a setting people will genuinely want to drive down -- 1 ms and
-		// 100 µs were clean over 120 reads and 30 writes, and `info` went from
-		// 0.38 s to 0.04 s -- so point them at the fastest value that was
-		// actually clean rather than at the fastest value there is. 1 ns was
-		// the one setting in that bisection that dropped frames, so naming it
-		// here as "as fast as possible" would steer the user at the only
-		// measured-lossy pace in the table.
+		// session.Options treats a zero ByteDelay as "unset" and substitutes
+		// proto.ByteDelay, so accepting 0 here would silently pace a user who
+		// asked for no pacing at all. Refusing is the honest answer for a
+		// second reason: near-zero pacing is the one thing SPEC.md §14.15
+		// measured as lossy. 1 ns dropped 2.5% and 3.3% of commands on the two
+		// units, while 1 ms and 100 µs were clean over 120 trials each on both
+		// (and 30 writes on the first unit, the only one written to). Since the
+		// default is now that clean 1 ms, someone reaching for 0 wants to go faster
+		// still, and the measurement says there is nothing there: 100 µs turned
+		// in 0.043 s per `info` against 1 ms's 0.045 s, inside the noise,
+		// because the wall time is already the device's turnaround. So say what
+		// the number would do rather than naming a faster one to try.
 		return codedf(ExitUsage, "--byte-delay 0 is indistinguishable from unset and would be "+
-			"treated as the %s default; use a small positive value such as 1ms, which was measured "+
-			"clean -- 1ns dropped about 2.5%% of responses (SPEC.md §14.15)",
+			"treated as the %s default; going faster is not worth asking for anyway -- 1ns, the "+
+			"closest pacing measured, dropped 2.5%% and 3.3%% of responses on the two units "+
+			"tested, and 100µs was no faster than the 1ms default end to end (SPEC.md §14.15)",
 			proto.ByteDelay)
 	}
 	return nil

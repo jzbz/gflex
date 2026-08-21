@@ -335,6 +335,11 @@ Global flags: `--port`, `--transport rawmidi|usb`, `--json`, `--timeout`, `--byt
 environment counterpart on purpose: both decide whether the device gets written to, and a
 `GFLEX_YES` left in a shell profile would pre-answer every safety confirmation for months.
 
+`--byte-delay` paces successive messages, and defaults to **1 ms** rather than the 20 ms the
+vendor's app uses — the measurement behind that is in
+[Status and limitations](#status-and-limitations). `--byte-delay 0` is refused: zero pacing dropped
+frames on both units measured, so it is not an option the flag will accept.
+
 There is no global `--force`. `--force` means one specific thing, on one command:
 `firmware flash --force` flashes an image that carries no CRC. A persistent flag of the same name
 would shadow that on the most dangerous command in the tool.
@@ -416,7 +421,10 @@ the rule and add yourself to that group.
 **Timeouts** (exit 5). The protocol has no NACK, so any lost frame becomes a timeout. A single one
 is unremarkable; repeated ones are worth investigating with `gflex monitor` in one terminal and the
 failing command with `-v` in another. If a freshly plugged unit times out, that's expected briefly —
-voltage reads already retry for ~10 s.
+voltage reads already retry for ~10 s. Pacing is worth ruling out on hardware unlike what has been
+measured: the 1 ms default was verified on two units of one firmware revision on one host, so
+`--byte-delay 20ms` puts back the vendor's conservative pacing if a different unit or a different
+USB controller proves flakier.
 
 **The voltage didn't change.** Check `gflex voltage get`, then the LED. Solid green means it
 negotiated and is in tolerance; slow-blinking red means the *source* can't supply what you asked for
@@ -461,11 +469,12 @@ nineteen places, mostly because the vendor's behaviour is unsafe — those are c
 
 ## Status and limitations
 
-**Verified on hardware, 2026-08-21.** A real unit — firmware `APP.05.00.00`, PID `0x800F` — was
-driven by this tool for the first time, and the protocol worked on the first attempt: the
-nibble-encoded MIDI framing, the big-endian scalars, the identity strings, the inverted LED byte,
-the HIGH-before-LOW voltage limits, and the full PD capability scan including its serial-latch
-invariant. No decode had to be corrected afterwards.
+**Verified on hardware, 2026-08-21.** Two real units — serials `81a0bcc3` and `58b4f621`, both
+firmware `APP.05.00.00`, PID `0x800F` — have been driven by this tool. On the first, the protocol
+worked on the first attempt: the nibble-encoded MIDI framing, the big-endian scalars, the identity
+strings, the inverted LED byte, the HIGH-before-LOW voltage limits, and the full PD capability scan
+including its serial-latch invariant. No decode had to be corrected afterwards. The second was
+brought up to settle the pacing question below, and matched the first on everything re-measured.
 
 Nine of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
 are now answered from measurement — plus one the original list did not contain — and three of the
@@ -476,9 +485,18 @@ answers corrected the documentation. Highlights:
   required rather than merely defensive.
 - The **scratchpad flag makes a write validate-and-discard**: acknowledged, echoed back, never
   committed.
-- The vendor's **20 ms inter-message delay is ~20× more conservative than necessary** — 1 ms was
-  clean across 120 reads and 30 writes — but zero delay is *not* safe (2.5% frame loss). The default
-  stays 20 ms until that is corroborated on a second unit; `--byte-delay 1ms` is ~10× faster.
+- **The inter-message delay now defaults to 1 ms, down from the vendor's 20 ms.** The second unit
+  reproduced the first unit's pacing measurements, which is exactly what
+  [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21) question 15 named
+  as the precondition for changing the default. 1 ms was clean on both: 120 trials each, 240 in
+  total, 0 failures, and every trial is six command round trips. End to end, `info` goes from 0.38 s
+  to 0.04 s on unit 1 and from 0.391 s to 0.045 s on unit 2. Going below 1 ms buys nothing
+  measurable — 100 µs timed 0.043 s against 1 ms's 0.045 s, a 4% difference that is inside the
+  noise, because at 1 ms the wall time is already the device's own turnaround rather than our
+  pacing. What lowering it does buy is risk: at 1 ns the two units lost 2.5% and 3.3% of commands,
+  which is why `--byte-delay 0` is still refused outright.
+- The **device sends nothing unsolicited** — a 12 s idle capture on the second unit recorded 0
+  frames, matching the first and corroborating §14 question 14 as well.
 - The **vendor-class interface is present while the application is running**, which the spec had not
   anticipated. `firmware flash --recover` now refuses a unit that still presents a MIDI interface.
 
@@ -486,8 +504,19 @@ Still unverified: firmware flashing end to end (no image to hand), the auth-lock
 the tolerance-sag units, and the six commands that are dead code in the vendor's app. Those, and the
 CRC algorithm, are the remaining §14 entries.
 
-Reports from real hardware are still the most useful contribution — especially from a *second* unit,
-since every measurement above is n=1 on one host.
+**What two units do and do not establish.** Both run firmware `APP.05.00.00` and carry manufacturing
+date `004apr26`, so they are plausibly from a single production batch, and both were measured on the
+same host. That is materially stronger than n=1 and it is what §14 asked for — but it is not
+evidence about a different firmware revision or a different USB controller, and nothing above should
+be read as such. Writes were re-tested only on unit 1 (0/30 failed, 0/30 read
+back wrong at 1 ms); re-testing writes on unit 2 would mean writing to someone else's device. What
+makes 1 ms a reasonable default rather than a gamble is the shape of the failure: too little pacing
+surfaces as a response timeout, which is visible and retryable, not as a silent wrong write — and
+the paths that can damage a load, `voltage`, `current` and `vlimit`, all verify by read-back.
+
+Reports from real hardware are still the most useful contribution — especially from a unit on a
+different firmware revision, a different batch, or a different USB controller, since that is where
+the pacing default is untested.
 
 ---
 

@@ -79,11 +79,13 @@ func PermanentErr(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-// Options configures a Session. The zero value is valid and selects the vendor
-// application's own defaults.
+// Options configures a Session. The zero value is valid and selects this
+// tool's defaults, which are the vendor application's everywhere except
+// ByteDelay.
 type Options struct {
 	// ByteDelay is the pause the framer inserts between MIDI messages.
-	// Defaults to proto.ByteDelay (20 ms).
+	// Defaults to proto.ByteDelay (1 ms; the vendor app's own value is 20 ms,
+	// see SPEC.md §14.15 for the measurement behind the difference).
 	ByteDelay time.Duration
 	// Timeout is the per-command response timeout. Defaults to
 	// proto.DefaultTimeout (5 s).

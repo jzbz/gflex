@@ -32,8 +32,9 @@ import (
 //     by fake's own tests.
 
 // newTestSession wires a Session to a fresh, silent fake.Device. ByteDelay is
-// set to a single nanosecond so the suite does not pay the 20 ms per MIDI
-// message the vendor client uses on real hardware.
+// set to a single nanosecond so the suite pays no pacing per MIDI message --
+// neither the 1 ms default nor the 20 ms the vendor client uses on real
+// hardware. A fake device needs none of it: the pacing exists for the wire.
 func newTestSession(t *testing.T, opts Options) (*Session, *fake.Device) {
 	t.Helper()
 	d := fake.New()

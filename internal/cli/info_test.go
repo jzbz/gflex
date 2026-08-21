@@ -12,8 +12,8 @@ import (
 )
 
 // newFakeSession builds a session over a healthy in-memory VFLEX, paced as fast
-// as the framer allows so a test does not pay the vendor's 20 ms per MIDI
-// message (SPEC.md §3.1).
+// as the framer allows so a test pays no per-message delay at all (SPEC.md
+// §3.1) -- neither the 1 ms default nor the vendor's 20 ms.
 func newFakeSession(t *testing.T, dev *fake.Device) *session.Session {
 	t.Helper()
 	s := session.New(dev.Transport(), session.Options{

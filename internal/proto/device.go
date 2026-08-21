@@ -22,7 +22,8 @@ const (
 	PortNameMatch = "vflex"
 )
 
-// Timing defaults, matching the vendor application.
+// Timing defaults. The timeouts match the vendor application; ByteDelay
+// deliberately does not, for the measured reason recorded on it.
 const (
 	// DefaultTimeout is the response timeout for an ordinary command.
 	DefaultTimeout = 5 * time.Second
@@ -32,12 +33,31 @@ const (
 	BootloaderACKTimeout = 15 * time.Second
 	// VerifyTimeout is the timeout for a firmware CRC verification.
 	VerifyTimeout = 120 * time.Second
-	// ByteDelay is the inter-message delay the vendor app applies when
-	// transmitting MIDI. The device does not require anything like it: on the
-	// one unit measured (SPEC.md §14.15), 1 ms and 100 us were both clean over
-	// 120 reads while 1 ns lost 2.5% of frames to response timeouts. The
-	// vendor's 20 ms stays the default until a second unit corroborates that.
-	ByteDelay = 20 * time.Millisecond
+	// ByteDelay is the inter-message delay applied when transmitting MIDI. The
+	// vendor app uses 20 ms; this is 1 ms, because the device does not require
+	// anything like the vendor's pacing and the corroboration SPEC.md §14.15
+	// asked for arrived. Two units (serials 81a0bcc3 and 58b4f621, both
+	// firmware APP.05.00.00) were each driven 120 trials of six command round
+	// trips at 1 ms and at 100 us with no failures, while 1 ns lost 2.5% and
+	// 3.3% of commands to response timeouts. `info` end to end went from 0.38 s
+	// to 0.04 s on the first unit and 0.391 s to 0.045 s on the second.
+	//
+	// 1 ms rather than something smaller: 100 us measured 0.043 s per `info`
+	// against 1 ms's 0.045 s, a 4% difference inside the noise, because at
+	// 1 ms the wall time is already the device's own turnaround rather than our
+	// pacing. Going lower buys nothing measurable and only moves closer to the
+	// 1 ns setting where both units drop frames, which is why --byte-delay 0 is
+	// still refused.
+	//
+	// The sample's limits: both units carry manufacturing date 004apr26 and the
+	// same firmware, so they are plausibly one production batch, and both were
+	// measured on one host. That is what §14 asked for and materially stronger
+	// than n=1, but it says nothing about another firmware revision or another
+	// USB controller. It is a reasonable default rather than a gamble because
+	// the failure mode here is a response timeout -- visible and retryable --
+	// not a silent wrong write: every path that can damage a load (voltage,
+	// current, vlimit) verifies by read-back.
+	ByteDelay = 1 * time.Millisecond
 )
 
 // DeviceInfo is everything the protocol can tell us about a connected unit.

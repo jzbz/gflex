@@ -94,7 +94,7 @@ func newReplaySession(t *testing.T, dev *fake.Device) *session.Session {
 
 // countDeviceReads counts the read frames for cmd that actually reached the
 // device. Not what was printed: how many times the command asked, which is what
-// a protocol charging 20 ms per message (SPEC.md §3.1) bills for.
+// a protocol that charges --byte-delay per message (SPEC.md §3.1) bills for.
 func countDeviceReads(t *testing.T, dev *fake.Device, cmd proto.Cmd) int {
 	t.Helper()
 	n := 0
@@ -127,8 +127,8 @@ func containsLine(lines []string, sub string) bool {
 // TestFirmwareVersionAsksTheDeviceOnce pins the single read. The whole body of
 // this command is one CMD_FIRMWARE_VERSION exchange, and it used to issue two:
 // once to print the string, and again inside Session.FirmwareAtLeast, whose
-// first act is another read. At the vendor's 20 ms per message (SPEC.md §3.1)
-// that doubled the command's device time, and against a unit that has stopped
+// first act is another read. At any per-message pacing (SPEC.md §3.1) that
+// doubled the command's device time, and against a unit that has stopped
 // answering it doubled the wait to two full --timeout periods. --dry-run has
 // always advertised the one-frame shape; this makes the live path agree.
 //
