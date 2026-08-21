@@ -535,8 +535,22 @@ geometry: 320-byte pages of 8×40, not the 512 assumed for a raw `.bin`. Note al
 returned `APP.05.00.00` for a unit already running it — it serves the current image for a serial, so
 a fetch is not by itself an update.
 
-Still unverified: firmware flashing end to end (an image is now to hand, but no unit has been
-flashed), the auth-lock levels beyond 0,
+**Firmware flashing is verified end to end.** Unit `58b4f621` was flashed on 2026-08-21 with the
+image the vendor service holds for it: the jump to the bootloader, the re-enumeration, the
+vendor-class interface opening inside the 8 s retry window, the serial matching across the
+excursion, 165 pages of 320 bytes streamed in acknowledged mode, the device's own CRC coming back
+`0x30` as the image declared, the jump back to the application, and every setting replayed. A field
+by field comparison before and after found no drift at all.
+
+That also answers [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
+question 16, the last one a single unit could settle, and it independently validates the payload
+parsing above: the CRC is computed by the device over what it was actually given, so an image
+assembled wrongly from the vendor's chunk map would not have matched.
+
+Note what was flashed was the same version already installed — the service serves a unit's current
+image, so this exercised the path rather than delivering an update.
+
+Still unverified: the auth-lock levels beyond 0, the auth-lock levels beyond 0,
 the tolerance-sag units, and the six commands that are dead code in the vendor's app. Those, and the
 CRC algorithm, are the remaining §14 entries.
 
