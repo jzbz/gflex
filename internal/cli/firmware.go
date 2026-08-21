@@ -430,9 +430,12 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 	// document, so a cleartext fetch authenticates neither (SPEC.md §10.3).
 	// Someone pointing this at a lab endpoint should learn the spelling of the
 	// downgrade before the refusal, not from it.
+	// The back-quoted word is the value placeholder cobra prints, matching the
+	// same flag on `firmware fetch`; without it this one rendered as `--ws-url
+	// string` while its sibling rendered `--ws-url url`.
 	fl.StringVar(&wsURL, "ws-url", bootloader.DefaultWSURL,
-		"WebSocket endpoint used by --fetch; must be wss:// or https:// -- a cleartext endpoint is "+
-			"refused unless its URL says ws+insecure:// in full")
+		"WebSocket endpoint `url` used by --fetch; must be wss:// or https:// -- a cleartext "+
+			"endpoint is refused unless its URL says ws+insecure:// in full")
 	// --timeout is the per-command response timeout for the MIDI protocol and
 	// has no bearing on an HTTP/WebSocket download; using it here bounded a
 	// whole firmware download by 5 s. The budget SPEC.md §10.3 records for the
