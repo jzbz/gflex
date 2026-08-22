@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -554,23 +555,33 @@ func (t *transport) Close() error {
 // failure.
 //
 // usbfs.ErrTimeout is the documented sentinel and the raw ETIMEDOUT is what it
-// unwraps to, but both are checked, along with a context deadline (usbfs
-// refuses to submit a transfer whose deadline has already passed) and, as a
-// last resort, the error text. Misreading a genuine failure as a timeout would
-// turn a dead device into a silent stall, so nothing broader is matched.
+// unwraps to; usbfs.Error.Unwrap returns both, so a real transfer timeout
+// matches twice over before anything else is tried. A context deadline is
+// checked too, since usbfs refuses to submit a transfer whose deadline has
+// already passed, and finally the net/os Timeout() shape, which is a type
+// assertion rather than a string.
+//
+// Deliberately NOT the error text. This used to end in a
+// strings.Contains(s, "timeout") fallback, which is the broadest possible match
+// and therefore the exact opposite of what the sentence above promises: a
+// genuine transport failure whose message merely mentions a timeout would be
+// read as "device quiet", ReadMIDI would return (0, nil), and the framer would
+// keep waiting until the session command died at its own deadline reporting a
+// timeout instead of the real fault. Misreading a dead device as a silent stall
+// is the failure direction that matters here, and text matching is what causes
+// it. The sibling classifier in internal/cli/exit.go removed the identical
+// branch for the same reason and records the argument at length; the two
+// implement one concept and must not drift apart again.
 func isTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, usbfs.ErrTimeout) ||
 		errors.Is(err, syscall.ETIMEDOUT) ||
-		errors.Is(err, context.DeadlineExceeded) {
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
 	var te interface{ Timeout() bool }
-	if errors.As(err, &te) && te.Timeout() {
-		return true
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "timed out") || strings.Contains(s, "timeout")
+	return errors.As(err, &te) && te.Timeout()
 }

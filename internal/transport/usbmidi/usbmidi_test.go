@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -237,6 +238,14 @@ func TestBufSize(t *testing.T) {
 }
 
 // Every shape a timeout can arrive in must be recognised, and nothing else may
+// timeoutShaped reports itself the way net.Error and the os poller do: a method,
+// not a message. That shape is what replaced the text match, so the test needs
+// one that carries no timeout wording at all.
+type timeoutShaped struct{}
+
+func (timeoutShaped) Error() string { return "operation did not finish" }
+func (timeoutShaped) Timeout() bool { return true }
+
 // be, or a dead device would look like an idle one.
 func TestIsTimeout(t *testing.T) {
 	timeouts := []error{
@@ -246,8 +255,8 @@ func TestIsTimeout(t *testing.T) {
 		fmt.Errorf("usbfs: transfer: %w", syscall.ETIMEDOUT),
 		context.DeadlineExceeded,
 		fmt.Errorf("usbfs: %w", context.DeadlineExceeded),
-		errors.New("usbfs: bulk transfer timed out"),
-		errors.New("usbfs: timeout waiting for URB"),
+		os.ErrDeadlineExceeded,
+		timeoutShaped{},
 	}
 	for _, err := range timeouts {
 		if !isTimeout(err) {
@@ -263,6 +272,16 @@ func TestIsTimeout(t *testing.T) {
 		fmt.Errorf("usbfs: submit urb: %w", syscall.EPIPE),
 		errors.New("usbfs: device disconnected"),
 		context.Canceled,
+		// These two carry no sentinel, no errno and no Timeout() method: the
+		// only thing that ever made them look like timeouts was their text.
+		// They live here rather than above because matching on text is the
+		// broadest possible rule, and getting it wrong in this direction is the
+		// expensive one -- a genuine transport failure read as "device quiet"
+		// leaves the framer waiting and reports a timeout instead of the fault
+		// that actually happened. internal/cli/exit.go dropped the identical
+		// branch for the same reason. Re-adding it fails these two rows.
+		errors.New("usbfs: bulk transfer timed out"),
+		errors.New("usbfs: timeout waiting for URB"),
 	}
 	for _, err := range notTimeouts {
 		if isTimeout(err) {
