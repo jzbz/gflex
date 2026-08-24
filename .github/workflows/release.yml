@@ -197,8 +197,13 @@ jobs:
           Static Linux binaries. They are cgo-free and depend on nothing at runtime -- no shared
           libraries, no Go toolchain, no browser.
 
-              sha256sum -c SHA256SUMS
+              gpg --verify SHA256SUMS.asc SHA256SUMS
+              sha256sum --ignore-missing -c SHA256SUMS
               install -m 0755 gflex-$VERSION-linux-amd64 ~/.local/bin/gflex
+
+          SHA256SUMS.asc is signed by hand once this workflow has published, because the signing key
+          never goes near CI; the README's "Verifying a download" says where to get that key and
+          which fingerprint it has to be.
 
           The USB transport and every firmware operation need a udev rule; run **gflex install-udev**
           or see the README's Install section.

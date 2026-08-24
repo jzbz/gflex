@@ -158,19 +158,51 @@ udev rule.
 ### Download a binary
 
 Every release attaches Linux binaries for **amd64** and **arm64**, built and checked on the
-architecture they target, plus a `SHA256SUMS` file listing both:
-[github.com/jzbz/gflex/releases](https://github.com/jzbz/gflex/releases).
+architecture they target, plus a `SHA256SUMS` file listing both and a `SHA256SUMS.asc` signing that
+list: [github.com/jzbz/gflex/releases](https://github.com/jzbz/gflex/releases).
 
-`uname -m` says which one you want — `x86_64` is amd64, `aarch64` is arm64. Download it and
-`SHA256SUMS` alongside it, then:
+`uname -m` says which one you want — `x86_64` is amd64, `aarch64` is arm64. Download it and both
+checksum files alongside it, then:
 
 ```bash
-sha256sum --ignore-missing -c SHA256SUMS
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum --ignore-missing -c SHA256SUMS
 install -m 0755 gflex-*-linux-amd64 ~/.local/bin/gflex
 gflex version
 ```
 
-(`--ignore-missing` because the file lists both architectures and you have one of them.)
+(`--ignore-missing` because the file lists both architectures and you have one of them.) What
+`gpg --verify` has to say for that to mean anything is [below](#verifying-a-download).
+
+### Verifying a download
+
+Fetch the signing key once, from GitHub:
+
+```bash
+curl -sL https://github.com/jzbz.gpg | gpg --import
+```
+
+or from a keyserver, which is the better of the two — it does not come from the same host as the
+release:
+
+```bash
+gpg --locate-keys jz@jz.bz
+```
+
+Either way it is the fingerprint that is trusted, not where the key came from. `gpg --verify` has to
+report a *Good signature* from `252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`; any other key,
+or none at all, and the checksums it vouches for mean nothing.
+
+A freshly imported key also draws *"WARNING: This key is not certified with a trusted signature"*.
+That is expected and is not a failed check: it says the key has no web-of-trust path from anything
+you already trust, which a key you just fetched never does. The signature is still good. Compare the
+fingerprint gpg prints against the one above and move on, or sign the key locally
+(`gpg --lsign-key jz@jz.bz`) to silence it on later releases.
+
+The order is the whole point. `SHA256SUMS` ships from the same release as the binaries it describes,
+so on its own it catches a truncated download and nothing else — anyone who could replace a binary
+could replace the list beside it just as easily. The signature is what turns it into a check, and it
+is made by hand after the release workflow has published: the signing key never goes near CI, so a
+compromised workflow can publish a binary but cannot sign for one.
 
 ### Install with Go
 
