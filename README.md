@@ -170,12 +170,13 @@ install -m 0755 gflex-*-linux-amd64 ~/.local/bin/gflex
 gflex version
 ```
 
-(`--ignore-missing` because the file lists both architectures and you have one of them.) What
-`gpg --verify` has to say for that to mean anything is [below](#verifying-a-download).
+[Verifying a download](#verifying-a-download) below is what makes that first line mean anything:
+where the signing key comes from, and which fingerprint it has to be.
 
 ### Verifying a download
 
-Fetch the signing key once, from GitHub:
+A [release](https://github.com/jzbz/gflex/releases) carries the two static binaries, a `SHA256SUMS`
+listing both, and a `SHA256SUMS.asc` signing that list. Fetch the signing key once, from GitHub:
 
 ```bash
 curl -sL https://github.com/jzbz.gpg | gpg --import
@@ -188,9 +189,17 @@ release:
 gpg --locate-keys jz@jz.bz
 ```
 
-Either way it is the fingerprint that is trusted, not where the key came from. `gpg --verify` has to
-report a *Good signature* from `252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`; any other key,
-or none at all, and the checksums it vouches for mean nothing.
+Either way the fingerprint below is what to trust, not where you got it. Then check the signature
+before the files:
+
+```bash
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum --ignore-missing -c SHA256SUMS
+```
+
+`gpg --verify` has to report a *Good signature* from
+`252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`; any other key, or none, and the rest is
+meaningless. `--ignore-missing` checks whichever architecture you actually downloaded and stays
+quiet about the other.
 
 A freshly imported key also draws *"WARNING: This key is not certified with a trusted signature"*.
 That is expected and is not a failed check: it says the key has no web-of-trust path from anything
@@ -198,11 +207,16 @@ you already trust, which a key you just fetched never does. The signature is sti
 fingerprint gpg prints against the one above and move on, or sign the key locally
 (`gpg --lsign-key jz@jz.bz`) to silence it on later releases.
 
-The order is the whole point. `SHA256SUMS` ships from the same release as the binaries it describes,
-so on its own it catches a truncated download and nothing else — anyone who could replace a binary
-could replace the list beside it just as easily. The signature is what turns it into a check, and it
-is made by hand after the release workflow has published: the signing key never goes near CI, so a
-compromised workflow can publish a binary but cannot sign for one.
+The order is the whole point. `SHA256SUMS` sits in the same release as the files it describes, so on
+its own it catches a truncated download and nothing else — anyone able to replace a binary could
+replace the list beside it just as easily. The signature is what turns it into a check, and it is
+made by hand after the release workflow has published: the key never goes near CI, so a compromised
+workflow can publish a binary but cannot sign for one.
+
+None of this is the [CRC a firmware image carries](#firmware-update). That one is the vendor's, it
+travels in the same document as the image it describes, and the device recomputes it over whatever
+it was actually written — it answers whether the flash took the bytes intact, not who published
+them.
 
 ### Install with Go
 
