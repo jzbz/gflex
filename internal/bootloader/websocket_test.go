@@ -276,6 +276,24 @@ func TestReadMessageEnforcesMaxSize(t *testing.T) {
 	})
 }
 
+// A negative budget must refuse the frame rather than allocate it.
+//
+// readMessage passes the ceiling minus what is already held, and it refuses an
+// over-long fragment from its header, so nothing subtracts its way below zero
+// today. The guard is on the primitive: uint64 of a negative int wraps to
+// ~2^64, which would turn the size cap into a comparison that is false for
+// every length a header can carry -- an eight-byte length field and a make()
+// with nothing in between.
+func TestReadFrameRefusesANegativeBudget(t *testing.T) {
+	t.Parallel()
+	// A 1-byte binary frame: small enough that only a broken cap would let a
+	// negative budget through, so the refusal is the cap and not the length.
+	c, _ := testConn(t, []byte{0x82, 0x01, 0xFF}, []byte{1, 2, 3, 4})
+	if _, _, payload, err := c.readFrame(-1); err == nil {
+		t.Fatalf("readFrame(-1) allocated %d bytes and reported no error", len(payload))
+	}
+}
+
 // The example key/accept pair from RFC 6455 §1.3.
 func TestWSAcceptKey(t *testing.T) {
 	t.Parallel()

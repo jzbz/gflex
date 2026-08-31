@@ -474,27 +474,3 @@ func (s *Session) drainStale() {
 		}
 	}
 }
-
-// sleepCtx waits for d and reports why it stopped: nil once the full duration
-// has elapsed, ctx.Err() if the context ended first.
-//
-// A non-positive d is NOT a no-op: it returns ctx.Err(), so the call remains a
-// cancellation checkpoint rather than a way to skip one. Both callers sit
-// inside retry loops -- VoltageMv's backoff, which clips its last wait to the
-// remaining budget, and the PDO chunk retry delay -- where a wait that
-// collapsed to zero must not also swallow the operator's Ctrl-C for another
-// round trip. internal/cli and internal/bootloader carry their own copies of
-// this helper; keep this one's semantics if they are ever unified.
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
-}

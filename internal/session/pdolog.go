@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jzbz/gflex/internal/ctxwait"
 	"github.com/jzbz/gflex/internal/proto"
 )
 
@@ -144,7 +145,7 @@ func (s *Session) FullPDOLog(ctx context.Context, progress func(chunk int, bytes
 
 		for attempt := 0; attempt < pdoChunkAttempts; attempt++ {
 			if attempt > 0 {
-				if err := sleepCtx(ctx, pdoChunkRetryDelay); err != nil {
+				if err := ctxwait.Sleep(ctx, pdoChunkRetryDelay); err != nil {
 					return nil, fmt.Errorf("PDO log chunk %d: %w", i, err)
 				}
 			}

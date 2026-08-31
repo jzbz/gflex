@@ -237,12 +237,30 @@ func DecodeString(payload []byte) string {
 	var sb strings.Builder
 	sb.Grow(len(payload))
 	for _, b := range payload {
-		if b >= 0x20 && b <= 0x7E {
+		if PrintableASCII(b) {
 			sb.WriteByte(b)
 		}
 	}
 	return strings.TrimSpace(sb.String())
 }
+
+// PrintableASCII reports whether b is printable ASCII: 0x20 to 0x7E, space
+// through tilde.
+//
+// This one predicate is the whole of the terminal-safety rule this tool applies
+// to text it did not write. What it keeps out is NUL padding, invalid UTF-8,
+// and -- the byte that matters -- the ESC that introduces an ANSI control
+// sequence. Device identity strings, rawmidi port names, firmware version
+// strings and WebSocket close reasons are all printed to a terminal, and any
+// one of them could otherwise repaint or clear it.
+//
+// It is exported so the filters that apply it can share it: DecodeString above,
+// and printableASCII in internal/bootloader, which keeps its own loop because
+// it takes a string and bounds the result where this one takes a bounded
+// payload and does not. They differ in what they consume, not in what they
+// consider printable, and a rule stated in two places is a rule that can drift
+// in one.
+func PrintableASCII(b byte) bool { return b >= 0x20 && b <= 0x7E }
 
 // SerialUsable reports whether a decoded serial number is long enough to trust.
 // The vendor client applies the same four-character minimum before using a

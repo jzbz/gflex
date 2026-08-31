@@ -246,8 +246,8 @@ func (a *App) openUSB(ctx context.Context) (proto.Transport, string, error) {
 // selectUSBRef applies --port to an enumerated device list: the unique match,
 // or ok=false when nothing matched (the caller owns the not-found report).
 //
-// Every match is collected before anything is opened. matchesUSBPort ends in a
-// suffix match and also takes a bare address, so with two VFLEX units attached
+// Every match is collected before anything is opened. matchesUSBPort takes a
+// bare address and a trailing part of a path, so with two VFLEX units attached
 // an imprecise --port ("3" matching addr 3 on both buses) can designate both --
 // and taking whichever usbfs.Enumerate happens to sort first would silently
 // write the voltage to the wrong unit's rail. rawmidi.Select already refuses
@@ -277,7 +277,9 @@ func selectUSBRef(refs []usbfs.DeviceRef, port string) (usbfs.DeviceRef, bool, e
 }
 
 // matchesUSBPort reports whether --port designates ref. A path, a "bus:addr"
-// pair and a bare address all work, because `gflex devices` prints all three.
+// pair, a bare address and a trailing part of the path all work, because
+// `gflex devices` prints the first three and the fourth is what someone types
+// when they have half of a path in front of them.
 func matchesUSBPort(ref usbfs.DeviceRef, port string) bool {
 	if port == ref.Path || port == ref.SysPath {
 		return true
@@ -288,7 +290,13 @@ func matchesUSBPort(ref usbfs.DeviceRef, port string) bool {
 	if n, err := strconv.Atoi(port); err == nil && n == ref.Addr {
 		return true
 	}
-	return strings.HasSuffix(ref.Path, port)
+	// Anchored on the separator, so a partial path is a whole number of path
+	// components and not any string the path happens to end with. Unanchored,
+	// --port 3 matched /dev/bus/usb/011/013 -- and where the unit the user
+	// meant is not on the bus, that is a lone match rather than the ambiguity
+	// selectUSBRef refuses, so the write went to the other unit's rail with
+	// nothing said. "013" and "011/013" still designate it; "3" no longer does.
+	return strings.HasSuffix(ref.Path, "/"+port)
 }
 
 // transportError classifies a failure to open the device and attaches the
@@ -427,30 +435,5 @@ func waitForDevice(ctx context.Context, want bool, timeout time.Duration) error 
 			return ctx.Err()
 		case <-time.After(poll):
 		}
-	}
-}
-
-// sleepCtx sleeps for d unless the context is cancelled first.
-//
-// A non-positive d is not a no-op: it returns ctx.Err(), so the call remains a
-// cancellation checkpoint rather than a way to skip one. internal/session and
-// internal/bootloader carry their own copies of this helper and both already
-// behave that way; this one returned nil, which is the difference that matters
-// on the one caller whose duration a user controls. `scan --settle 0` calls
-// sleepCtx during the unplug/replug handover (scan.go), and the next guard,
-// waitForDevice above, tests devicePresent() before it consults ctx.Done() --
-// so a Ctrl-C arriving there was swallowed twice over and the scan carried on
-// past the interrupt.
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
 	}
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/jzbz/gflex/internal/ctxwait"
 	"github.com/jzbz/gflex/internal/pdo"
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/session"
@@ -161,7 +162,7 @@ func readSerialRetrying(ctx context.Context, read func(context.Context) (string,
 	var last error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
-			if err := sleepCtx(ctx, delay); err != nil {
+			if err := ctxwait.Sleep(ctx, delay); err != nil {
 				return "", err
 			}
 		}
@@ -416,7 +417,7 @@ func (a *App) scanAwaitHandover(ctx context.Context, f Formatter, o scanOpts,
 	if err := waitDev(ctx, false, o.wait); err != nil {
 		return err
 	}
-	if err := sleepCtx(ctx, o.settle); err != nil {
+	if err := ctxwait.Sleep(ctx, o.settle); err != nil {
 		return err
 	}
 	f.Diag("waiting up to %s for the VFLEX to come back...", o.wait)

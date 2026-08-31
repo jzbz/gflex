@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jzbz/gflex/internal/ctxwait"
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/usbfs"
 )
@@ -141,8 +142,8 @@ type Flasher struct {
 	readLen int
 	t       timing
 	// sleep replaces the real wait, so a test can assert *which* delays a
-	// sequence applies rather than only how long it took. nil means sleepCtx,
-	// which is what every non-test path uses.
+	// sequence applies rather than only how long it took. nil means
+	// ctxwait.Sleep, which is what every non-test path uses.
 	sleep func(context.Context, time.Duration) error
 }
 
@@ -151,7 +152,7 @@ func (f *Flasher) pause(ctx context.Context, d time.Duration) error {
 	if f.sleep != nil {
 		return f.sleep(ctx, d)
 	}
-	return sleepCtx(ctx, d)
+	return ctxwait.Sleep(ctx, d)
 }
 
 // NewFlasher builds a Flasher over an already-open device and an interface that
@@ -490,21 +491,6 @@ func (f *Flasher) JumpToApp(ctx context.Context) error {
 	return nil
 }
 
-// sleepCtx sleeps unless the context ends first.
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Device discovery
 // ---------------------------------------------------------------------------
@@ -570,7 +556,7 @@ func Connect(ctx context.Context) (*usbfs.Device, usbfs.Interface, error) {
 		if time.Now().After(deadline) {
 			break
 		}
-		if err := sleepCtx(ctx, ConnectRetryInterval); err != nil {
+		if err := ctxwait.Sleep(ctx, ConnectRetryInterval); err != nil {
 			return nil, usbfs.Interface{}, err
 		}
 	}

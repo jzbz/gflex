@@ -338,6 +338,29 @@ func TestDecodeString(t *testing.T) {
 	}
 }
 
+// PrintableASCII is the shared terminal-safety rule, so pin its boundaries and
+// pin that DecodeString keeps exactly the bytes it admits -- the filters that
+// import it must not be able to drift from the predicate they were given.
+func TestPrintableASCIIIsTheRuleDecodeStringApplies(t *testing.T) {
+	for _, tc := range []struct {
+		b    byte
+		want bool
+	}{{0x00, false}, {0x1B, false}, {0x1F, false}, {0x20, true}, {'A', true}, {0x7E, true}, {0x7F, false}, {0x80, false}, {0xFF, false}} {
+		if got := PrintableASCII(tc.b); got != tc.want {
+			t.Errorf("PrintableASCII(0x%02x) = %v, want %v", tc.b, got, tc.want)
+		}
+	}
+	for i := 0; i < 256; i++ {
+		b := byte(i)
+		// Sandwiched between two letters, so the TrimSpace at the end of
+		// DecodeString cannot be mistaken for the predicate dropping a space.
+		kept := len(DecodeString([]byte{'A', b, 'A'})) == 3
+		if kept != PrintableASCII(b) {
+			t.Errorf("DecodeString keeps 0x%02x = %v, but PrintableASCII says %v", b, kept, PrintableASCII(b))
+		}
+	}
+}
+
 func TestSerialUsable(t *testing.T) {
 	for _, tc := range []struct {
 		s    string

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jzbz/gflex/internal/proto"
 )
 
 // page builds a deterministic 8*n byte page.
@@ -883,4 +885,22 @@ func TestChunkedPageRejectsBadGeometry(t *testing.T) {
 			t.Errorf("error = %v", err)
 		}
 	})
+}
+
+// printableASCII keeps its own loop -- it takes a string that may be megabytes
+// long and bounds what it returns, where proto.DecodeString takes an
+// already-bounded payload and does not -- but it must not keep its own idea of
+// what is printable. Every byte, checked against the shared predicate.
+func TestPrintableASCIIAppliesTheSharedPredicate(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 256; i++ {
+		b := byte(i)
+		// Sandwiched between two letters: the trailing TrimSpace would
+		// otherwise drop a lone space, which the predicate calls printable.
+		kept := len(printableASCII(string([]byte{'A', b, 'A'}), 0)) == 3
+		if kept != proto.PrintableASCII(b) {
+			t.Errorf("printableASCII keeps 0x%02x = %v, but proto.PrintableASCII says %v",
+				b, kept, proto.PrintableASCII(b))
+		}
+	}
 }

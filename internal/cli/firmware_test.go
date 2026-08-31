@@ -1189,3 +1189,90 @@ func TestProgressWriter(t *testing.T) {
 		t.Error("clear() did not end the pending progress line")
 	}
 }
+
+// TestFetchedImageSaveIsAtomic covers the success half of `firmware fetch -o`:
+// the file lands with its full contents, is readable by the flash path that
+// will later be handed it, carries 0644 (os.CreateTemp opens 0600, so the
+// explicit Chmod is load-bearing), and leaves no temporary file behind.
+func TestFetchedImageSaveIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "image.json")
+
+	app, _, _ := newFlashTestApp()
+	fw := flashTestImage()
+	if err := app.reportFetched(app.newFormatter(), fw, path); err != nil {
+		t.Fatalf("reportFetched: %v", err)
+	}
+
+	// The point of saving is that `firmware flash <file>` can read it back.
+	back, err := bootloader.LoadFile(path)
+	if err != nil {
+		t.Fatalf("the saved image does not load: %v", err)
+	}
+	if len(back.Pages) != len(fw.Pages) || back.PageSize() != fw.PageSize() {
+		t.Errorf("round trip gave %d pages of %d bytes, want %d of %d",
+			len(back.Pages), back.PageSize(), len(fw.Pages), fw.PageSize())
+	}
+	if !back.CRCKnown || back.CRC != fw.CRC {
+		t.Errorf("round trip gave crc %#02x (known=%v), want %#02x", back.CRC, back.CRCKnown, fw.CRC)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o644 {
+		t.Errorf("mode = %04o, want 0644 -- a firmware image is not a secret", perm)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("directory holds %v, want only the image", names)
+	}
+}
+
+// The half that matters: a save that fails must leave whatever was at that path
+// alone. os.WriteFile truncates in place, so the old behaviour committed a
+// zero-length file before writing a byte -- and this path is a trust input to
+// `firmware flash` later, where a truncated-but-parseable image is one with
+// pages missing, which can still flash and verify cleanly (SPEC.md §10.2).
+//
+// The failure is injected by taking write permission off the directory, which
+// stops the temporary file from being created but leaves the destination file
+// itself writable -- exactly the case an in-place os.WriteFile would sail
+// through, rewriting the file and failing this test's first assertion.
+func TestFetchedImageSaveLeavesThePreviousFileIntactWhenItFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the failure cannot be injected")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "image.json")
+	const old = "{\"app_bin\": [[1, 2, 3, 4]], \"app_version\": \"5.0.0\"}\n"
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	app, _, _ := newFlashTestApp()
+	if err := app.reportFetched(app.newFormatter(), flashTestImage(), path); err == nil {
+		t.Fatal("reportFetched reported success with an unwritable directory")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != old {
+		t.Errorf("the previously saved image was damaged by a failed write:\n%q", got)
+	}
+}

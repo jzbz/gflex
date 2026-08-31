@@ -126,7 +126,9 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 //
 // budget is how much of the message ceiling is still unspent, and it bounds the
 // payload allocation for a data frame. Control frames do not spend it: they are
-// bounded at 125 bytes by the RFC and are answered rather than accumulated.
+// bounded at 125 bytes by the RFC and are answered rather than accumulated. A
+// negative budget is not a licence to allocate: it is refused outright, as an
+// exhausted one would be.
 func (c *wsConn) readFrame(budget int) (fin bool, opcode byte, payload []byte, err error) {
 	var h [2]byte
 	if _, err := io.ReadFull(c.r, h[:]); err != nil {
@@ -167,7 +169,16 @@ func (c *wsConn) readFrame(budget int) (fin bool, opcode byte, payload []byte, e
 		if length > 125 {
 			return false, 0, nil, fmt.Errorf("%w: control frame of %d bytes exceeds 125", errWebsocket, length)
 		}
-	} else if length > uint64(budget) {
+	} else if budget < 0 || length > uint64(budget) {
+		// The budget < 0 test is not tidiness. uint64 of a negative int wraps
+		// to something near 2^64, so the comparison alone would be false for
+		// every length a frame header can express -- and this test is the only
+		// thing standing between a server-chosen length and the make() below.
+		// No caller can pass a negative budget today (readMessage refuses an
+		// over-long fragment from its header, so len(buf) never passes maxMsg),
+		// which makes this a guard on the primitive rather than a live bug. It
+		// costs one comparison and closes the way a later caller could disable
+		// the ceiling without any of this reading as though it had.
 		return false, 0, nil, fmt.Errorf("%w: frame of %d bytes exceeds the %d-byte limit", errWebsocket, length, c.maxMsg)
 	}
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jzbz/gflex/internal/ctxwait"
 	"github.com/jzbz/gflex/internal/proto"
 )
 
@@ -186,7 +187,7 @@ func (s *Session) VoltageMv(ctx context.Context) (uint16, error) {
 		if wait > delay {
 			wait = delay
 		}
-		if err := sleepCtx(ctx, wait); err != nil {
+		if err := ctxwait.Sleep(ctx, wait); err != nil {
 			return 0, fmt.Errorf("read voltage: %w", err)
 		}
 		delay *= 2

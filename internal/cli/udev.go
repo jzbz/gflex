@@ -161,50 +161,15 @@ func (a *App) installUdev(ctx context.Context, f Formatter, path string) error {
 	return nil
 }
 
-// writeRuleFile writes the embedded rule to path by way of a temporary file in
-// the same directory and a rename.
+// writeRuleFile installs the embedded rule at path.
 //
-// os.WriteFile would truncate the destination in place, committing an empty
-// file to the filesystem before any of the new bytes reach it, and it cleans up
-// nothing on the error path. That window is not theoretical here: the file
-// lives in a directory udev re-reads on every `udevadm control --reload-rules`,
-// and a truncated rule grants no access at all while looking installed. A
-// rename within one directory is atomic, so udev sees either the whole old file
-// or the whole new one.
-func writeRuleFile(path string) (err error) {
-	// The temporary name must not end in ".rules", or udev would load the
-	// half-written file as a rule if it happened to reload mid-install.
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".70-gflex.rules.*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer func() {
-		if err != nil {
-			tmp.Close()
-			os.Remove(name)
-		}
-	}()
-
-	if _, err = tmp.WriteString(udevRules); err != nil {
-		return err
-	}
-	// CreateTemp opens 0600. The installed rule is world-readable, matching
-	// every other file in /etc/udev/rules.d.
-	if err = tmp.Chmod(0o644); err != nil {
-		return err
-	}
-	// Sync before the rename: the very next thing the caller does is tell udev
-	// to reload, and a rule that exists only in the page cache is one power cut
-	// away from being a zero-length file that silently grants nothing.
-	if err = tmp.Sync(); err != nil {
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	err = os.Rename(name, path)
-	return err
+// The write is atomic (writefile.go) because this file lives in a directory
+// udev re-reads on every `udevadm control --reload-rules`, and a rule truncated
+// partway through an install looks installed while granting no access at all.
+// 0644 rather than the 0600 a temporary file is created with: the installed
+// rule is world-readable, matching every other file in /etc/udev/rules.d.
+func writeRuleFile(path string) error {
+	return writeFileAtomic(path, []byte(udevRules), 0o644)
 }
 
 // udevadmPaths are the standard locations for udevadm, in the order they are

@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/jzbz/gflex/internal/proto"
 )
 
 // DefaultPageSize is the page size assumed when a raw .bin image is loaded.
@@ -727,13 +729,15 @@ const maxVersionLen = 64
 // printed. Dropping rather than escaping matches proto.DecodeString, and it is
 // also what keeps invalid UTF-8 out.
 //
-// The rule is deliberately duplicated rather than imported. proto.DecodeString
-// takes the []byte of a wire payload already bounded by the one-byte frame
-// length, so it needs no ceiling and returns nothing to bound; the strings here
-// arrive from JSON and from a close frame, are bounded by nothing useful, and
-// converting one to []byte just to reuse eight lines would copy a value that
-// may be megabytes long. internal/proto is also the protocol layer: the tail
-// that trims and truncates *host-side* text belongs on this side of that line.
+// The predicate is proto.PrintableASCII, not a second spelling of it: the rule
+// is the same rule, and one stated twice is one that can drift in one place.
+// The loop around it is deliberately separate. proto.DecodeString takes the
+// []byte of a wire payload already bounded by the one-byte frame length, so it
+// needs no ceiling and returns nothing to bound; the strings here arrive from
+// JSON and from a close frame, are bounded by nothing useful, and converting
+// one to []byte just to reuse eight lines would copy a value that may be
+// megabytes long. internal/proto is also the protocol layer: the tail that
+// trims and truncates *host-side* text belongs on this side of that line.
 func printableASCII(s string, max int) string {
 	var sb strings.Builder
 	grow := len(s)
@@ -744,7 +748,7 @@ func printableASCII(s string, max int) string {
 	truncated := false
 	for i := 0; i < len(s); i++ {
 		b := s[i]
-		if b < 0x20 || b > 0x7E {
+		if !proto.PrintableASCII(b) {
 			continue
 		}
 		if max > 0 && sb.Len() >= max {

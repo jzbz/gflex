@@ -2,12 +2,10 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/session"
@@ -200,48 +198,46 @@ func TestSelectUSBRefNoMatch(t *testing.T) {
 	}
 }
 
-// TestSleepCtxIsACancellationCheckpoint pins the semantics this package's copy
-// of sleepCtx drifted away from.
+// TestMatchesUSBPortAnchorsItsSuffixOnASeparator is the regression test for
+// --port picking a unit the user did not name.
 //
-// internal/session's copy carries the specification -- a non-positive duration
-// is not a no-op, it returns ctx.Err(), so the call stays a cancellation
-// checkpoint rather than a way to skip one -- and internal/bootloader's copy
-// already agreed. This one returned nil, and the divergence was reachable:
-// --settle takes any duration the user types, `scan` calls sleepCtx with it
-// during the unplug/replug handover, and the guard immediately after
-// (waitForDevice) tests devicePresent() before it consults ctx.Done(). A Ctrl-C
-// landing there was therefore swallowed twice over and the scan carried on.
-func TestSleepCtxIsACancellationCheckpoint(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+// The suffix arm existed so half a path works, but it was unanchored: "3" is a
+// suffix of /dev/bus/usb/011/013, so it designated address 13. Where the unit
+// the user meant is also attached, selectUSBRef sees two matches and refuses;
+// where it is not -- the script pinned --port 3, that unit re-enumerated or was
+// left unplugged -- the stray match is the only one, so it was selected without
+// a word and the voltage went to the other unit's rail.
+func TestMatchesUSBPortAnchorsItsSuffixOnASeparator(t *testing.T) {
+	ref := usbfs.DeviceRef{Path: "/dev/bus/usb/011/013", SysPath: "/sys/bus/usb/devices/11-2", Bus: 11, Addr: 13}
 
-	for _, d := range []time.Duration{0, -time.Second} {
-		if err := sleepCtx(ctx, d); !errors.Is(err, context.Canceled) {
-			t.Errorf("sleepCtx(cancelled, %v) = %v, want context.Canceled: a non-positive "+
-				"duration must stay a cancellation checkpoint, not skip one", d, err)
+	for _, port := range []string{"/dev/bus/usb/011/013", "/sys/bus/usb/devices/11-2",
+		"11:13", "011:013", "13", "013", "011/013", "usb/011/013"} {
+		if !matchesUSBPort(ref, port) {
+			t.Errorf("--port %q no longer designates %s; every form gflex devices prints must keep working", port, ref.Path)
+		}
+	}
+	for _, port := range []string{"3", "1/013", "13/013", "0"} {
+		if matchesUSBPort(ref, port) {
+			t.Errorf("--port %q matched %s on a partial path component", port, ref.Path)
 		}
 	}
 }
 
-// The other half: a non-positive duration against a live context still costs
-// nothing and reports no error, so the callers that pass a computed delay of
-// zero on their first iteration are not turned into failures.
-func TestSleepCtxNonPositiveOnALiveContextSucceeds(t *testing.T) {
-	if err := sleepCtx(context.Background(), 0); err != nil {
-		t.Errorf("sleepCtx(live, 0) = %v, want nil", err)
+// The consequence, at the layer that opens the device: a --port that names no
+// attached unit must find nothing, not fall through onto whichever path happens
+// to end with those characters. openUSB owns the not-found report, so no match
+// is ok=false with no error.
+func TestSelectUSBRefDoesNotFallThroughToAnUnnamedUnit(t *testing.T) {
+	refs := []usbfs.DeviceRef{
+		{Path: "/dev/bus/usb/001/004", Bus: 1, Addr: 4},
+		{Path: "/dev/bus/usb/011/013", Bus: 11, Addr: 13},
 	}
-}
-
-// And a positive duration is still interruptible rather than slept through.
-func TestSleepCtxPositiveDurationHonoursCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	start := time.Now()
-	if err := sleepCtx(ctx, time.Minute); !errors.Is(err, context.Canceled) {
-		t.Errorf("sleepCtx(cancelled, 1m) = %v, want context.Canceled", err)
+	ref, ok, err := selectUSBRef(refs, "3")
+	if err != nil {
+		t.Fatalf("selectUSBRef: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("sleepCtx slept %v on a cancelled context", elapsed)
+	if ok {
+		t.Errorf("--port 3 selected %s; no attached unit is at address 3", ref.Path)
 	}
 }
 

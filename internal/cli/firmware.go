@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/jzbz/gflex/internal/bootloader"
+	"github.com/jzbz/gflex/internal/ctxwait"
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/session"
 	"github.com/jzbz/gflex/internal/usbfs"
@@ -164,7 +165,7 @@ func newFirmwareFetchCommand(app *App) *cobra.Command {
 					if outPath == "" {
 						return codedf(ExitUsage, "--raw needs -o: the payload is not something to print")
 					}
-					if err := os.WriteFile(outPath, msg, 0o644); err != nil {
+					if err := writeFileAtomic(outPath, msg, 0o644); err != nil {
 						return fmt.Errorf("writing %s: %w", outPath, err)
 					}
 					f.KV("path", "saved", outPath, outPath)
@@ -214,9 +215,13 @@ func (a *App) reportFetched(f Formatter, fw *bootloader.Firmware, outPath string
 	if err != nil {
 		return err
 	}
+	// Atomic, because this file is a trust input to `firmware flash` later:
+	// truncated in place by a Ctrl-C or a full disk, what is left can still
+	// parse as an image, just one with pages missing (writefile.go).
+	//
 	// 0o644 rather than 0o600: a firmware image is not a secret, and a file the
 	// user cannot read back with ordinary tooling defeats the point of saving it.
-	if err := os.WriteFile(outPath, data, 0o644); err != nil {
+	if err := writeFileAtomic(outPath, data, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", outPath, err)
 	}
 	f.KV("path", "saved", outPath, outPath)
@@ -555,7 +560,7 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 		if err := a.confirmJump(ctx, f, appSerial); err != nil {
 			return err
 		}
-		if err := sleepCtx(ctx, bootloaderModeSwitchDelay); err != nil {
+		if err := ctxwait.Sleep(ctx, bootloaderModeSwitchDelay); err != nil {
 			return err
 		}
 	}
@@ -1043,7 +1048,7 @@ func (a *App) waitForApplicationMode(ctx context.Context, timeout time.Duration)
 				"no device with vendor 0x%04X came back on the USB bus within %s after the jump",
 				proto.VendorID, timeout)
 		}
-		if err := sleepCtx(ctx, poll); err != nil {
+		if err := ctxwait.Sleep(ctx, poll); err != nil {
 			return err
 		}
 	}
@@ -1061,7 +1066,7 @@ func (a *App) waitForApplicationMode(ctx context.Context, timeout time.Duration)
 // and jumped into. Every error return is therefore phrased by
 // postFlashFailure.
 func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, res *bootloader.UpdateResult) error {
-	if err := sleepCtx(ctx, postJumpDelay); err != nil {
+	if err := ctxwait.Sleep(ctx, postJumpDelay); err != nil {
 		return a.postFlashFailure(f, res, "waiting out the post-jump settle", err)
 	}
 	if err := a.waitForApplicationMode(ctx, reenumerationTimeout); err != nil {
