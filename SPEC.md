@@ -639,17 +639,44 @@ counted list of colour records, and the vendor's five bytes are its one-record c
 | 3, 5, … | 2 | **A marker, not a magnitude** — must read exactly 2. 1, 50 and 99 were each tried in each position independently and every one suppresses the record that follows it. Nothing here is a duration. |
 | last | 0 | Terminator, and the only thing that says how long the list is. |
 
-**The list is a loop.** Every record gets roughly half a second except the **last**, which gets a
-phase brief enough to read as a flash. One record is therefore solid — its brief phase is all there
-is — which is why the vendor's payload looks like a plain "set the colour". Two records read as a
-colour with a flash of the second. Three alternate the first two at half a second with the third too
-quick to see.
+**The list is a loop**, and it runs until the next write. What it looks like:
 
-That single rule is what finally fit; two earlier readings of the same data did not. "Plays once
-rather than looping" and "the third record is dropped" were both the same perceptual error, and both
-were broken by one well-chosen frame: `[…, off, 2, white, 2, 0]`, which puts the brief phase against
-a dark LED where a repeat is unmissable. Choosing colours that make the failure mode visible was
-worth more than any number of repetitions of the ambiguous case.
+| records | appearance |
+|---|---|
+| 1 | solid — which is why the vendor's payload reads as a plain "set the colour" |
+| 2 | the first colour, with a flash of the second too quick to time by eye |
+| 3 | the first two alternating at about half a second, the third too quick to see |
+
+Two earlier readings of this — "plays once rather than looping" and "the third record is dropped" —
+were the same perceptual error and both were wrong. What broke them was one well-chosen frame,
+`[…, off, 2, white, 2, 0]`: putting the brief phase against a dark LED makes a repeat unmissable
+where a green flash on red is nearly invisible. Choosing colours that make the failure mode visible
+was worth more than repeating the ambiguous case.
+
+**The timing was measured and does not reduce to a rule.** Phase boundaries were timed by tapping a
+key on each colour change — absolute onsets carry the observer's reaction time, but the intervals do
+not, since the same lag sits at both ends and subtracts out. 44–50 taps per run:
+
+| records | full cycle | first record's phase |
+|---|---|---|
+| 2 — off, white | 511 ms (sd 52, n=47) | — |
+| 3 — red, green, blue | 1274 ms | 572 ms (sd 42, n=20) |
+| 4 — red, green, blue, white | 1783 ms | 446 ms (sd 75, n=21) |
+
+Each run on its own suggests a different rule and none survives the other two. Four records fit equal
+phases almost exactly (446 × 4 = 1783). Three records fit two long and one brief (572 + 572 + 130 =
+1274). Two records fit neither, and solving the three- and two-record pair for a fixed per-record
+duration gives a negative one.
+
+The one thing that does hold across all of it is a negative result, and it is what kills every
+formula tried: **the phase duration is a property of the list, not of the record.** Red is the first
+record of both the three- and four-record lists — same colour, same marker, same position — and holds
+for 572 ms in one and 446 ms in the other. Against standard errors of 9.5 and 16.4 ms that is a
+six-sigma difference, not tapping noise.
+
+So the table above is the finding, and there is no formula to go with it. Settling it needs an
+instrument rather than a finger: a slow-motion video at 240 fps gives exact phase boundaries by frame
+count, and nothing here needs them badly enough to have done it.
 
 Three further behaviours, and they are what a caller needs:
 
@@ -1487,8 +1514,14 @@ confident wrong answer:
 
 Both of the questions this left over were then answered, and both answers **corrected** the first
 write-up rather than extending it: byte 1 is inert rather than a record count, and a multi-record
-list loops rather than playing once. See §6.2. The phase lengths — roughly half a second, with the
-last record much shorter — are eyeballed and stated as such; nothing here timed them.
+list loops rather than playing once (§6.2).
+
+The phases were then timed properly, by tapping a key on each colour change so that reaction lag
+cancels out of the intervals. That produced a third correction, this time to a rule rather than an
+observation: there is no fixed per-record duration. Cycle times for two, three and four records are
+511, 1274 and 1783 ms, no formula fits all three, and the first record of a list holds for 572 ms in
+one list and 446 ms in another — six sigma apart. Phase duration is a property of the whole list.
+The measurements are in §6.2 and are offered as measurements, not as a rule.
 
 18 gates six booleans that are deliberately not decoded until somebody answers it.
 

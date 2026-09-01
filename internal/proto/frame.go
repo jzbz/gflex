@@ -294,11 +294,16 @@ func ParseLEDColor(s string) (LEDColor, bool) {
 // not from a count field. Each record is a colour and a marker byte that must
 // read exactly 2; any other value suppresses the record after it.
 //
-// The list loops, every record holding for roughly half a second except the
-// last, which is brief enough to read as a flash. One record is therefore
-// solid -- its brief phase is all there is -- which is why the vendor's five
-// bytes look like a plain "set the colour". That is the form this builds; a
-// caller wanting the animation can reach it with `gflex raw`.
+// The list loops until the next write. One record is solid, which is why the
+// vendor's five bytes read as a plain "set the colour"; longer lists cycle,
+// with cycle times measured at 511, 1274 and 1783 ms for two, three and four
+// records. No per-record duration explains those -- the first record of a list
+// holds for 572 ms in one list and 446 ms in another -- so the timing is a
+// property of the whole list and SPEC.md §6.2 records the measurements without
+// a formula.
+//
+// The one-record form is what this builds. A caller wanting the animation can
+// reach it with `gflex raw`.
 //
 // The effect latches in RAM until the next write and does not survive a power
 // cycle, so this costs no flash wear.
