@@ -504,15 +504,14 @@ func (s *Session) SetLEDAlwaysOn(ctx context.Context, on bool) error {
 
 // SetLEDColor drives the LED to a colour (command 13).
 //
-// Unlike SetLEDAlwaysOn, which changes a stored setting, this is understood to
-// be a momentary effect: the vendor library calls the command
-// FLASH_LED_SEQUENCE_ADVANCED and its CLI treats it as an action, not a
-// setting. There is no read side -- no source, vendor or measured, describes
-// one -- so nothing here reads the colour back, and how long the colour lasts
-// is UNKNOWN (SPEC.md §14.17).
+// Unlike SetLEDAlwaysOn, which changes a stored setting, this is an action. The
+// colour latches in RAM until the next write and does not survive a power
+// cycle: after a replug the unit shows its idle indication again, so a replug
+// is the way back and this costs no flash wear (SPEC.md §6.2, measured §14.17).
 //
-// The payload is proto.LEDColorPayload's, sent byte for byte as the vendor
-// sends it.
+// There is no read side. The device acknowledges with a bare two-byte frame
+// carrying no payload, so nothing here reads the colour back and nothing can:
+// the only way to confirm a colour is to look at the unit.
 func (s *Session) SetLEDColor(ctx context.Context, c proto.LEDColor) error {
 	if _, err := s.Do(ctx, proto.CmdFlashLEDSeqAdvanced, proto.LEDColorPayload(c), true); err != nil {
 		return fmt.Errorf("write led colour %s: %w", c, err)

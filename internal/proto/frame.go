@@ -231,8 +231,12 @@ func DecodeLEDAlwaysOn(b byte) bool { return b == 0 }
 // The command was UNKNOWN for as long as the only source was the shipped vendor
 // application, which never issues it. The vendor's own published library does:
 // tundra-labs/lib.vflex.app documents the write and its eight colour values,
-// and ships a CLI that sends exactly this frame. That is a documented source,
-// not a measurement -- see LEDColorPayload for what remains unexplained.
+// and ships a CLI that sends exactly this frame. The rest of the payload was
+// then measured on hardware (SPEC.md §6.2, §14.17); see LEDColorPayload.
+//
+// Values outside this table are refused rather than masked, and not
+// consistently: 9 and 11 are acknowledged and discarded, while 32 turns the LED
+// off. Nothing here sends one, and ParseLEDColor will not produce one.
 type LEDColor uint8
 
 // The eight colour values the vendor library defines.
@@ -279,12 +283,24 @@ func ParseLEDColor(s string) (LEDColor, bool) {
 
 // LEDColorPayload builds the payload of an LED colour write: [10, 1, c, 2, 0].
 //
-// Only the middle byte is understood. The vendor library sends this exact
-// five-byte payload for every colour, varying nothing else, and its name --
-// FLASH_LED_SEQUENCE_ADVANCED -- suggests the surrounding bytes describe a
-// sequence: a duration, a step count, a repeat. Which is which is UNKNOWN, and
-// guessing at them would be inventing protocol rather than reproducing it, so
-// this sends the vendor's frame byte for byte and says so (SPEC.md §14.17).
+// The name FLASH_LED_SEQUENCE_ADVANCED is literal. Measured on hardware
+// (SPEC.md §6.2, §14.17), the payload is a counted list of colour records:
+//
+//	[ inert, count, colour, 2, colour, 2, ..., 0 ]
+//
+// The leading byte does nothing -- 0 and 10 are indistinguishable. The second
+// counts the records that follow. Each record is a colour and a marker byte
+// that must read exactly 2; any other value suppresses the record after it, in
+// every position tried. The list is terminated by 0.
+//
+// So the vendor's five bytes are the one-record case, which is why they read as
+// a plain "set the colour", and that is what this builds. A list of two or more
+// plays once as the frame lands -- the first colour holds and the rest flash
+// past -- rather than looping, so there is nothing a caller would want from the
+// longer form that this does not already give them. `gflex raw` reaches it.
+//
+// The effect latches in RAM until the next write and does not survive a power
+// cycle, so this costs no flash wear.
 func LEDColorPayload(c LEDColor) []byte {
 	return []byte{10, 1, byte(c), 2, 0}
 }

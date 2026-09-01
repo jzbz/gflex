@@ -802,13 +802,14 @@ func newLEDColorCommand(app *App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "color " + strings.Join(proto.LEDColorNames(), "|"),
 		Short: "Drive the LED to a colour",
-		Long: "Sends command 13 (FLASH_LED_SEQUENCE_ADVANCED) with the vendor library's own\n" +
-			"five-byte payload, [10, 1, color, 2, 0].\n\n" +
-			"Only the colour byte is understood. The other four are sent unchanged because\n" +
-			"that is what the vendor's library sends for every colour; the command's name\n" +
-			"suggests they describe a sequence, but nothing documents them (SPEC.md §14.17).\n\n" +
-			"How long the colour lasts, and whether it survives a power state change, are\n" +
-			"both unknown -- there is no read side to ask. Use --dry-run to see the frame\n" +
+		Long: "Sends command 13 (FLASH_LED_SEQUENCE_ADVANCED) with the payload\n" +
+			"[10, 1, color, 2, 0].\n\n" +
+			"The payload is a counted list of colour records and this is its one-record\n" +
+			"case, which is why it reads as a plain \"set the colour\" (SPEC.md §6.2).\n\n" +
+			"The colour holds until the next write. It does not survive a power cycle --\n" +
+			"unplug and replug the unit to get the normal state indication back. There is\n" +
+			"no read side: the device acknowledges with an empty frame, so the only way to\n" +
+			"confirm a colour is to look at the unit. Use --dry-run to see the frame\n" +
 			"without sending it.",
 		Args:      cobra.ExactArgs(1),
 		ValidArgs: proto.LEDColorNames(),

@@ -621,12 +621,46 @@ colour:  0 off   1 red   2 green   3 blue   4 white   5 yellow   6 magenta   7 c
 frame:   07 8D 0A 01 <colour> 02 00
 ```
 
-Only the middle byte is understood. The library sends the other four unchanged for every colour and
-explains none of them; the command's name — FLASH_LED_**SEQUENCE**_ADVANCED — suggests a duration, a
-step count or a repeat, which is a guess and is recorded as one (§14.17). There is no read form
-described anywhere, so how long a colour lasts and whether it survives a power-state change are both
-unknown, and `gflex led color` cannot read anything back — it reports what it wrote, annotated
-`(written)`, on the same terms as `led set` and `authlock set`.
+**MEASURED on unit `58b4f621`, 2026-09-01 (§14.17).** The library explains none of the other four
+bytes, and the name — FLASH_LED_**SEQUENCE**_ADVANCED — turns out to be literal. The payload is a
+counted list of colour records, and the vendor's five bytes are its one-record case:
+
+```
+[ b0 , count , colour , 2 , colour , 2 , … , 0 ]
+   │      │        └── one record per colour: the value, then a marker byte
+   │      │            that must read exactly 2
+   │      └── how many records follow
+   └── inert
+```
+
+| Byte | Vendor value | Measured |
+|---|---|---|
+| 0 | 10 | **Inert.** 0 and 10 are indistinguishable, two trials each. |
+| 1 | 1 | **Record count.** 1 plays the colour alone; 2 plays a second record. |
+| 2 | colour | The colour index. |
+| 3, 5, … | 2 | **A marker, not a magnitude** — must read exactly 2. 1, 50 and 99 were each tried in each position independently and every one suppresses the record that follows it. Nothing here is a duration. |
+| last | 0 | Terminator. |
+
+Three behaviours follow, and they are what a caller needs:
+
+- **The write is acknowledged and never echoed.** Every frame answers `02 0D` — the command code with
+  the write bit cleared and an empty payload. Unlike `CMD_VOLTAGE_MV` the device says nothing about
+  how it parsed the payload, so there is no read side and no way to confirm a colour except to look
+  at the unit.
+- **The colour latches in RAM.** It held ~50 s untouched, survived unrelated commands, and stayed
+  until the next write — but it does **not** survive a power cycle: after a replug the unit shows its
+  idle indication again. So this is not a stored setting, it costs no flash wear, and a replug is the
+  way back to normal.
+- **A multi-record list plays once, not in a loop.** Two records give the first colour solid with a
+  brief flash of the second as the frame lands. Reproduced twice from two different prior colours.
+
+**Out-of-range colours are refused, not masked, and not consistently.** 9 and 11 are acknowledged and
+discarded — the LED does not move, where a 3-bit mask would have shown red and blue. But 32 turns the
+LED off, twice, the second time from a known-distinct prior. No reading covers both; §14.17 keeps
+what is left.
+
+`gflex led color` sends the one-record form and reports what it wrote, annotated `(written)`, on the
+same terms as `led set` and `authlock set` — there being nothing to read back.
 
 `CMD_FLASH_LED` (14) remains UNKNOWN. The library does not mention it.
 
@@ -1415,11 +1449,26 @@ library does not mention them, and the probe advice still stands, nothing attach
 
 | # | Question | Why it is open | How to answer it |
 |---|---|---|---|
-| 17 | What are the four fixed bytes of the LED colour payload? | The library sends `[10, 1, colour, 2, 0]` for every colour and explains none of it. FLASH_LED_**SEQUENCE**_ADVANCED suggests a duration, a step count or a repeat, which is a guess. Nor is there a read form anywhere, so how long a colour lasts and whether it survives a power-state change are unknown too. | `gflex raw` the write with each of the four varied one at a time, nothing attached to the X-Connector, watching the LED. Low risk as these things go — the observable is an LED — but it is still an undocumented write. |
+| 17 | What are the four fixed bytes of the LED colour payload? | **ANSWERED on hardware, 2026-09-01** — see below. | — |
 | 18 | Which bit of a Fixed PDO is which, for bits 24-29? | VENDOR-LIB names six flags in an order that does not match the published USB-PD field layout (§9.4). Two sources, one of them demonstrably wrong about two *other* fields in the same word, and no third. | Scan a charger whose capabilities are known independently — one whose dual-role and unconstrained-power behaviour is documented — and compare both readings of its 5 V object. A second charger of a different class settles it. |
 
-Neither blocks anything. 17 gates nothing but a nicer `led color`; 18 gates six booleans that are
-deliberately not decoded until somebody answers it.
+**Question 17 is answered.** Unit `58b4f621`, firmware `APP.05.00.00`, 2026-09-01, nothing attached
+to the X-Connector: roughly twenty frames varying one byte at a time. The payload is a counted list
+of colour records, `[inert, count, {colour, 2}…, 0]`, and the vendor's five bytes are its one-record
+case; the name FLASH_LED_SEQUENCE_ADVANCED is literal. The full layout, the marker byte that must
+read exactly 2, the RAM-only latching and the one-shot playback are in §6.2. Every stored setting was
+byte-identical before and after.
+
+Two smaller things came out of it and stay open, neither blocking anything:
+
+- **Out-of-range colours are refused, not masked — inconsistently.** 9 and 11 are acknowledged and
+  discarded; 32 turns the LED off. A mask would have made 9 and 11 read as red and blue. Worth one
+  frame each on 8, 16 and 33: if 33 also goes dark then bit 5 is an "off" flag independent of the low
+  bits, and 9 and 11 are failing on bit 3.
+- **The flash was eyeballed, not timed.** "One-shot rather than looping" is the consistent reading of
+  five descriptions across two trials, not a measurement.
+
+18 gates six booleans that are deliberately not decoded until somebody answers it.
 
 ---
 

@@ -310,6 +310,24 @@ func TestCheckRawFrame(t *testing.T) {
 		t.Errorf("warnings %q should explain why", d.Warnings)
 	}
 
+	// Command 13's payload was measured (SPEC.md §6.2), but only for lists of one
+	// and two records, so a raw frame to it still confirms -- and the warning
+	// says which part is charted and names the command that sends the charted
+	// part, because somebody reaching for `raw` to set a colour has `led color`.
+	led := proto.Frame{Cmd: proto.CmdFlashLEDSeqAdvanced, Write: true}
+	dl := CheckRawFrame(led)
+	if !dl.Confirm {
+		t.Error("a raw frame to command 13 must still be confirmed; a payload measured to depth two is not characterisation")
+	}
+	for _, want := range []string{"counted list", "led color"} {
+		if !containsAny(dl.Warnings, want) {
+			t.Errorf("warnings %q should mention %q", dl.Warnings, want)
+		}
+	}
+	if containsAny(dl.Warnings, "no documented payload format") {
+		t.Errorf("command 13 still claims nothing is documented: %q", dl.Warnings)
+	}
+
 	scratch := proto.Frame{Cmd: proto.CmdVoltageMv, Scratchpad: true}
 	if d := CheckRawFrame(scratch); !d.Confirm || !containsAny(d.Warnings, "scratchpad") {
 		t.Errorf("the scratchpad flag must be called out; got confirm=%v warnings=%q", d.Confirm, d.Warnings)

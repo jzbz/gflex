@@ -380,7 +380,19 @@ func CheckRawFrame(f proto.Frame) Decision {
 		reasons = append(reasons, "it is a WRITE frame and no range checking is applied to a raw payload")
 	}
 	if f.Cmd.Undocumented() {
-		reasons = append(reasons, fmt.Sprintf("%s has no documented payload format or effect (SPEC.md §14.5)", f.Cmd))
+		// Command 13 is the one with a documented shape but not a documented
+		// command: naming the supported path here is worth a line, because
+		// somebody reaching for `raw` to set a colour has a command that does
+		// it, and somebody probing the rest of the payload should know exactly
+		// which part of it is charted (SPEC.md §14.17).
+		if f.Cmd == proto.CmdFlashLEDSeqAdvanced {
+			reasons = append(reasons, fmt.Sprintf(
+				"%s carries a counted list of colour records; `gflex led color` sends the one-record "+
+					"form. A hand-built list is reachable here and was measured, but only for lists of "+
+					"one and two (SPEC.md §6.2)", f.Cmd))
+		} else {
+			reasons = append(reasons, fmt.Sprintf("%s has no documented payload format or effect (SPEC.md §14.5)", f.Cmd))
+		}
 	}
 	if !f.Cmd.Known() {
 		reasons = append(reasons, fmt.Sprintf("command code %d is outside the known table", uint8(f.Cmd)))

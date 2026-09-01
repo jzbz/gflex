@@ -190,6 +190,11 @@ func (c Cmd) Known() bool {
 // Undocumented reports whether c is in the command table but its payload format
 // and effect were never determined (SPEC.md §14.5-§14.7, all still open).
 //
+// CmdFlashLEDSeqAdvanced stays in this set even though §6.2 now documents one
+// payload for it. One shape out of 256^n is not characterisation: `led color`
+// sends the shape the vendor sends, and every other shape a raw frame can carry
+// is as uncharacterised as it ever was (SPEC.md §14.17).
+//
 // Callers must not emit one silently: SPEC.md §13.10 requires the raw escape
 // hatch to name the code and confirm, which is what cli.CheckRawFrame does. Do
 // not turn that into an override flag -- SPEC.md §11 rejects a global --force
