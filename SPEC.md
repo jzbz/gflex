@@ -621,38 +621,32 @@ colour:  0 off   1 red   2 green   3 blue   4 white   5 yellow   6 magenta   7 c
 frame:   07 8D 0A 01 <colour> 02 00
 ```
 
-**MEASURED on unit `58b4f621`, 2026-09-01 (§14.17).** The library explains none of the other four
-bytes, and the name — FLASH_LED_**SEQUENCE**_ADVANCED — turns out to be literal. The payload is a
-counted list of colour records, and the vendor's five bytes are its one-record case:
+**MEASURED on unit `58b4f621`, 2026-09-01 (§14.17).** The name — FLASH_LED_**SEQUENCE**_ADVANCED —
+is literal: a longer payload animates. What is solid, and what is not, are worth separating sharply.
 
-```
-[ inert , inert , colour , 2 , colour , 2 , … , 0 ]
-                     └── one record per colour: the value, then a marker byte
-                         that must read exactly 2
-```
+**Solid, and what `gflex led color` relies on:**
 
 | Byte | Vendor value | Measured |
 |---|---|---|
 | 0 | 10 | **Inert.** 0 and 10 are indistinguishable, two trials each. |
-| 1 | 1 | **Inert.** 2, 3 and 6 are indistinguishable against an identical record list. It is not a count: the number of records comes from the list itself, terminated by 0. |
-| 2, 4, … | colour | One colour index per record. |
-| 3, 5, … | 2 | **A marker, not a magnitude** — must read exactly 2. 1, 50 and 99 were each tried in each position independently and every one suppresses the record that follows it. Nothing here is a duration. |
-| last | 0 | Terminator, and the only thing that says how long the list is. |
+| 2 | colour | The colour, for the vendor's five-byte payload. 0-7 per the table above; anything higher goes dark. |
+| last | 0 | Terminator. |
 
-**The list is a loop**, and it runs until the next write. What it looks like:
+The five-byte vendor payload sets one colour, solid, and holds it until the next write. That was
+reproduced many times over and nothing below casts doubt on it.
 
-| records | appearance |
-|---|---|
-| 1 | solid — which is why the vendor's payload reads as a plain "set the colour" |
-| 2 | the first colour, with a flash of the second too quick to time by eye |
-| 3 | the first two alternating at about half a second, the third too quick to see |
-| 4 | the first, second and fourth cycling; **the third** too quick to see |
-
-**The brief phase is positional: it is the third record**, once a list has three or more. Swapping
-records 3 and 4 moves which colour disappears — `[red, green, blue, white]` shows red, green, white
-and `[red, green, white, blue]` shows red, green, blue — so it follows the slot, not the colour. With
-two records it is the second; with three, third and last are the same slot, which is what made this
-look like "the last record is brief" for as long as no list was longer than three.
+> ⚠ **The multi-colour layout is NOT resolved.** Four structural models were built during that
+> session and each one fitted the run it was built from and died on the next. The observations
+> themselves conflict: `[10, 4, red, blue, white, cyan, 0]` shows red and blue cycling, which says
+> payload bytes 4 and 5 are ignored; but swapping bytes 6 and 8 of an eleven-byte payload changes
+> which colour appears, which says those bytes are read. No single layout does both.
+>
+> The limit is the instrument, not the device. Every open question is "which colour is in which
+> slot", the phases in question run at 130 ms or less, and colour reports at that speed were wrong
+> three times in one session — white read as green twice and cyan as white once. **Settling this
+> needs a 240 fps recording**, which gives the colour order and the phase boundaries together from
+> frame counts. Until somebody does that, treat everything about multi-colour payloads as
+> unresolved, including the byte roles this section used to assert.
 
 Two earlier readings of this — "plays once rather than looping" and "the third record is dropped" —
 were the same perceptual error and both were wrong. What broke them was one well-chosen frame,
@@ -670,11 +664,10 @@ not, since the same lag sits at both ends and subtracts out. 44–50 taps per ru
 | 3 — red, green, blue | 1274 ms | 572 ms (sd 42, n=20) |
 | 4 — red, green, blue, white | 1783 ms | 446 ms (sd 75, n=21) |
 
-Each run on its own suggests a different rule and none survives the other two. Three records fit two
-long and one brief (572 + 572 + 130 = 1274). Two records fit neither that nor anything simpler, and
-solving the three- and two-record pair for a fixed per-record duration gives a negative one. Four
-records appear to fit equal phases — 446 × 4 = 1783 — but that reading is refuted independently: one
-of those four records is the brief third, so the arithmetic is a coincidence rather than a fit.
+These are timings of whatever the device was doing, and they stand as measurements. What they were
+timings *of* is the part that is unresolved: the payloads are described above by a layout that later
+observations contradict. No formula fits all three cycle times, and the first colour of a list holds
+572 ms in one and 446 ms in another, so nothing here is a fixed per-record duration either.
 
 The one thing that does hold across all of it is a negative result, and it is what kills every
 formula tried: **the phase duration is a property of the list, not of the record.** Red is the first
@@ -1531,12 +1524,24 @@ observation: there is no fixed per-record duration. Cycle times for two, three a
 one list and 446 ms in another — six sigma apart. Phase duration is a property of the whole list.
 The measurements are in §6.2 and are offered as measurements, not as a rule.
 
-A fourth correction followed, and it is the one worth reading. The brief phase is **positional — the
-third record** — not the last. Swapping records 3 and 4 of a four-record list moves which colour
-disappears, so it tracks the slot rather than the colour. Every earlier list had been short enough
-that its third record was also its last, so "the last record is brief" fitted three separate
-observations and was still wrong. It took a list long enough to tell the two apart, and an operator
-who noticed that a four-colour list was showing three.
+A fourth correction followed, then a fifth, and the fifth is the one worth reading. The brief phase
+looked **positional — the third record** — after a swap moved which colour disappeared. Then a
+five-byte payload with cyan in the second slot, and a seven-byte one with four distinct colours,
+produced observations that no layout explains alongside the swap: one says a byte is ignored, the
+other says the same kind of byte is read.
+
+Four structural models were built that session. Each fitted the run it came from and died on the
+next. The one thing they had in common is that all four rested on **which colour appeared in which
+slot**, judged by eye, at phases of 130 ms or less — and colour reports at that speed were wrong
+three times in the same session (white read as green twice, cyan as white once).
+
+So the multi-colour layout is recorded as **unresolved**, and §6.2 says so where it previously
+asserted byte roles. The one-colour form the vendor ships and `gflex led color` sends is unaffected:
+it was reproduced many times and nothing casts doubt on it.
+
+**What would settle it: a 240 fps recording.** Four seconds of phone video, played back frame by
+frame, gives the colour order and the phase boundaries together — every open question here at once,
+and none of them through a channel that has already failed three times.
 
 18 gates six booleans that are deliberately not decoded until somebody answers it.
 

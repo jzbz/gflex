@@ -284,26 +284,19 @@ func ParseLEDColor(s string) (LEDColor, bool) {
 
 // LEDColorPayload builds the payload of an LED colour write: [10, 1, c, 2, 0].
 //
-// The name FLASH_LED_SEQUENCE_ADVANCED is literal. Measured on hardware
-// (SPEC.md §6.2, §14.17), the payload is a list of colour records:
+// This five-byte form sets one colour, solid, until the next write. That was
+// measured on hardware many times over (SPEC.md §6.2, §14.17): byte 0 is inert,
+// byte 2 is the colour, and a value above 7 goes dark rather than being refused.
 //
-//	[ inert, inert, colour, 2, colour, 2, ..., 0 ]
-//
-// Both leading bytes do nothing: 0 and 10 are indistinguishable in the first,
-// and 2, 3 and 6 in the second. The list length comes from the 0 terminator,
-// not from a count field. Each record is a colour and a marker byte that must
-// read exactly 2; any other value suppresses the record after it.
-//
-// The list loops until the next write. One record is solid, which is why the
-// vendor's five bytes read as a plain "set the colour"; longer lists cycle,
-// with one slot -- the third, once there are three or more -- too brief to see.
-// Cycle times measured at 511, 1274 and 1783 ms for two, three and four
-// records. No per-record duration explains those, since the first record of a
-// list holds for 572 ms in one list and 446 ms in another, so SPEC.md §6.2
-// records the measurements without a formula.
-//
-// The one-record form is what this builds. A caller wanting the animation can
-// reach it with `gflex raw`.
+// The name FLASH_LED_SEQUENCE_ADVANCED is literal -- a longer payload animates
+// -- but the multi-colour layout is NOT resolved, and this deliberately does not
+// build one. Four structural models were fitted during that session and each
+// died on the next measurement; the observations conflict about which payload
+// bytes are even read. Every one of those judgements was "which colour is in
+// which slot" at phases of 130 ms or less, judged by eye, on a channel that
+// misreported colour three times in the same session. Settling it needs a
+// 240 fps recording, not more frames. `gflex raw` reaches the longer form for
+// anyone who wants to try.
 //
 // The effect latches in RAM until the next write and does not survive a power
 // cycle, so this costs no flash wear.
