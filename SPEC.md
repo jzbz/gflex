@@ -49,6 +49,19 @@ Two honest qualifications, so nobody over-relies on the label:
   behaviour. What was extracted are interface facts — that command 18 carries a big-endian
   millivolt value, that the LED byte is inverted — not creative expression.
 
+**A third source arrived later: the vendor's own published library.** On 2026-08-31,
+`tundra-labs/lib.vflex.app` was read — a readable, MIT-licensed JavaScript library the vendor
+publishes to document the protocol, with a docs site, a Node CLI and two browser tools. It is not
+the shipped application phase 1 was built from, and it is not a measurement; it is a fourth kind of
+evidence, and claims resting on it are marked **VENDOR-LIB** here. Where it agrees with what was
+already recorded, it is corroboration by an independent vendor-authored implementation. Where it
+disagrees, it does not automatically win: two of its PDO decodes are demonstrably narrower than the
+USB-PD field layout this document recovered, and §9.4 says so and does not follow it. What it added
+outright is the vocabulary of §9.3's flag words and the write form of command 13.
+
+Its licence is more permissive than anything phase 1 had, but the discipline is unchanged: facts
+were taken, code was not.
+
 Nothing in this repository is derived from vendor source, documentation under licence, or any
 confidential material. The manual cited is public. The APK was obtained as a shipped artifact.
 
@@ -545,7 +558,7 @@ implementation **must** serialise all device access through a single mutex.
 | 10 | `CMD_HARDWARE_ID` | R | 8 ASCII bytes | no |
 | 11 | `CMD_FIRMWARE_VERSION` | R | 12 ASCII bytes | **yes** |
 | 12 | `CMD_MFG_DATE` | R | 8 ASCII bytes | no |
-| 13 | `CMD_FLASH_LED_SEQUENCE_ADVANCED` | — | **UNKNOWN** | no |
+| 13 | `CMD_FLASH_LED_SEQUENCE_ADVANCED` | W | 5 bytes, `[10, 1, colour, 2, 0]` (§6.2) — **VENDOR-LIB** | no |
 | 14 | `CMD_FLASH_LED` | — | **UNKNOWN** | no |
 | 15 | `CMD_DISABLE_LED_DURING_OPERATION` | R/W | 1 byte, **inverted** (§6.2) | **yes** |
 | 16 | `CMD_ENCRYPT_MSG` | W | n bytes out, n bytes back | no |
@@ -596,6 +609,26 @@ decode: alwaysOn = (wireByte == 0)
 `0x00` = "LED Always On" **enabled** (LED lit in Power Good). `0x01` = suppressed while green.
 **Do not name the CLI flag after the wire field** (`disable_led_during_operation`) or users will get
 it backwards. Use `gflex led set on|off` where `on` means the user-facing "always on".
+
+**Command 13 drives the colour, and is the one command here whose only source is VENDOR-LIB.** The
+shipped application never issues it, which is why it sat UNKNOWN through the whole of phase 1. The
+vendor's published library documents a write with a five-byte payload and eight colour values, and
+its CLI ships it as `--led <colour>`:
+
+```
+payload: [10, 1, colour, 2, 0]
+colour:  0 off   1 red   2 green   3 blue   4 white   5 yellow   6 magenta   7 cyan
+frame:   07 8D 0A 01 <colour> 02 00
+```
+
+Only the middle byte is understood. The library sends the other four unchanged for every colour and
+explains none of them; the command's name — FLASH_LED_**SEQUENCE**_ADVANCED — suggests a duration, a
+step count or a repeat, which is a guess and is recorded as one (§14.17). There is no read form
+described anywhere, so how long a colour lasts and whether it survives a power-state change are both
+unknown, and `gflex led color` cannot read anything back — it reports what it wrote, annotated
+`(written)`, on the same terms as `led set` and `authlock set`.
+
+`CMD_FLASH_LED` (14) remains UNKNOWN. The library does not mention it.
 
 ### 6.3 AUTHLOCK — asymmetric, and unexercised in the vendor client
 
@@ -806,13 +839,49 @@ back. Serial reads during this phase use 6 attempts, 300 ms apart.
 [4]      u8      nPdosReceived
 [5]      u8      idSelectedPdo
 [6..7]   u16 LE  flags
-[8..9]   u16 LE  flags2      (bit 3 / 0x0008 = eprCableFail)
+[8..9]   u16 LE  flags2
 [10..89] 20 × u32 LE  standard USB-PD Source_Capabilities PDOs
 ```
 
-Only `min(nPdosReceived, 20)` entries are parsed; bytes beyond that are never read. Only
-`eprCableFail` is consumed downstream — target/measured voltage, selected PDO id and `flags` are
-parsed and discarded. The CLI should surface all of them; they are free diagnostics.
+Only `min(nPdosReceived, 20)` entries are parsed; bytes beyond that are never read.
+
+**The two flag words are a record of how the last negotiation went** — not of what the source can
+do, which is what the PDOs are for. They are the first thing to look at when a scan came back
+without a voltage the source plainly advertises.
+
+The shipped application consumes only `eprCableFail` and discards the rest; the names below are
+**VENDOR-LIB**, from the published library and corroborated against the vendor's own browser tool in
+the same repository. None of them is measured, and only bit 3 of `flags2` has been observed to do
+anything here, which is why `gflex` prints both words raw beside its reading of them.
+
+| Word | Bit | Meaning |
+|---|---|---|
+| `flags` | `0x0001` | pd request accepted |
+| `flags` | `0x0002` | pd request rejected |
+| `flags` | `0x0004` | voltage within tolerance |
+| `flags` | `0x0008` | webusb connection |
+| `flags2` | `0x0001` | spr init pdos received |
+| `flags2` | `0x0002` | spr ps ready |
+| `flags2` | `0x0004` | non-epr ps |
+| `flags2` | `0x0008` | **epr cable fail** — the one the shipped app reads |
+| `flags2` | `0x0010` | non-epr ps ready |
+| `flags2` | `0x0020` | non-epr ps reject |
+| `flags2` | `0x0040` | epr available |
+| `flags2` | `0x0080` | epr enter request |
+| `flags2` | `0x0100` | epr enter request ack |
+| `flags2` | `0x0200` | epr entered |
+| `flags2` | `0x0400` | epr rejected |
+| `flags2` | `0x0800` | epr 1st pdo chunk received |
+| `flags2` | `0x1000` | epr 2nd pdo chunk received |
+| `flags2` | `0x2000` | epr ps ready |
+
+Two bits of `flags2` and fourteen of `flags` have no name. A tool should report an unnamed bit that
+is set rather than dropping it: it is either a firmware newer than this table or a misreading of the
+word, and both are worth seeing.
+
+`eprCableFail` has a second, computed source — an EPR AVS APDO that fails validation (§9.4) — so the
+decoded bit and the condition the compatibility check consults are deliberately not the same value.
+Keep them distinguishable.
 
 ### 9.4 PDO decode
 
@@ -822,9 +891,24 @@ parsed and discarded. The CLI should surface all of them; they are free diagnost
 ```
 voltageV    = 0.05 * ((pdo >> 10) & 0x3FF)     // 50 mV units
 maxCurrentA = 0.01 * ( pdo        & 0x3FF)     // 10 mA units
+eprCapable  = (pdo >> 23) & 1                  // VENDOR-LIB, agrees with USB-PD
+peakCurrent = (pdo >> 20) & 3                  // VENDOR-LIB, agrees with USB-PD; an index, not a current
 keep only if voltageV >= 5 && maxCurrentA > 0
 section: voltageV <= 20 -> SPR, else EPR       // EPR fixed uses the same 50 mV scale
 ```
+
+`eprCapable` is worth having on its own: USB-PD requires an EPR-capable source to set it on every
+fixed object, so the mandatory 5 V object answers "does this charger do EPR at all" outright, where
+the compatibility check otherwise infers it from which object classes turned up. `peakCurrent`
+indexes a USB-PD table of overload profiles; 0 means none. The table is not transcribed here, so
+report the index.
+
+> ⚠ **The other six flags of a Fixed PDO are NOT decoded, on purpose.** VENDOR-LIB assigns bits
+> 24-29 to dual-role power, USB suspend, unconstrained power, USB communications capable, dual-role
+> data and unchunked extended messages in an order that does not match the published USB-PD field
+> layout — the two disagree about which bit is which, and nothing here has been checked against a
+> charger whose capabilities are known independently (§14.18). Six booleans that are a coin flip
+> between two sources are worse than none; the raw word carries them for whoever settles it.
 
 **Augmented (type 3),** `subtype = (pdo >> 28) & 3`:
 ```
@@ -846,6 +930,24 @@ minimum report their presence rather than pretend they do not exist.
 > ⚠ The SPR-AVS field naming (`maxI20V` from bits 19:10, `maxI15V` from bits 9:0) could not be
 > verified against the USB-PD 3.2 field order. If the firmware follows the published layout the two
 > may be swapped. Low impact — the only consumer takes `max()` of the two.
+>
+> VENDOR-LIB does **not** settle it. It agrees on the ordering — its higher-order field is the 20 V
+> band — but reads both currents from bits that cannot be right: `(pdo>>17)&0x7F` and
+> `(pdo>>8)&0x7F` at 50 mA, which are the PPS *voltage* field positions with a current scale, and
+> look like a copy-paste from the PPS branch above. Corroboration from a decode that is wrong about
+> where the fields are is not corroboration, so this stays open.
+
+**Where VENDOR-LIB is followed and where it is not.** The published library is an independent
+vendor-authored decode of the same words, so a disagreement is worth stating rather than silently
+winning:
+
+| Field | VENDOR-LIB | Here | Which, and why |
+|---|---|---|---|
+| EPR AVS `maxV` | `(pdo>>17)&0xFF` × 100 mV | `(pdo>>17)&0x1FF` × 100 mV | **Here.** Eight bits cap at 25.5 V, and EPR AVS reaches 48 V; a 48 V range decodes as 22.4 V under their mask, which under-reports exactly the chargers EPR exists for. |
+| SPR AVS currents | `(pdo>>17)&0x7F`, `(pdo>>8)&0x7F` × 50 mA | bits 19:10 and 9:0 × 10 mA | **Here.** See the ⚠ above. |
+| Fixed `eprCapable`, `peakCurrent` | bits 23 and 21:20 | same | Agreed, so both are decoded. |
+| Fixed flags, bits 24-29 | six named bits | not decoded | Neither. They disagree with USB-PD; §14.18. |
+| Battery, Variable PDOs | discarded | decoded and reported | **Here**, as with the shipped app (§17). |
 
 ### 9.5 Compatibility check (worth reimplementing offline)
 
@@ -1028,6 +1130,7 @@ gflex tolerance get | set [--nominal <mV>] [--sag <raw-u16>]
 gflex measure                            raw ADC + calibrated mV
 gflex calibrate get | adc --offset <int32> --scale <int32>
 gflex led       get | set on|off         "on" = user-facing "LED Always On"
+                color <colour>           drive the LED; command 13, VENDOR-LIB only (§6.2)
 gflex authlock  get | set <level>
 gflex scan [--voltage <v> --current <a>] [--no-prompt] [--wait <d>] [--settle <d>]
                                          guided PDO capture wizard
@@ -1234,7 +1337,7 @@ one interlock that needs a second key uses a self-describing name rather than a 
 
 **Bring-up happened, then happened again.** A real unit — serial `81a0bcc3`, firmware
 `APP.05.00.00`, PID `0x800F` — was attached and driven by this tool for the first time, and a second
-unit, `58b4f621`, followed. **Ten** of the sixteen questions below are now answered from measurement
+unit, `58b4f621`, followed. **Ten** of the original sixteen questions are now answered from measurement
 rather than inference — 1, 2, 3, 4, 8, 11, 13, 14, 15 and 16 — and one question the original list did
 not contain, the meaning of `SelectedPDOID`, was settled alongside them. Six remain open: 5, 6, 7, 9,
 10 and 12, and none of them is answerable with another unit. The answers are collected in the table
@@ -1298,6 +1401,25 @@ its scale), **10** (whether the 750 mV tolerance is symmetric — needs a variab
 Question 5's probes remain the ones to run last and with nothing attached.
 
 **Question 16 is answered** — see the table above. It was the last one a single unit could settle.
+
+### Moved by the vendor's published library, 2026-08-31
+
+Reading `tundra-labs/lib.vflex.app` (§0) settled part of one question and opened two new ones. None
+of this is measurement, and none of it displaces anything the two units settled.
+
+**Question 5 is half-answered for command 13.** The list below says of commands 4-7, 13 and 14 that
+they are unused and block nothing, and prescribes read-form probes as a last resort. The vendor's
+library documents a **write** form for 13 — `[10, 1, colour, 2, 0]`, eight colours (§6.2) — and
+ships a CLI that sends it, so `gflex led color` sends it too. Commands 4-7 and 14 are unchanged: the
+library does not mention them, and the probe advice still stands, nothing attached.
+
+| # | Question | Why it is open | How to answer it |
+|---|---|---|---|
+| 17 | What are the four fixed bytes of the LED colour payload? | The library sends `[10, 1, colour, 2, 0]` for every colour and explains none of it. FLASH_LED_**SEQUENCE**_ADVANCED suggests a duration, a step count or a repeat, which is a guess. Nor is there a read form anywhere, so how long a colour lasts and whether it survives a power-state change are unknown too. | `gflex raw` the write with each of the four varied one at a time, nothing attached to the X-Connector, watching the LED. Low risk as these things go — the observable is an LED — but it is still an undocumented write. |
+| 18 | Which bit of a Fixed PDO is which, for bits 24-29? | VENDOR-LIB names six flags in an order that does not match the published USB-PD field layout (§9.4). Two sources, one of them demonstrably wrong about two *other* fields in the same word, and no third. | Scan a charger whose capabilities are known independently — one whose dual-role and unconstrained-power behaviour is documented — and compare both readings of its 5 V object. A second charger of a different class settles it. |
+
+Neither blocks anything. 17 gates nothing but a nicer `led color`; 18 gates six booleans that are
+deliberately not decoded until somebody answers it.
 
 ---
 

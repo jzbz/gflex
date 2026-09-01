@@ -427,7 +427,7 @@ func TestEPRAVSInvalidPromotesCableFail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if l.Flags2&FlagEPRCableFail != 0 {
+	if l.Flags2&Flag2EPRCableFail != 0 {
 		t.Fatal("test blob accidentally set flags2 bit 3")
 	}
 	if !l.EPRCableFail {
@@ -448,7 +448,7 @@ func TestEPRAVSInvalidPromotesCableFail(t *testing.T) {
 }
 
 func TestFlags2CableFailBit(t *testing.T) {
-	l, err := Parse(buildLog(28000, 0, 1, 1, 0, FlagEPRCableFail, fixed5V3A))
+	l, err := Parse(buildLog(28000, 0, 1, 1, 0, Flag2EPRCableFail, fixed5V3A))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -695,4 +695,139 @@ func TestKindString(t *testing.T) {
 	if got := Kind(99).String(); got != "kind(99)" {
 		t.Errorf("Kind(99).String() = %q", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Negotiation flags
+// ---------------------------------------------------------------------------
+
+// TestStatusDecodesEveryNamedBitExactlyOnce walks the flag vocabulary itself:
+// for each bit, a log with only that bit set must light exactly that field and
+// name exactly that label.
+//
+// Driving the test from the same table the code uses would be circular for the
+// mask values, and is not for the wiring: the table maps a mask to a field
+// accessor and a label, and the failure this catches is two entries pointing at
+// one field -- a copy-paste that silently drops a bit and doubles another.
+// Nothing outside the table could notice that, and eighteen hand-written cases
+// would be the same copy-paste with a second chance to make it.
+func TestStatusDecodesEveryNamedBitExactlyOnce(t *testing.T) {
+	for _, group := range []struct {
+		name  string
+		bits  []statusBit
+		build func(mask uint16) []byte
+		label func(uint16) []string
+	}{
+		{"flags", flagBits,
+			func(m uint16) []byte { return buildLog(5000, 5000, 1, 1, m, 0, fixed5V3A) },
+			FlagLabels},
+		{"flags2", flag2Bits,
+			func(m uint16) []byte { return buildLog(5000, 5000, 1, 1, 0, m, fixed5V3A) },
+			Flag2Labels},
+	} {
+		for _, b := range group.bits {
+			t.Run(group.name+"/"+b.label, func(t *testing.T) {
+				l, err := Parse(group.build(b.mask))
+				if err != nil {
+					t.Fatalf("Parse: %v", err)
+				}
+				if !*b.field(&l.Status) {
+					t.Errorf("%s bit %#04x (%s) did not set its field", group.name, b.mask, b.label)
+				}
+				// Exactly one field, so no two entries share an accessor.
+				var lit int
+				for _, other := range append(append([]statusBit{}, flagBits...), flag2Bits...) {
+					if *other.field(&l.Status) {
+						lit++
+					}
+				}
+				if lit != 1 {
+					t.Errorf("%s bit %#04x (%s) set %d fields, want exactly 1", group.name, b.mask, b.label, lit)
+				}
+				if got := group.label(b.mask); len(got) != 1 || got[0] != b.label {
+					t.Errorf("labels for %#04x = %v, want [%q]", b.mask, got, b.label)
+				}
+			})
+		}
+	}
+}
+
+// A bit nobody has a name for is reported, not dropped. Two of the sixteen bits
+// of flags2 and fourteen of flags are unaccounted for, and a firmware that
+// starts setting one is exactly the thing this tool should show rather than
+// quietly discard.
+func TestFlagLabelsReportUnnamedBits(t *testing.T) {
+	got := Flag2Labels(Flag2EPRCableFail | 0x4000)
+	want := []string{"epr cable fail", "unknown 0x4000"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("Flag2Labels = %v, want %v", got, want)
+	}
+	if labels := FlagLabels(0); len(labels) != 0 {
+		t.Errorf("FlagLabels(0) = %v, want nothing", labels)
+	}
+}
+
+// Log.EPRCableFail is the union of the flags2 bit and the computed source (an
+// EPR AVS APDO that failed validation); Status.EPRCableFail is the bit alone.
+// They disagree on purpose exactly when the word is silent and the APDO is not,
+// and a reader of either needs the other to stay put.
+func TestStatusEPRCableFailIsTheBitAloneNotTheUnion(t *testing.T) {
+	// eprAVSBad declares 0 W, so it fails validation; the flag word is clear.
+	l, err := Parse(buildLog(28000, 0, 2, 1, 0, 0, fixed5V3A, eprAVSBad))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !l.EPRCableFail {
+		t.Error("Log.EPRCableFail is false; a failed EPR AVS APDO is its second source (SPEC.md §9.4)")
+	}
+	if l.Status.EPRCableFail {
+		t.Error("Status.EPRCableFail is true with flags2 bit 3 clear; it must report the bit, not the union")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fixed PDO capability bits
+// ---------------------------------------------------------------------------
+
+// EPR-capable and peak current are decoded for Fixed PDOs and are nil for every
+// other class, where those bit positions mean something else entirely. nil
+// rather than false is the point: "not EPR capable" and "this class has no such
+// bit" are different statements.
+func TestFixedPDOCapabilityBits(t *testing.T) {
+	// Bit 23 and bits 21:20, laid on the 20 V 5 A fixed word above. Both sit
+	// clear of the voltage (19:10) and current (9:0) fields, so the decoded
+	// figures must not move either.
+	const eprCapable, peakLevel2 uint32 = 1 << 23, 2 << 20
+
+	t.Run("fixed carries both", func(t *testing.T) {
+		l := simpleLog(t, fixed20V5A|eprCapable|peakLevel2)
+		p := l.PDOs[0]
+		if !nearly(p.VoltageV, 20) || !nearly(p.MaxCurrentA, 5) {
+			t.Errorf("capability bits disturbed the value fields: %v V, %v A", p.VoltageV, p.MaxCurrentA)
+		}
+		if p.EPRCapable == nil || !*p.EPRCapable {
+			t.Errorf("EPRCapable = %v, want true for a PDO with bit 23 set", p.EPRCapable)
+		}
+		if p.PeakCurrent == nil || *p.PeakCurrent != 2 {
+			t.Errorf("PeakCurrent = %v, want 2 from bits 21:20", p.PeakCurrent)
+		}
+	})
+	t.Run("fixed without the bits says so", func(t *testing.T) {
+		p := simpleLog(t, fixed20V5A).PDOs[0]
+		if p.EPRCapable == nil || *p.EPRCapable {
+			t.Errorf("EPRCapable = %v, want a non-nil false: the object carries the bit and it is clear", p.EPRCapable)
+		}
+		if p.PeakCurrent == nil || *p.PeakCurrent != 0 {
+			t.Errorf("PeakCurrent = %v, want a non-nil 0", p.PeakCurrent)
+		}
+	})
+	t.Run("other classes carry neither", func(t *testing.T) {
+		for _, raw := range []uint32{pps3321V5A, battery, eprAVS140W, sprAVS} {
+			p := simpleLog(t, raw).PDOs[0]
+			if p.EPRCapable != nil || p.PeakCurrent != nil {
+				t.Errorf("%s PDO reports epr_capable=%v peak_current=%v; those bits are not its fields",
+					p.Kind, p.EPRCapable, p.PeakCurrent)
+			}
+		}
+	})
 }

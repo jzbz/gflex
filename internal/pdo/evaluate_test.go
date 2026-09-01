@@ -328,7 +328,7 @@ func TestEvaluateEPRCableFaultSurfaced(t *testing.T) {
 func TestEvaluateEPRCableFaultOnSPROnlySource(t *testing.T) {
 	// flags2 says the cable failed, and no EPR capability was recorded as a
 	// result. Point at the cable rather than declaring the charger inadequate.
-	l, err := Parse(buildLog(28000, 0, 1, 1, 0, FlagEPRCableFail, fixed5V3A))
+	l, err := Parse(buildLog(28000, 0, 1, 1, 0, Flag2EPRCableFail, fixed5V3A))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestSPRAVSAssumptionDisclosedOnEveryDecidingPath(t *testing.T) {
 // may therefore have seen an incomplete picture.
 func TestEPRCableFailCaveatOnPositiveVerdict(t *testing.T) {
 	t.Run("flags2 bit with an EPR fixed verdict", func(t *testing.T) {
-		l, err := Parse(buildLog(28000, 0, 2, 1, 0, FlagEPRCableFail, fixed5V3A, fixed28V5A))
+		l, err := Parse(buildLog(28000, 0, 2, 1, 0, Flag2EPRCableFail, fixed5V3A, fixed28V5A))
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
@@ -620,7 +620,7 @@ func TestEPRCableFailCaveatOnPositiveVerdict(t *testing.T) {
 	t.Run("EPR AVS answering an SPR request", func(t *testing.T) {
 		// 18 V is below the EPR threshold, but the capability chosen is an EPR
 		// object, so entering EPR is still required and the caveat still bites.
-		l, err := Parse(buildLog(18000, 0, 2, 1, 0, FlagEPRCableFail, fixed5V3A, eprAVS140W))
+		l, err := Parse(buildLog(18000, 0, 2, 1, 0, Flag2EPRCableFail, fixed5V3A, eprAVS140W))
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
@@ -634,7 +634,7 @@ func TestEPRCableFailCaveatOnPositiveVerdict(t *testing.T) {
 		// No recorded failure: no caveat.
 		wantNoCaveat(t, simpleLog(t, fixed28V5A).Evaluate(28, 3), CaveatEPRCableFail)
 		// Recorded failure, but a purely SPR verdict that never needs EPR.
-		l, err := Parse(buildLog(9000, 0, 2, 1, 0, FlagEPRCableFail, fixed5V3A, fixed9V3A))
+		l, err := Parse(buildLog(9000, 0, 2, 1, 0, Flag2EPRCableFail, fixed5V3A, fixed9V3A))
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}

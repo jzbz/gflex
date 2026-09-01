@@ -39,7 +39,7 @@ const (
 	CmdHardwareID           Cmd = 10 // 8 ASCII bytes; never issued by the vendor app
 	CmdFirmwareVersion      Cmd = 11 // used: 12 ASCII bytes
 	CmdMfgDate              Cmd = 12 // 8 ASCII bytes; never issued by the vendor app
-	CmdFlashLEDSeqAdvanced  Cmd = 13 // UNKNOWN
+	CmdFlashLEDSeqAdvanced  Cmd = 13 // used by the vendor library: LED colour write, see LEDColor
 	CmdFlashLED             Cmd = 14 // UNKNOWN
 	CmdDisableLEDDuringOp   Cmd = 15 // used: 1 byte, inverted sense (see LEDAlwaysOn)
 	CmdEncryptMsg           Cmd = 16 // challenge/response of unknown construction

@@ -167,8 +167,19 @@ func TypicalPDOLog() []byte {
 	binary.LittleEndian.PutUint16(b[2:4], 4998)      // measuredVoltageMv
 	b[4] = 3                                         // nPdosReceived
 	b[5] = 1                                         // idSelectedPdo
-	binary.LittleEndian.PutUint16(b[6:8], 0)         // flags
-	binary.LittleEndian.PutUint16(b[8:10], 0)        // flags2, bit 3 = eprCableFail
+	// The negotiation flags of a source that was asked for 5 V and delivered it
+	// (SPEC.md §9.3). Written as literals rather than through internal/pdo's
+	// constants, for the reason the MIDI codec here is independent too: a fake
+	// that shares its vocabulary with the decoder cannot catch the decoder
+	// misreading the vocabulary.
+	//
+	//	flags  0x0005 = pd request accepted | voltage within tolerance
+	//	flags2 0x0003 = spr init pdos received | spr ps ready
+	//
+	// Bit 3 of flags2 -- eprCableFail -- is deliberately clear: this source is
+	// an SPR one and never attempted EPR entry.
+	binary.LittleEndian.PutUint16(b[6:8], 0x0005)  // flags
+	binary.LittleEndian.PutUint16(b[8:10], 0x0003) // flags2
 
 	// Fixed PDOs (type 0): voltage in 50 mV units at bits 19:10, maximum
 	// current in 10 mA units at bits 9:0 (SPEC.md §9.4).

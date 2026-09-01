@@ -223,6 +223,73 @@ func EncodeLEDAlwaysOn(alwaysOn bool) byte {
 func DecodeLEDAlwaysOn(b byte) bool { return b == 0 }
 
 // ---------------------------------------------------------------------------
+// LED colour (command 13). SPEC.md §6.2.
+// ---------------------------------------------------------------------------
+
+// LEDColor is a colour the LED can be driven to with CmdFlashLEDSeqAdvanced.
+//
+// The command was UNKNOWN for as long as the only source was the shipped vendor
+// application, which never issues it. The vendor's own published library does:
+// tundra-labs/lib.vflex.app documents the write and its eight colour values,
+// and ships a CLI that sends exactly this frame. That is a documented source,
+// not a measurement -- see LEDColorPayload for what remains unexplained.
+type LEDColor uint8
+
+// The eight colour values the vendor library defines.
+const (
+	LEDOff     LEDColor = 0
+	LEDRed     LEDColor = 1
+	LEDGreen   LEDColor = 2
+	LEDBlue    LEDColor = 3
+	LEDWhite   LEDColor = 4
+	LEDYellow  LEDColor = 5
+	LEDMagenta LEDColor = 6
+	LEDCyan    LEDColor = 7
+)
+
+// ledColorNames is the whole colour vocabulary, in wire order so that a listing
+// reads as the value table it is.
+var ledColorNames = []string{
+	LEDOff: "off", LEDRed: "red", LEDGreen: "green", LEDBlue: "blue",
+	LEDWhite: "white", LEDYellow: "yellow", LEDMagenta: "magenta", LEDCyan: "cyan",
+}
+
+// LEDColorNames returns every colour name, in wire order, for help text and for
+// the "valid colours are" line of a parse failure.
+func LEDColorNames() []string { return append([]string(nil), ledColorNames...) }
+
+// String returns the colour name, or a numeric form for a value outside the
+// table -- which is reachable, since nothing says the device rejects one.
+func (c LEDColor) String() string {
+	if int(c) < len(ledColorNames) {
+		return ledColorNames[c]
+	}
+	return fmt.Sprintf("color(%d)", uint8(c))
+}
+
+// ParseLEDColor resolves a colour name, case-insensitively.
+func ParseLEDColor(s string) (LEDColor, bool) {
+	for i, name := range ledColorNames {
+		if strings.EqualFold(s, name) {
+			return LEDColor(i), true
+		}
+	}
+	return 0, false
+}
+
+// LEDColorPayload builds the payload of an LED colour write: [10, 1, c, 2, 0].
+//
+// Only the middle byte is understood. The vendor library sends this exact
+// five-byte payload for every colour, varying nothing else, and its name --
+// FLASH_LED_SEQUENCE_ADVANCED -- suggests the surrounding bytes describe a
+// sequence: a duration, a step count, a repeat. Which is which is UNKNOWN, and
+// guessing at them would be inventing protocol rather than reproducing it, so
+// this sends the vendor's frame byte for byte and says so (SPEC.md §14.17).
+func LEDColorPayload(c LEDColor) []byte {
+	return []byte{10, 1, byte(c), 2, 0}
+}
+
+// ---------------------------------------------------------------------------
 // Identity strings.
 // ---------------------------------------------------------------------------
 

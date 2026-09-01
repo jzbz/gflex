@@ -709,13 +709,15 @@ func firstErr(errs ...error) error {
 func newLEDCommand(app *App) *cobra.Command {
 	cmd := group(&cobra.Command{
 		Use:   "led",
-		Short: "Read or set the \"LED Always On\" setting",
-		Long: "\"on\" is the user-facing setting: the LED stays lit in the Power Good state.\n" +
-			"\"off\" suppresses it only while solid green; every other state still lights\n" +
-			"(SPEC.md §1.1).\n\n" +
+		Short: "Read or set the \"LED Always On\" setting, or drive the LED to a colour",
+		Long: "get and set carry the \"LED Always On\" setting. \"on\" is the user-facing sense:\n" +
+			"the LED stays lit in the Power Good state. \"off\" suppresses it only while solid\n" +
+			"green; every other state still lights (SPEC.md §1.1).\n\n" +
 			"The wire field is named the other way round -- DISABLE_LED_DURING_OPERATION, where\n" +
 			"0 means always-on -- so this command deliberately does not use the wire name\n" +
-			"(SPEC.md §6.2).",
+			"(SPEC.md §6.2).\n\n" +
+			"color is a different command (13) and a momentary effect rather than a setting;\n" +
+			"see `gflex led color --help`.",
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "get",
@@ -784,7 +786,62 @@ func newLEDCommand(app *App) *cobra.Command {
 			})
 		},
 	})
+	cmd.AddCommand(newLEDColorCommand(app))
 	return cmd
+}
+
+// newLEDColorCommand drives the LED to a colour with command 13.
+//
+// This is the one command in the tree whose only source is the vendor's
+// published library rather than the shipped application or a measurement, and
+// the help says so. Everything else here was either read out of the app that
+// ships to users or confirmed on hardware (SPEC.md §0); this was transcribed
+// from tundra-labs/lib.vflex.app, which documents the write and the eight
+// colours and ships a CLI that sends it.
+func newLEDColorCommand(app *App) *cobra.Command {
+	return &cobra.Command{
+		Use:   "color " + strings.Join(proto.LEDColorNames(), "|"),
+		Short: "Drive the LED to a colour",
+		Long: "Sends command 13 (FLASH_LED_SEQUENCE_ADVANCED) with the vendor library's own\n" +
+			"five-byte payload, [10, 1, color, 2, 0].\n\n" +
+			"Only the colour byte is understood. The other four are sent unchanged because\n" +
+			"that is what the vendor's library sends for every colour; the command's name\n" +
+			"suggests they describe a sequence, but nothing documents them (SPEC.md §14.17).\n\n" +
+			"How long the colour lasts, and whether it survives a power state change, are\n" +
+			"both unknown -- there is no read side to ask. Use --dry-run to see the frame\n" +
+			"without sending it.",
+		Args:      cobra.ExactArgs(1),
+		ValidArgs: proto.LEDColorNames(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return app.run(cmd, func(ctx context.Context, f Formatter) error {
+				colour, ok := proto.ParseLEDColor(args[0])
+				if !ok {
+					return codedf(ExitUsage, "unknown colour %q; valid colours are %s",
+						args[0], strings.Join(proto.LEDColorNames(), ", "))
+				}
+				if app.DryRun {
+					frame, err := proto.Write(proto.CmdFlashLEDSeqAdvanced, proto.LEDColorPayload(colour))
+					if err != nil {
+						return err
+					}
+					return app.dryRun(f, frame)
+				}
+				c, err := app.connect(ctx, f)
+				if err != nil {
+					return err
+				}
+				defer c.Close()
+				if err := c.Session.SetLEDColor(ctx, colour); err != nil {
+					return fmt.Errorf("setting the LED colour: %w", err)
+				}
+				// "(written)" for the same reason as `led set` above: no read
+				// side exists at all here, so this is what was sent, not what
+				// the device is known to be showing.
+				f.KV("led_color", "led colour", colour.String(), colour.String()+"  (written)")
+				return nil
+			})
+		},
+	}
 }
 
 // ---------------------------------------------------------------------------

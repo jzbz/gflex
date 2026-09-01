@@ -495,3 +495,63 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// LED colour (command 13)
+// ---------------------------------------------------------------------------
+
+// The colour table is the vendor library's, and the payload is the frame its
+// CLI sends. Both are transcribed rather than derived, so pin them literally:
+// the failure this catches is somebody "tidying" a magic number that is not
+// ours to tidy.
+func TestLEDColorPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		c    LEDColor
+		want []byte
+	}{
+		{"off", LEDOff, []byte{10, 1, 0, 2, 0}},
+		{"red", LEDRed, []byte{10, 1, 1, 2, 0}},
+		{"cyan", LEDCyan, []byte{10, 1, 7, 2, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := LEDColorPayload(tc.c)
+			if len(got) != len(tc.want) {
+				t.Fatalf("payload = % X, want % X", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("payload = % X, want % X", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestParseLEDColor(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want LEDColor
+	}{{"off", LEDOff}, {"RED", LEDRed}, {"Green", LEDGreen}, {"magenta", LEDMagenta}, {"cyan", LEDCyan}} {
+		got, ok := ParseLEDColor(tc.in)
+		if !ok || got != tc.want {
+			t.Errorf("ParseLEDColor(%q) = %v,%v, want %v,true", tc.in, got, ok, tc.want)
+		}
+		if got.String() != strings.ToLower(tc.in) {
+			t.Errorf("%v.String() = %q, want %q", got, got.String(), strings.ToLower(tc.in))
+		}
+	}
+	for _, bad := range []string{"", "chartreuse", "8", "of"} {
+		if got, ok := ParseLEDColor(bad); ok {
+			t.Errorf("ParseLEDColor(%q) = %v,true, want a refusal", bad, got)
+		}
+	}
+	// A value outside the table is reachable -- nothing says the device refuses
+	// one -- so String must not index past the names.
+	if got := LEDColor(200).String(); got != "color(200)" {
+		t.Errorf("LEDColor(200).String() = %q, want color(200)", got)
+	}
+	if names := LEDColorNames(); len(names) != 8 || names[0] != "off" || names[7] != "cyan" {
+		t.Errorf("LEDColorNames() = %v, want the eight vendor colours in wire order", names)
+	}
+}

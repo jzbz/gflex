@@ -300,6 +300,7 @@ cable — without one, the device fast-blinks red.
 gflex current set 3A                        # negotiated current limit, max 5 A
 gflex vlimit set --low 3.3V --high 24V      # clamp the range voltage set will accept
 gflex led set off                           # LED off while in the green "power good" state
+gflex led color blue                        # drive the LED to a colour
 gflex measure                               # device's own measurement of its output
 ```
 
@@ -404,6 +405,7 @@ you care about with `-v` in another, which traces the session's own frames as we
 | `gflex measure` | The device's own measurement of its output |
 | `gflex calibrate get \| adc` | Read or write the ADC calibration |
 | `gflex led get \| set on\|off` | The "LED Always On" setting |
+| `gflex led color <colour>` | Drive the LED to one of eight colours (see SPEC §6.2) |
 | `gflex authlock get \| set` | Read or set the auth lock (effect undocumented — see SPEC §14) |
 | `gflex scan` | Guided capture of a power source's PD capabilities |
 | `gflex pdo dump \| clear` | Re-decode or erase the stored capability log |
@@ -535,9 +537,11 @@ negotiated and is in tolerance; slow-blinking red means the *source* can't suppl
 — run `gflex scan` against that charger to see what it actually offers.
 
 **A scan says "not achievable" for a voltage you believe is supported.** Run `gflex pdo dump` and
-read the decoded table. Fixed PDOs must match exactly; PPS and AVS ranges are inclusive. If the log
-records an EPR cable failure, the scan may not have seen the source's real capability — refit an
-eMarker-equipped 5 A cable and rescan.
+read the decoded table. Fixed PDOs must match exactly; PPS and AVS ranges are inclusive. Then read
+the `negotiation:` line above it, which names the flags the device set during the exchange: `pd
+request rejected`, `epr rejected` and `epr cable fail` each say something different about why the
+source did not deliver. An EPR cable failure in particular means the scan may not have seen the
+source's real capability — refit an eMarker-equipped 5 A cable and rescan.
 
 ---
 
@@ -559,6 +563,14 @@ Two honest qualifications, because the term gets used loosely:
   JavaScript and Hermes bytecode; this is Go, written from a written description of behaviour. What
   was extracted are interface facts — that command 18 carries a big-endian millivolt value, that the
   LED byte is inverted — not creative expression.
+
+A third source arrived later. In 2026-08 the vendor published
+[lib.vflex.app](https://github.com/tundra-labs/lib.vflex.app), an MIT-licensed JavaScript library
+documenting the same protocol. It is neither the shipped app nor a measurement, so claims that rest
+on it are marked **VENDOR-LIB** in the spec and it does not automatically win a disagreement: it
+gave us the names of the PD negotiation flags and the LED colour command, and two of its PDO decodes
+are narrower than the layout already recorded here, which [SPEC.md
+§9.4](SPEC.md#94-pdo-decode) sets out and does not follow. Facts were taken from it; code was not.
 
 Nothing here derives from vendor source, licensed documentation, or confidential material. The
 manual cited is public; the APK was obtained as a shipped artifact. Reverse-engineering for

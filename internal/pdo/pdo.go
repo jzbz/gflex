@@ -47,13 +47,163 @@ const (
 	MaxPDOs = 20
 )
 
-// FlagEPRCableFail is bit 3 of the flags2 word: the device could not establish
-// Extended Power Range operation, in practice because the attached cable is not
-// an eMarked 5 A EPR cable. SPEC.md §9.3.
+// The bits of the two flag words, SPEC.md §9.3.
 //
-// Note that this is only one of two sources for the condition: an EPR_AVS APDO
-// that fails validation sets Log.EPRCableFail as well (SPEC.md §9.4).
-const FlagEPRCableFail uint16 = 0x0008
+// The vocabulary comes from the vendor's published library, which names all
+// eighteen; the shipped application this protocol was otherwise recovered from
+// consumes only Flag2EPRCableFail and discards the rest. Nothing here is
+// measured -- see the note on Status.
+const (
+	// Bits of Log.Flags.
+	FlagPDRequestAccepted      uint16 = 0x0001
+	FlagPDRequestRejected      uint16 = 0x0002
+	FlagVoltageWithinTolerance uint16 = 0x0004
+	FlagWebUSBConnection       uint16 = 0x0008
+
+	// Bits of Log.Flags2.
+	Flag2SPRInitPDOsReceived        uint16 = 0x0001
+	Flag2SPRPSReady                 uint16 = 0x0002
+	Flag2NonEPRPS                   uint16 = 0x0004
+	Flag2EPRCableFail               uint16 = 0x0008
+	Flag2NonEPRPSReady              uint16 = 0x0010
+	Flag2NonEPRPSReject             uint16 = 0x0020
+	Flag2EPRAvailable               uint16 = 0x0040
+	Flag2EPREnterRequest            uint16 = 0x0080
+	Flag2EPREnterRequestAck         uint16 = 0x0100
+	Flag2EPREntered                 uint16 = 0x0200
+	Flag2EPRRejected                uint16 = 0x0400
+	Flag2EPRFirstPDOsChunkReceived  uint16 = 0x0800
+	Flag2EPRSecondPDOsChunkReceived uint16 = 0x1000
+	Flag2EPRPSReady                 uint16 = 0x2000
+)
+
+// Status is the decoded negotiation state carried by the two flag words.
+//
+// It is a record of how the last power negotiation went, not a capability: the
+// PDOs say what the source offers, these bits say what happened when the device
+// asked for something. That makes them the first thing to look at when a scan
+// came back with a target voltage the source plainly advertises -- a rejected
+// request, an EPR entry the source refused, a cable that could not carry EPR.
+//
+// # Provenance
+//
+// The names are the vendor's own, from its published library
+// (tundra-labs/lib.vflex.app), corroborated between that library and the vendor
+// web tool in the same repository. None of them is measured, and only
+// EPRCableFail has ever been observed to do anything here. A bit whose label
+// turns out to be wrong is wrong in the output too, which is why Log.Flags and
+// Log.Flags2 are still reported raw beside this: the words are the evidence,
+// this is the reading of them.
+//
+// # EPRCableFail
+//
+// This field is bit 3 alone. Log.EPRCableFail is the union of that bit with the
+// second, computed source -- an EPR AVS APDO that failed validation -- and it is
+// the one Evaluate consults. The two therefore disagree, on purpose, exactly
+// when the flag word is silent and the APDO is not.
+type Status struct {
+	PDRequestAccepted      bool `json:"pd_request_accepted"`
+	PDRequestRejected      bool `json:"pd_request_rejected"`
+	VoltageWithinTolerance bool `json:"voltage_within_tolerance"`
+	WebUSBConnection       bool `json:"webusb_connection"`
+
+	SPRInitPDOsReceived        bool `json:"spr_init_pdos_received"`
+	SPRPSReady                 bool `json:"spr_ps_ready"`
+	NonEPRPS                   bool `json:"non_epr_ps"`
+	EPRCableFail               bool `json:"epr_cable_fail"`
+	NonEPRPSReady              bool `json:"non_epr_ps_ready"`
+	NonEPRPSReject             bool `json:"non_epr_ps_reject"`
+	EPRAvailable               bool `json:"epr_available"`
+	EPREnterRequest            bool `json:"epr_enter_request"`
+	EPREnterRequestAck         bool `json:"epr_enter_request_ack"`
+	EPREntered                 bool `json:"epr_entered"`
+	EPRRejected                bool `json:"epr_rejected"`
+	EPRFirstPDOsChunkReceived  bool `json:"epr_first_pdos_chunk_received"`
+	EPRSecondPDOsChunkReceived bool `json:"epr_second_pdos_chunk_received"`
+	EPRPSReady                 bool `json:"epr_ps_ready"`
+}
+
+// statusBit ties one bit to its name and to the field it decodes into.
+type statusBit struct {
+	mask  uint16
+	label string
+	field func(*Status) *bool
+}
+
+// The flag vocabulary, once. A bit named in the output but missing from Status,
+// or decoded into Status but never named, is the drift this table exists to
+// make impossible; both listings below are generated from it. Wire order, so
+// that a rendering of the set bits reads in the order the device laid them out.
+var (
+	flagBits = []statusBit{
+		{FlagPDRequestAccepted, "pd request accepted", func(s *Status) *bool { return &s.PDRequestAccepted }},
+		{FlagPDRequestRejected, "pd request rejected", func(s *Status) *bool { return &s.PDRequestRejected }},
+		{FlagVoltageWithinTolerance, "voltage within tolerance", func(s *Status) *bool { return &s.VoltageWithinTolerance }},
+		{FlagWebUSBConnection, "webusb connection", func(s *Status) *bool { return &s.WebUSBConnection }},
+	}
+	flag2Bits = []statusBit{
+		{Flag2SPRInitPDOsReceived, "spr init pdos received", func(s *Status) *bool { return &s.SPRInitPDOsReceived }},
+		{Flag2SPRPSReady, "spr ps ready", func(s *Status) *bool { return &s.SPRPSReady }},
+		{Flag2NonEPRPS, "non-epr ps", func(s *Status) *bool { return &s.NonEPRPS }},
+		{Flag2EPRCableFail, "epr cable fail", func(s *Status) *bool { return &s.EPRCableFail }},
+		{Flag2NonEPRPSReady, "non-epr ps ready", func(s *Status) *bool { return &s.NonEPRPSReady }},
+		{Flag2NonEPRPSReject, "non-epr ps reject", func(s *Status) *bool { return &s.NonEPRPSReject }},
+		{Flag2EPRAvailable, "epr available", func(s *Status) *bool { return &s.EPRAvailable }},
+		{Flag2EPREnterRequest, "epr enter request", func(s *Status) *bool { return &s.EPREnterRequest }},
+		{Flag2EPREnterRequestAck, "epr enter request ack", func(s *Status) *bool { return &s.EPREnterRequestAck }},
+		{Flag2EPREntered, "epr entered", func(s *Status) *bool { return &s.EPREntered }},
+		{Flag2EPRRejected, "epr rejected", func(s *Status) *bool { return &s.EPRRejected }},
+		{Flag2EPRFirstPDOsChunkReceived, "epr 1st pdo chunk received", func(s *Status) *bool { return &s.EPRFirstPDOsChunkReceived }},
+		{Flag2EPRSecondPDOsChunkReceived, "epr 2nd pdo chunk received", func(s *Status) *bool { return &s.EPRSecondPDOsChunkReceived }},
+		{Flag2EPRPSReady, "epr ps ready", func(s *Status) *bool { return &s.EPRPSReady }},
+	}
+)
+
+// decodeStatus reads both flag words into their named fields.
+func decodeStatus(flags, flags2 uint16) Status {
+	var s Status
+	for _, group := range []struct {
+		word uint16
+		bits []statusBit
+	}{{flags, flagBits}, {flags2, flag2Bits}} {
+		for _, b := range group.bits {
+			if group.word&b.mask != 0 {
+				*b.field(&s) = true
+			}
+		}
+	}
+	return s
+}
+
+// FlagLabels names the bits set in the flags word, and Flag2Labels those in
+// flags2, both in wire order.
+//
+// A bit with no name is reported as "unknown 0x…" rather than dropped. Fourteen
+// of sixteen bits of flags2 are spoken for and two of flags are, so an unnamed
+// bit is either a firmware newer than the vocabulary or a misreading of the
+// word -- and either one is worth seeing rather than hiding.
+func FlagLabels(flags uint16) []string { return labelBits(flags, flagBits) }
+
+// Flag2Labels is FlagLabels for the second word.
+func Flag2Labels(flags2 uint16) []string { return labelBits(flags2, flag2Bits) }
+
+func labelBits(word uint16, bits []statusBit) []string {
+	var out []string
+	named := uint16(0)
+	for _, b := range bits {
+		named |= b.mask
+		if word&b.mask != 0 {
+			out = append(out, b.label)
+		}
+	}
+	for i := range 16 {
+		mask := uint16(1) << i
+		if word&mask != 0 && named&mask == 0 {
+			out = append(out, fmt.Sprintf("unknown 0x%04x", mask))
+		}
+	}
+	return out
+}
 
 // Voltage boundaries used to classify and evaluate capabilities.
 const (
@@ -217,6 +367,34 @@ type PDO struct {
 	// field (which PDPWatts cannot represent) and, for symmetry, the EPR AVS
 	// PDP. This field has no counterpart in the vendor app.
 	MaxPowerW float64 `json:"max_power_w,omitempty"`
+
+	// EPRCapable is bit 23 of a Fixed Supply PDO: the source can operate in the
+	// Extended Power Range. USB-PD requires every EPR-capable source to set it
+	// on all of its fixed objects, so the mandatory 5 V object answers "does
+	// this charger do EPR at all" directly -- where Evaluate otherwise has to
+	// infer it from which object classes turned up.
+	//
+	// PeakCurrent is bits 21:20 of the same object: how far above its rated
+	// current the source will go, briefly, and for how long. It is an index
+	// into a USB-PD table of overload profiles, not a current; 0 means no
+	// overload capability. It is reported as the raw index because the table it
+	// indexes has not been transcribed here.
+	//
+	// Both are pointers because both are defined only for Fixed Supply PDOs.
+	// nil says "this class does not carry the field", which false and 0 cannot:
+	// a source that is not EPR-capable and one whose PDO has no such bit are
+	// different statements, and squashing them would put the second in the
+	// output as though it were the first.
+	//
+	// The other six flags a Fixed PDO carries (dual-role power and data, USB
+	// suspend, unconstrained power, USB communications capable, unchunked
+	// extended messages) are deliberately NOT decoded: the vendor's library and
+	// the published USB-PD field order disagree about which bit is which, and
+	// nothing here has been checked against a charger whose capabilities are
+	// known independently. Raw carries them for whoever settles it
+	// (SPEC.md §14.18).
+	EPRCapable  *bool `json:"epr_capable,omitempty"`
+	PeakCurrent *int  `json:"peak_current,omitempty"`
 }
 
 // Log is a decoded PDO capture.
@@ -227,6 +405,9 @@ type Log struct {
 	SelectedPDOID     uint8  `json:"selected_pdo_id"`
 	Flags             uint16 `json:"flags"`
 	Flags2            uint16 `json:"flags2"`
+	// Status is Flags and Flags2 decoded into named bits. The words above stay
+	// beside it because they are the evidence and this is the reading.
+	Status Status `json:"status"`
 	// EPRCableFail is the union of two independent signals: bit 3 of Flags2,
 	// and an EPR_AVS APDO that failed validation (SPEC.md §9.4).
 	EPRCableFail bool  `json:"epr_cable_fail"`
@@ -257,7 +438,8 @@ func Parse(b []byte) (*Log, error) {
 		Flags:             binary.LittleEndian.Uint16(blob[6:8]),
 		Flags2:            binary.LittleEndian.Uint16(blob[8:10]),
 	}
-	l.EPRCableFail = l.Flags2&FlagEPRCableFail != 0
+	l.Status = decodeStatus(l.Flags, l.Flags2)
+	l.EPRCableFail = l.Flags2&Flag2EPRCableFail != 0
 
 	// Only the first nPdosReceived slots hold data; the rest of the array is
 	// stale or never written. Bound it at MaxPDOs so a corrupt count cannot
@@ -307,6 +489,13 @@ func decodePDO(index int, raw uint32) PDO {
 func decodeFixed(p *PDO, raw uint32) {
 	p.Kind = KindFixed
 	p.VoltageV = round2(0.05 * float64((raw>>10)&0x3FF))
+	// Bit 23 and bits 21:20. These two are the only capability fields of a
+	// Fixed PDO that the vendor's library and the published USB-PD layout agree
+	// on; see the PDO struct for why the other six are left in Raw
+	// (SPEC.md §9.4).
+	eprCapable := (raw>>23)&1 != 0
+	peakCurrent := int((raw >> 20) & 3)
+	p.EPRCapable, p.PeakCurrent = &eprCapable, &peakCurrent
 	// Ten bits of 10 mA reach 10.23 A, which no cable and no VFLEX can carry;
 	// see MaxCableCurrentA. Above 20 V it is doubly impossible, since EPR
 	// operation presupposes a 5 A eMarked cable.

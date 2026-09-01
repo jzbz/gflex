@@ -317,3 +317,50 @@ func TestPDOTableDoesNotInventACableBound(t *testing.T) {
 		t.Errorf("a current within the cable rating was reported as bounded:\n%s", got)
 	}
 }
+
+// TestPDOOutputNamesTheNegotiationFlags is the regression test for two words of
+// hex nobody could read.
+//
+// SPEC.md §9.3 recorded the gap: the flag words were parsed and discarded, and
+// they are the answer to "the charger advertises this voltage, so why did the
+// scan not get it". The words are still printed -- they are the evidence -- but
+// a reader gets the names too.
+func TestPDOOutputNamesTheNegotiationFlags(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 1,
+		Flags:         pdo.FlagPDRequestRejected,
+		Flags2:        pdo.Flag2EPRAvailable | pdo.Flag2EPRRejected,
+		PDOs:          []pdo.PDO{{Index: 0, Kind: pdo.KindFixed, VoltageV: 5, MaxCurrentA: 3, Valid: true}},
+	}
+	got := renderPDOLog(t, log)
+
+	for _, want := range []string{"pd request rejected", "epr available", "epr rejected"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the output does not name the %q bit:\n%s", want, got)
+		}
+	}
+	// The raw words survive alongside the reading of them: the names come from
+	// the vendor's library rather than from a measurement, so a reader who
+	// distrusts one still has the other.
+	if !strings.Contains(got, "0x0002") || !strings.Contains(got, "0x0440") {
+		t.Errorf("the raw flag words are gone from the output:\n%s", got)
+	}
+	// A bit that is clear must not be named at all -- eighteen labels every run
+	// would bury the two that mean something.
+	if strings.Contains(got, "pd request accepted") {
+		t.Errorf("a clear bit was named:\n%s", got)
+	}
+}
+
+// A log that parsed but flagged nothing says so, rather than dropping the line.
+// An empty section reads as "this build has no flags section"; the sentence
+// reads as the finding it is.
+func TestPDOOutputSaysWhenNothingIsFlagged(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 1,
+		PDOs:          []pdo.PDO{{Index: 0, Kind: pdo.KindFixed, VoltageV: 5, MaxCurrentA: 3, Valid: true}},
+	}
+	if got := renderPDOLog(t, log); !strings.Contains(got, "nothing flagged") {
+		t.Errorf("a log with both flag words clear says nothing about them:\n%s", got)
+	}
+}

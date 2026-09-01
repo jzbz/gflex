@@ -258,6 +258,68 @@ func TestLEDSetReportsWhatItWrote(t *testing.T) {
 	}
 }
 
+// TestLEDColorSendsTheVendorFrame pins command 13 byte for byte.
+//
+// This is the one command whose only source is the vendor's published library
+// rather than the shipped application or a measurement (SPEC.md §14.11): the
+// colour goes in the middle byte and the four around it are sent unchanged
+// because that is what the vendor sends. A test that only checked "a write for
+// command 13 arrived" would let somebody tidy those four away, and there is no
+// read side and no hardware here to notice.
+func TestLEDColorSendsTheVendorFrame(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+	if err := tr.run(t, "led", "color", "magenta"); err != nil {
+		t.Fatalf("`led color magenta`: %v", err)
+	}
+
+	var frame []byte
+	for _, fr := range dev.Sent() {
+		parsed, err := proto.Parse(fr)
+		if err != nil {
+			t.Fatalf("the device received an unparseable frame %s: %v", proto.Hex(fr), err)
+		}
+		if parsed.Cmd == proto.CmdFlashLEDSeqAdvanced {
+			frame = fr
+		}
+	}
+	if frame == nil {
+		t.Fatalf("`led color magenta` never reached the device:\n%s", tr.stdout.String())
+	}
+	// 07 8d 0a 01 06 02 00: length, command 13 with the write bit, then
+	// [10, 1, magenta=6, 2, 0].
+	if got := proto.Hex(frame); got != "07 8d 0a 01 06 02 00" {
+		t.Errorf("frame = %s, want 07 8d 0a 01 06 02 00", got)
+	}
+	// Written, not read back -- there is no read side at all for this command.
+	if !strings.Contains(tr.stdout.String(), "(written)") {
+		t.Errorf("`led color` presents an unverified write as confirmed state:\n%s", tr.stdout.String())
+	}
+}
+
+// An unknown colour is a usage error, and the refusal lists the eight that work
+// rather than leaving the caller to guess at a vocabulary it cannot read
+// anywhere else.
+func TestLEDColorRefusesAnUnknownColour(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+	err := tr.run(t, "led", "color", "chartreuse")
+	if err == nil {
+		t.Fatal("`led color chartreuse` was accepted")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	for _, want := range []string{"magenta", "cyan", "off"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not list %q as a valid colour:\n%v", want, err)
+		}
+	}
+	if tr.wrote(t, proto.CmdFlashLEDSeqAdvanced) {
+		t.Error("an unknown colour still reached the device")
+	}
+}
+
 // The Go-literal shapes are usage errors through the real tree as well, so a
 // script cannot feed them past cobra.
 func TestAuthLockSetRefusesGoLiteralShapes(t *testing.T) {

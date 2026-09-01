@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -217,6 +218,7 @@ func emitPDOLog(f Formatter, log *pdo.Log, blob []byte, withRaw, setDoc bool) {
 	f.KV("flags", "flags", log.Flags, fmt.Sprintf("0x%04x", log.Flags))
 	f.KV("flags2", "flags2", log.Flags2, fmt.Sprintf("0x%04x", log.Flags2))
 	f.KV("epr_cable_fail", "epr cable fail", log.EPRCableFail, eprCableText(log.EPRCableFail))
+	emitNegotiation(f, log)
 
 	rows := make([][]string, 0, len(log.PDOs))
 	for _, p := range log.PDOs {
@@ -253,6 +255,36 @@ func emitPDOLog(f Formatter, log *pdo.Log, blob []byte, withRaw, setDoc bool) {
 		f.Note("")
 		f.Note("raw blob (little-endian): %s", proto.Hex(blob))
 	}
+}
+
+// emitNegotiation names the flag bits that are set, for the human path only.
+//
+// The two words are printed above as hex because they are the evidence; this is
+// the reading of them, and it is the answer to "the charger advertises 28 V, so
+// why did the scan not get it" -- a rejected request, an EPR entry the source
+// refused, a cable that could not carry EPR. SPEC.md §9.3 asked for exactly
+// this: the flags were parsed and discarded, and they are free diagnostics.
+//
+// One line, however long, rather than a wrapped block or a truncated list: the
+// same call this file's table makes, for the same reason (see writeTable).
+//
+// It goes out as a KV with an empty key, which both formatters already treat as
+// "human only" -- the JSON one skips an empty key outright. That is the right
+// shape here rather than a Note: a Note would break the run of aligned KV rows
+// above and land unindented in the middle of them, and JSON callers want
+// log.Status, where every bit is named whether it is set or not, not a
+// pre-joined sentence.
+//
+// An empty list is still printed. A log that parsed but negotiated nothing is a
+// real state, and silence would read as "no flags section" rather than as the
+// finding it is.
+func emitNegotiation(f Formatter, log *pdo.Log) {
+	labels := append(pdo.FlagLabels(log.Flags), pdo.Flag2Labels(log.Flags2)...)
+	if len(labels) == 0 {
+		f.KV("", "negotiation", nil, "nothing flagged -- neither word has a bit set")
+		return
+	}
+	f.KV("", "negotiation", nil, strings.Join(labels, ", "))
 }
 
 // hasSPRAVS reports whether any decoded object is an SPR AVS APDO, which is the
