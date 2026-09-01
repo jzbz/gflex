@@ -646,6 +646,13 @@ counted list of colour records, and the vendor's five bytes are its one-record c
 | 1 | solid — which is why the vendor's payload reads as a plain "set the colour" |
 | 2 | the first colour, with a flash of the second too quick to time by eye |
 | 3 | the first two alternating at about half a second, the third too quick to see |
+| 4 | the first, second and fourth cycling; **the third** too quick to see |
+
+**The brief phase is positional: it is the third record**, once a list has three or more. Swapping
+records 3 and 4 moves which colour disappears — `[red, green, blue, white]` shows red, green, white
+and `[red, green, white, blue]` shows red, green, blue — so it follows the slot, not the colour. With
+two records it is the second; with three, third and last are the same slot, which is what made this
+look like "the last record is brief" for as long as no list was longer than three.
 
 Two earlier readings of this — "plays once rather than looping" and "the third record is dropped" —
 were the same perceptual error and both were wrong. What broke them was one well-chosen frame,
@@ -663,10 +670,11 @@ not, since the same lag sits at both ends and subtracts out. 44–50 taps per ru
 | 3 — red, green, blue | 1274 ms | 572 ms (sd 42, n=20) |
 | 4 — red, green, blue, white | 1783 ms | 446 ms (sd 75, n=21) |
 
-Each run on its own suggests a different rule and none survives the other two. Four records fit equal
-phases almost exactly (446 × 4 = 1783). Three records fit two long and one brief (572 + 572 + 130 =
-1274). Two records fit neither, and solving the three- and two-record pair for a fixed per-record
-duration gives a negative one.
+Each run on its own suggests a different rule and none survives the other two. Three records fit two
+long and one brief (572 + 572 + 130 = 1274). Two records fit neither that nor anything simpler, and
+solving the three- and two-record pair for a fixed per-record duration gives a negative one. Four
+records appear to fit equal phases — 446 × 4 = 1783 — but that reading is refuted independently: one
+of those four records is the brief third, so the arithmetic is a coincidence rather than a fit.
 
 The one thing that does hold across all of it is a negative result, and it is what kills every
 formula tried: **the phase duration is a property of the list, not of the record.** Red is the first
@@ -1522,6 +1530,13 @@ observation: there is no fixed per-record duration. Cycle times for two, three a
 511, 1274 and 1783 ms, no formula fits all three, and the first record of a list holds for 572 ms in
 one list and 446 ms in another — six sigma apart. Phase duration is a property of the whole list.
 The measurements are in §6.2 and are offered as measurements, not as a rule.
+
+A fourth correction followed, and it is the one worth reading. The brief phase is **positional — the
+third record** — not the last. Swapping records 3 and 4 of a four-record list moves which colour
+disappears, so it tracks the slot rather than the colour. Every earlier list had been short enough
+that its third record was also its last, so "the last record is brief" fitted three separate
+observations and was still wrong. It took a list long enough to tell the two apart, and an operator
+who noticed that a four-colour list was showing three.
 
 18 gates six booleans that are deliberately not decoded until somebody answers it.
 
