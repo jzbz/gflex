@@ -654,10 +654,11 @@ Three behaviours follow, and they are what a caller needs:
 - **A multi-record list plays once, not in a loop.** Two records give the first colour solid with a
   brief flash of the second as the frame lands. Reproduced twice from two different prior colours.
 
-**Out-of-range colours are refused, not masked, and not consistently.** 9 and 11 are acknowledged and
-discarded — the LED does not move, where a 3-bit mask would have shown red and blue. But 32 turns the
-LED off, twice, the second time from a known-distinct prior. No reading covers both; §14.17 keeps
-what is left.
+**Any colour value above 7 turns the LED off.** 8, 9, 11, 16, 32 and 33 were each sent from a
+known-distinct prior colour and every one goes dark. It is not a mask — a 3-bit mask would show red
+for 9 and for 33 — and it is not a suppression bit, since 8 and 16 share no bit with 32 beyond being
+greater than 7. The firmware treats anything outside the table as "off" rather than refusing the
+frame, so an out-of-range colour is indistinguishable from colour 0 at the LED.
 
 `gflex led color` sends the one-record form and reports what it wrote, annotated `(written)`, on the
 same terms as `led set` and `authlock set` — there being nothing to read back.
@@ -1459,14 +1460,24 @@ case; the name FLASH_LED_SEQUENCE_ADVANCED is literal. The full layout, the mark
 read exactly 2, the RAM-only latching and the one-shot playback are in §6.2. Every stored setting was
 byte-identical before and after.
 
-Two smaller things came out of it and stay open, neither blocking anything:
+Out-of-range colours were chased down in the same session: **anything above 7 turns the LED off**
+(8, 9, 11, 16, 32 and 33, each from a distinct prior). Not a mask, not a suppression bit.
 
-- **Out-of-range colours are refused, not masked — inconsistently.** 9 and 11 are acknowledged and
-  discarded; 32 turns the LED off. A mask would have made 9 and 11 read as red and blue. Worth one
-  frame each on 8, 16 and 33: if 33 also goes dark then bit 5 is an "off" flag independent of the low
-  bits, and 9 and 11 are failing on bit 3.
-- **The flash was eyeballed, not timed.** "One-shot rather than looping" is the consistent reading of
-  five descriptions across two trials, not a measurement.
+Two notes on the method, because both mistakes were the observer's and either would have produced a
+confident wrong answer:
+
+- **The effect latches, so "unchanged" and "set to what it already was" look identical.** Three early
+  observations carried that confound and were re-taken; every probe from then on resets to a colour
+  absent from the probe first.
+- **"Dark" is not "no change".** 9 and 11 were first recorded as *refused* on the strength of an
+  answer that said "no other colors" — literally true of a dark state, which is not a colour. That
+  reading supported a bit-flag theory for two hours before a single-probe re-run with the question
+  put as "dark, or still cyan?" killed it. Ask for the state, never for the change, and never batch a
+  probe whose failure mode looks like its neighbour's.
+
+What is left is smaller: whether a list of three or more records behaves as two does, and whether the
+flash is genuinely one-shot — that last is the consistent reading of five descriptions across two
+trials, not a measurement.
 
 18 gates six booleans that are deliberately not decoded until somebody answers it.
 

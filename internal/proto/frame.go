@@ -234,9 +234,10 @@ func DecodeLEDAlwaysOn(b byte) bool { return b == 0 }
 // and ships a CLI that sends exactly this frame. The rest of the payload was
 // then measured on hardware (SPEC.md §6.2, §14.17); see LEDColorPayload.
 //
-// Values outside this table are refused rather than masked, and not
-// consistently: 9 and 11 are acknowledged and discarded, while 32 turns the LED
-// off. Nothing here sends one, and ParseLEDColor will not produce one.
+// Any value above 7 turns the LED off (measured: 8, 9, 11, 16, 32, 33). It is
+// not a mask -- 9 would read as red -- so an out-of-range colour is
+// indistinguishable from colour 0 at the LED rather than being refused. Nothing
+// here sends one: ParseLEDColor resolves names only, and every name is in range.
 type LEDColor uint8
 
 // The eight colour values the vendor library defines.
