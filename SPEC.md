@@ -626,22 +626,32 @@ bytes, and the name — FLASH_LED_**SEQUENCE**_ADVANCED — turns out to be lite
 counted list of colour records, and the vendor's five bytes are its one-record case:
 
 ```
-[ b0 , count , colour , 2 , colour , 2 , … , 0 ]
-   │      │        └── one record per colour: the value, then a marker byte
-   │      │            that must read exactly 2
-   │      └── how many records follow
-   └── inert
+[ inert , inert , colour , 2 , colour , 2 , … , 0 ]
+                     └── one record per colour: the value, then a marker byte
+                         that must read exactly 2
 ```
 
 | Byte | Vendor value | Measured |
 |---|---|---|
 | 0 | 10 | **Inert.** 0 and 10 are indistinguishable, two trials each. |
-| 1 | 1 | **Record count.** 1 plays the colour alone; 2 plays a second record. |
-| 2 | colour | The colour index. |
+| 1 | 1 | **Inert.** 2, 3 and 6 are indistinguishable against an identical record list. It is not a count: the number of records comes from the list itself, terminated by 0. |
+| 2, 4, … | colour | One colour index per record. |
 | 3, 5, … | 2 | **A marker, not a magnitude** — must read exactly 2. 1, 50 and 99 were each tried in each position independently and every one suppresses the record that follows it. Nothing here is a duration. |
-| last | 0 | Terminator. |
+| last | 0 | Terminator, and the only thing that says how long the list is. |
 
-Three behaviours follow, and they are what a caller needs:
+**The list is a loop.** Every record gets roughly half a second except the **last**, which gets a
+phase brief enough to read as a flash. One record is therefore solid — its brief phase is all there
+is — which is why the vendor's payload looks like a plain "set the colour". Two records read as a
+colour with a flash of the second. Three alternate the first two at half a second with the third too
+quick to see.
+
+That single rule is what finally fit; two earlier readings of the same data did not. "Plays once
+rather than looping" and "the third record is dropped" were both the same perceptual error, and both
+were broken by one well-chosen frame: `[…, off, 2, white, 2, 0]`, which puts the brief phase against
+a dark LED where a repeat is unmissable. Choosing colours that make the failure mode visible was
+worth more than any number of repetitions of the ambiguous case.
+
+Three further behaviours, and they are what a caller needs:
 
 - **The write is acknowledged and never echoed.** Every frame answers `02 0D` — the command code with
   the write bit cleared and an empty payload. Unlike `CMD_VOLTAGE_MV` the device says nothing about
@@ -651,8 +661,8 @@ Three behaviours follow, and they are what a caller needs:
   until the next write — but it does **not** survive a power cycle: after a replug the unit shows its
   idle indication again. So this is not a stored setting, it costs no flash wear, and a replug is the
   way back to normal.
-- **A multi-record list plays once, not in a loop.** Two records give the first colour solid with a
-  brief flash of the second as the frame lands. Reproduced twice from two different prior colours.
+- **Colour 4 is white**, as the vendor's table says — checked directly, because a brief white flash
+  against a dark LED reads convincingly as green and nearly cost the table an unearned correction.
 
 **Any colour value above 7 turns the LED off.** 8, 9, 11, 16, 32 and 33 were each sent from a
 known-distinct prior colour and every one goes dark. It is not a mask — a 3-bit mask would show red
@@ -1475,9 +1485,10 @@ confident wrong answer:
   put as "dark, or still cyan?" killed it. Ask for the state, never for the change, and never batch a
   probe whose failure mode looks like its neighbour's.
 
-What is left is smaller: whether a list of three or more records behaves as two does, and whether the
-flash is genuinely one-shot — that last is the consistent reading of five descriptions across two
-trials, not a measurement.
+Both of the questions this left over were then answered, and both answers **corrected** the first
+write-up rather than extending it: byte 1 is inert rather than a record count, and a multi-record
+list loops rather than playing once. See §6.2. The phase lengths — roughly half a second, with the
+last record much shorter — are eyeballed and stated as such; nothing here timed them.
 
 18 gates six booleans that are deliberately not decoded until somebody answers it.
 

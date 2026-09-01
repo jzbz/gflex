@@ -285,20 +285,20 @@ func ParseLEDColor(s string) (LEDColor, bool) {
 // LEDColorPayload builds the payload of an LED colour write: [10, 1, c, 2, 0].
 //
 // The name FLASH_LED_SEQUENCE_ADVANCED is literal. Measured on hardware
-// (SPEC.md §6.2, §14.17), the payload is a counted list of colour records:
+// (SPEC.md §6.2, §14.17), the payload is a list of colour records:
 //
-//	[ inert, count, colour, 2, colour, 2, ..., 0 ]
+//	[ inert, inert, colour, 2, colour, 2, ..., 0 ]
 //
-// The leading byte does nothing -- 0 and 10 are indistinguishable. The second
-// counts the records that follow. Each record is a colour and a marker byte
-// that must read exactly 2; any other value suppresses the record after it, in
-// every position tried. The list is terminated by 0.
+// Both leading bytes do nothing: 0 and 10 are indistinguishable in the first,
+// and 2, 3 and 6 in the second. The list length comes from the 0 terminator,
+// not from a count field. Each record is a colour and a marker byte that must
+// read exactly 2; any other value suppresses the record after it.
 //
-// So the vendor's five bytes are the one-record case, which is why they read as
-// a plain "set the colour", and that is what this builds. A list of two or more
-// plays once as the frame lands -- the first colour holds and the rest flash
-// past -- rather than looping, so there is nothing a caller would want from the
-// longer form that this does not already give them. `gflex raw` reaches it.
+// The list loops, every record holding for roughly half a second except the
+// last, which is brief enough to read as a flash. One record is therefore
+// solid -- its brief phase is all there is -- which is why the vendor's five
+// bytes look like a plain "set the colour". That is the form this builds; a
+// caller wanting the animation can reach it with `gflex raw`.
 //
 // The effect latches in RAM until the next write and does not survive a power
 // cycle, so this costs no flash wear.
