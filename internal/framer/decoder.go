@@ -38,8 +38,12 @@ type Decoder struct {
 
 	// acc is the protocol-frame accumulator, filled by Note On messages and
 	// flushed by the end-of-frame marker.
-	acc    []byte
-	onDrop DropFunc
+	acc []byte
+	// overflow counts the bytes discarded past the cap in the frame currently
+	// being accumulated, so the drop hook hears about the overflow once per
+	// frame instead of once per byte. See reportOverflow.
+	overflow int
+	onDrop   DropFunc
 }
 
 // NewDecoder returns a Decoder with an empty accumulator.
@@ -132,6 +136,9 @@ func (d *Decoder) complete(out *[][]byte) {
 func (d *Decoder) message(status, d1, d2 byte) []byte {
 	switch status & 0xF0 { // the channel nibble carries no information
 	case StatusFrameStart:
+		// Report the overflow of the frame being abandoned before the drop that
+		// abandons it, so the notices arrive in the order the events happened.
+		d.reportOverflow()
 		// Start of frame. A marker arriving mid-frame discards the partial one;
 		// that is the intended resync, not an error.
 		if len(d.acc) > 0 {
@@ -145,11 +152,16 @@ func (d *Decoder) message(status, d1, d2 byte) []byte {
 		} else {
 			// The reference implementation caps the accumulator without
 			// resetting it, so an over-long frame still dispatches a truncated
-			// prefix rather than being dropped. Reproduced deliberately.
-			d.drop("frame exceeds 64 bytes; excess byte discarded", nil)
+			// prefix rather than being dropped. Reproduced deliberately. Only
+			// the count is kept here; reportOverflow tells the hook at the next
+			// marker.
+			d.overflow++
 		}
 
 	case StatusFrameEnd:
+		// Ahead of the length check below, so the overflow notice precedes the
+		// one that carries the accumulator rather than following it.
+		d.reportOverflow()
 		var frame []byte
 		if len(d.acc) >= proto.PreambleLen {
 			n := int(d.acc[0])
@@ -173,6 +185,26 @@ func (d *Decoder) message(status, d1, d2 byte) []byte {
 		return frame
 	}
 	return nil
+}
+
+// reportOverflow tells the hook, once, how much of the frame just ended was
+// discarded past the 64-byte cap, and arms the counter for the next frame.
+//
+// One notice per frame rather than one per byte: the excess is len(frame)-64
+// and unbounded, and the drop hook is the diagnostic channel of SPEC.md §3.3
+// -- gflex monitor's queue is short by design, so a per-byte notice for the
+// least informative event floods out the "declared frame length ..." notice
+// that follows it and actually carries the accumulator. The counter is flushed
+// by a marker, so a stream that sends none reports nothing; that is the same
+// bargain the accumulator itself already makes, since its contents are only
+// ever reported at a marker too.
+func (d *Decoder) reportOverflow() {
+	if d.overflow == 0 {
+		return
+	}
+	n := d.overflow
+	d.overflow = 0
+	d.drop(fmt.Sprintf("frame exceeded %d bytes; %d excess byte(s) discarded", proto.MaxFrameLen, n), nil)
 }
 
 func (d *Decoder) drop(reason string, buffered []byte) {

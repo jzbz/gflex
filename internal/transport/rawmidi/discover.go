@@ -352,6 +352,12 @@ func (s *scanner) openAuto(hint string) (proto.Transport, PortInfo, error) {
 // Select applies the port-choosing policy to an already-discovered list. It
 // performs no I/O, which makes the policy testable without hardware; OpenAuto
 // is Discover plus Select plus Open.
+//
+// The path branch below serves direct callers of this package. The CLI resolves
+// a "/" --port to Open itself and never reaches OpenAuto with one, deliberately:
+// discovery walks sysfs and can fail for reasons that have nothing to do with
+// the node the user named, and an explicitly named node has to keep opening
+// through that.
 func Select(ports []PortInfo, hint string) (PortInfo, error) {
 	if strings.HasPrefix(hint, "/") {
 		for _, p := range ports {

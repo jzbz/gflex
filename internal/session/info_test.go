@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -284,6 +285,53 @@ func TestInfoUnplugDuringOptionalReadsAbortsTheCall(t *testing.T) {
 	}
 }
 
+// TestInfoUnplugBetweenOptionalReadsAbortsTheCall covers the half of the unplug
+// the test above cannot reach.
+//
+// There the cable goes while a read is in flight, and the failure arrives on
+// the framer's channels as ErrTransportClosed. An unplug that lands with no
+// command outstanding fails the next SEND instead: the framer still transmits,
+// the kernel has already disconnected the port, and the error is the raw ENODEV
+// with none of the receive-side sentinels in it. Tolerating that is how `info
+// --all` prints nine blank optional fields and exits 0, which reads as a unit
+// declining commands it does not implement.
+func TestInfoUnplugBetweenOptionalReadsAbortsTheCall(t *testing.T) {
+	s, d, tr := newFailingWriteSession(t, Options{Timeout: 2 * time.Second})
+	scriptCore(d)
+	// Every optional command is answered, so only the dead port can stop the run.
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), proto.AuthLockUnlocked})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+
+	// Answer the first optional read in full, then kill the port: the next
+	// command is the one that finds it gone, with nothing outstanding.
+	d.SetHandler(proto.CmdChipUUID, func(proto.Frame) []byte {
+		defer tr.unplug()
+		return []byte("CHIP0001")
+	})
+
+	info, err := s.Info(context.Background(), true)
+	if err == nil {
+		t.Fatalf("Info returned a partial report and no error after an unplug: %+v", info)
+	}
+	if !errors.Is(err, syscall.ENODEV) {
+		t.Errorf("error = %v, want the kernel's cause carried through", err)
+	}
+	if info != nil {
+		t.Errorf("info = %+v, want nil alongside the error", info)
+	}
+	// Six core reads plus the chip UUID that was answered; the seven that would
+	// follow are never transmitted, so nothing after the death is recorded.
+	if n := len(d.Sent()); n != 7 {
+		t.Errorf("sent %d frames, want 7 (6 core + chip uuid); the run kept asking a device that was gone", n)
+	}
+}
+
 func TestInfoFailsOnCoreCommand(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 	scriptCore(d)
@@ -360,6 +408,82 @@ func TestPostUpdateInitOrder(t *testing.T) {
 		for i := range want {
 			if got[i] != want[i] {
 				t.Errorf("tx[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("an unreadable window is retried and then left alone", func(t *testing.T) {
+		// One dropped frame must not cost the user their guard rail. The read
+		// is asked again, and a window that still cannot be read is left as the
+		// flash left it rather than replaced by the 48 V default -- SPEC.md §17
+		// row 1 refuses the same fallback for `voltage set`, for the same
+		// reason.
+		s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
+		// Nothing answers the vlimit read; everything else does, so that step
+		// is the only one in question.
+		d.SetResponse(proto.CmdAuthLock, []byte{0x00})
+		d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+		d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
+
+		var logged []string
+		if err := s.PostUpdateInit(context.Background(), func(m string) { logged = append(logged, m) }); err != nil {
+			t.Fatalf("PostUpdateInit: %v", err)
+		}
+		want := []string{
+			"02 17", "02 17", "02 17", // asked three times before giving up
+			"03 96 00",    // unlock
+			"04 98 02 ee", // ...and on with the rest: no 06 97 anywhere
+			"06 9a 00 00 00 00",
+			"06 9b 00 00 00 00",
+			"04 93 13 88",
+		}
+		got := d.SentHex()
+		if len(got) != len(want) {
+			t.Fatalf("tx = %q, want %q", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("tx[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+		// The wording matters as much as the omission: the flashing caller
+		// classifies "<step> failed: <err>" as a setting left unrestored, which
+		// is what tells the user to check the window by hand.
+		if joined := strings.Join(logged, "\n"); !strings.Contains(joined, "read vlimit failed: ") {
+			t.Errorf("log does not report the read as a failed step; got:\n%s", joined)
+		}
+	})
+
+	t.Run("a surviving narrow window is widened out loud", func(t *testing.T) {
+		// [3300, 5000] is a 5 V ceiling: the strictest guard rail there is, and
+		// the vendor's erased-window test rejects it for being under 6 V
+		// (SPEC.md §17, row 2) even though nothing erased it. The rewrite is
+		// still what §10.4 prescribes, but it is a widening and has to be
+		// narrated as one, with the line that puts the window back.
+		s, d := newTestSession(t, Options{Timeout: time.Second})
+		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 5000))
+		d.SetResponse(proto.CmdAuthLock, []byte{0x00})
+		d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+		d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+		d.SetResponse(proto.CmdCurrentLimitMa, proto.EncodeU16(5000))
+
+		var logged []string
+		if err := s.PostUpdateInit(context.Background(), func(m string) { logged = append(logged, m) }); err != nil {
+			t.Fatalf("PostUpdateInit: %v", err)
+		}
+		if got := d.SentHex(); len(got) < 3 || got[2] != "06 97 bb 80 0c e4" {
+			t.Errorf("tx = %q, want the defaults written at index 2", got)
+		}
+		joined := strings.Join(logged, "\n")
+		for _, want := range []string{
+			"WIDENING",
+			"gflex vlimit set --low 3300mV --high 5000mV",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("log is missing %q; got:\n%s", want, joined)
 			}
 		}
 	})

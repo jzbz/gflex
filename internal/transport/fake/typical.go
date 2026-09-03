@@ -57,7 +57,7 @@ const (
 // register: a write updates it and a subsequent read returns the written value,
 // so write-then-read-back sequences behave as they do on hardware.
 //
-// Two deliberate departures from a bare echo device:
+// Three deliberate departures from a bare echo device:
 //
 //   - CMD_JUMP_APP_TO_BOOTLOADER is answered with silence, because the real
 //     device does not acknowledge it and disconnects instead (SPEC.md §10.1).
@@ -66,11 +66,20 @@ const (
 //     echoed a second time, then the level (SPEC.md §14, question 8, measured
 //     2026-08-21: tx 02 16 -> rx 04 16 16 00). So the stored register is not
 //     the payload of the write that set it.
+//   - CMD_FLASH_LED_SEQUENCE_ADVANCED is acknowledged with an empty payload
+//     rather than an echo: the LED colour write has no read side at all
+//     (SPEC.md §6.2, measured 2026-09-01).
+//
+// A write carrying CMD_FLAG_SCRATCHPAD is acknowledged and discarded on every
+// register, the way hardware treats it (SPEC.md §14.4); see SetRegister.
 //
 // Erasing the PDO log zeroes it, as it does on hardware, so a scan test that
 // erases first must put a capture back with
 // StoreRegister(proto.CmdPDOLog, TypicalPDOLog()) before downloading, or it
-// will read the all-zero blob a host is required to reject (SPEC.md §9.1).
+// will read the all-zero blob a host is required to reject (SPEC.md §9.1). A
+// log stored at any other length is served too: the last chunk is zero-padded
+// to eight bytes, so a 90-byte capture -- the size §9.3 defines and pdo.Parse
+// consumes -- downloads as the same twelve chunks the 96-byte one does.
 //
 // Commands with no registration fall through to the echo default, so an
 // unmodelled command still answers rather than timing out.
@@ -141,16 +150,31 @@ func NewTypical() *Device {
 			return nil // malformed chunk request: no answer
 		}
 		off := int(f.Payload[0]) * pdoLogChunkBytes
-		if off < 0 || off+pdoLogChunkBytes > len(log) {
+		if off >= len(log) {
 			return nil // chunk out of range: no answer, the host times out
 		}
-		out := make([]byte, 0, 1+pdoLogChunkBytes)
-		out = append(out, f.Payload[0]) // the response echoes the chunk index
-		return append(out, log[off:off+pdoLogChunkBytes]...)
+		// A chunk is always eight bytes, even when the stored log runs out
+		// part-way through it: the log is 90 bytes served as twelve 8-byte
+		// chunks, so the last one is six bytes of padding on hardware too
+		// (SPEC.md §9.1). Refusing the short window instead would leave chunk
+		// 11 unanswered for a test that stored a 90-byte capture, and the host
+		// spends three 8 s chunk timeouts discovering it.
+		out := make([]byte, 1+pdoLogChunkBytes)
+		out[0] = f.Payload[0] // the response echoes the chunk index
+		copy(out[1:], log[off:])
+		return out
 	})
 
 	// The jump command is never acknowledged; the device disconnects instead.
 	d.SetFault(proto.CmdJumpAppToBootloader, Fault{Drop: true})
+
+	// The LED colour write has no read side: every frame is answered with the
+	// command code and an empty payload, never with an echo of what was sent
+	// (SPEC.md §6.2, measured 2026-09-01 in §14.17). Registering an empty
+	// canned response is what keeps the echo default from inventing one, so a
+	// caller that mines the response for the colour it just set fails here
+	// rather than on hardware.
+	d.SetResponse(proto.CmdFlashLEDSeqAdvanced, nil)
 
 	return d
 }

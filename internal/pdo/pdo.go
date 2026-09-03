@@ -316,7 +316,7 @@ func (k Kind) MarshalText() ([]byte, error) { return []byte(k.String()), nil }
 //	fixed     VoltageV, MaxCurrentA
 //	battery   MinVoltageV, MaxVoltageV, MaxPowerW
 //	variable  MinVoltageV, MaxVoltageV, MaxCurrentA
-//	pps       MinVoltageV, MaxVoltageV, MaxCurrentA
+//	pps       MinVoltageV, MaxVoltageV, MaxCurrentA, PPSPowerLimited, PPSBudgetW
 //	epr_avs   MinVoltageV, MaxVoltageV, PDPWatts, MaxPowerW
 //	spr_avs   MaxCurrent15VA, MaxCurrent20VA, MaxCurrentA (the larger of the two)
 //	unknown   nothing
@@ -355,6 +355,25 @@ type PDO struct {
 	// PDPWatts is the EPR AVS power budget, in whole watts as carried on the
 	// wire. It is zero for every other class.
 	PDPWatts int `json:"pdp_watts,omitempty"`
+
+	// PPSPowerLimited is bit 27 of an SPR PPS APDO, the USB-PD "PPS Power
+	// Limited" bit: the source cannot hold this APDO's Maximum Current across
+	// the whole of its voltage range, and what it can supply at Vout is
+	// min(maxI, PDP/Vout). The USB-PD power rules make such an APDO the norm
+	// rather than an oddity — a 45 W source advertises 3.3-11 V at 5 A
+	// (55 W > 45 W) and a 65 W one 3.3-21 V at 3.25 A (68 W > 65 W) — so
+	// crediting a PPS range with its Maximum Current at the top of the range
+	// over-reports on most real chargers.
+	//
+	// PPSBudgetW is the power budget that bound applies, in whole watts. It is
+	// INFERRED, not decoded: a source's PDP travels in
+	// Source_Capabilities_Extended, which the VFLEX never captures
+	// (SPEC.md §9.3). See applyPPSPowerBudget for where the inference comes
+	// from and when it is declined; it is zero unless PPSPowerLimited is set and
+	// the fixed PDOs said something worth acting on. Every verdict that rests on
+	// either field discloses it (CaveatPPSPowerLimited).
+	PPSPowerLimited bool `json:"pps_power_limited,omitempty"`
+	PPSBudgetW      int  `json:"pps_budget_w,omitempty"`
 
 	MaxCurrent15VA float64 `json:"max_current_15v_a,omitempty"`
 	MaxCurrent20VA float64 `json:"max_current_20v_a,omitempty"`
@@ -463,7 +482,62 @@ func Parse(b []byte) (*Log, error) {
 		}
 		l.PDOs = append(l.PDOs, p)
 	}
+	// A power-limited PPS APDO is bounded by a budget that lives in the other
+	// objects, so it can only be applied once the whole array is decoded.
+	l.applyPPSPowerBudget()
 	return l, nil
+}
+
+// applyPPSPowerBudget copies the source's inferred SPR power budget onto every
+// PPS APDO that declared itself power limited.
+//
+// Such an APDO cannot hold its Maximum Current across its range: what the source
+// supplies at Vout is min(maxI, PDP/Vout). The PDP itself is NOT in this blob —
+// it travels in Source_Capabilities_Extended, which the VFLEX never captures
+// (SPEC.md §9.3) — so it is inferred here from the fixed PDOs, which the USB-PD
+// power rules derive from the source's rating: a 45 W source advertises 5 V 3 A,
+// 9 V 3 A, 15 V 3 A and 20 V 2.25 A, and 20 × 2.25 = 45. Only SPR objects count,
+// since PPS is an SPR class and an EPR source's higher fixed PDOs describe a
+// budget its PPS range cannot draw on.
+//
+// Where the cable ceiling reduced a fixed PDO's current, the declared figure is
+// what the budget is built from: a malformed 10.23 A object clamped to 5 A would
+// otherwise understate the source and over-tighten every PPS answer.
+//
+// A source whose only SPR fixed object is the mandatory 5 V one yields nothing
+// worth acting on — every source has that object, so 15 W says as much about
+// this one as about any other — and the budget is left at zero. currentAt then
+// reports the advertised current unchanged and the verdict discloses the bit
+// instead of quietly bounding a figure on 15 W of guesswork.
+func (l *Log) applyPPSPowerBudget() {
+	budget := 0.0
+	informative := false
+	for _, p := range l.PDOs {
+		if p.Kind != KindFixed || !p.Valid || p.VoltageV > EPRThresholdV {
+			continue
+		}
+		a := p.MaxCurrentA
+		if p.DeclaredMaxCurrentA > a {
+			a = p.DeclaredMaxCurrentA
+		}
+		if w := p.VoltageV * a; w > budget {
+			budget = w
+		}
+		if p.VoltageV > 5 {
+			informative = true
+		}
+	}
+	// Whole watts, rounded down, matching the EPR AVS PDP field's resolution and
+	// erring the only safe way.
+	w := int(math.Floor(budget))
+	if !informative || w <= 0 {
+		return
+	}
+	for i := range l.PDOs {
+		if l.PDOs[i].Kind == KindPPS && l.PDOs[i].PPSPowerLimited {
+			l.PDOs[i].PPSBudgetW = w
+		}
+	}
 }
 
 // decodePDO decodes one 32-bit Power Data Object. SPEC.md §9.4.
@@ -548,6 +622,13 @@ func decodeAugmented(p *PDO, raw uint32) {
 		p.MinVoltageV = round2(0.1 * float64((raw>>8)&0xFF))
 		// Seven bits of 50 mA reach 6.35 A; see MaxCableCurrentA.
 		p.MaxCurrentA, p.DeclaredMaxCurrentA = boundCurrent(0.05 * float64(raw&0x7F))
+		// Bit 27, "PPS Power Limited": the Maximum Current above is not held
+		// across the whole range. SPEC.md §9.4 does not list this bit — the
+		// vendor's library does not decode it either — and ignoring it credits
+		// most real chargers with a current they will not supply near the top of
+		// their range, which is the direction that destroys hardware. See the
+		// PDO struct and applyPPSPowerBudget.
+		p.PPSPowerLimited = (raw>>27)&1 != 0
 		p.Valid = p.MinVoltageV > 0 && p.MaxVoltageV > 0 &&
 			p.MaxVoltageV >= p.MinVoltageV && p.MaxCurrentA > 0
 		// PPS is defined only within the Standard Power Range.
@@ -637,6 +718,23 @@ func boundCurrent(a float64) (usable, declared float64) {
 // current goes through this.
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
+// floorToWireStep rounds a DERIVED current down to the 10 mA wire resolution.
+//
+// round2 is exact for anything decoded — every current field is an integer
+// multiple of 10 or 50 mA — but the currents this package computes rather than
+// reads are quotients: an EPR AVS budget's PDP/V, a power-limited PPS APDO's
+// PDP/V. Rounding a quotient to nearest moves it UP by as much as 5 mA, and the
+// result is not display-only: it is what the verdict compares the request
+// against (evaluate.go, finish). A 140 W budget at 36 V is 3.8889 A and was
+// answering "yes" to a request for 3.89 A. Small, and the wrong direction, which
+// is the one the package undertakes never to take.
+//
+// The epsilon is load-bearing in the other direction: an exact two-decimal
+// quotient is not always exactly representable — 23 W / 20 V evaluates to
+// 1.1499999999999999 — and a bare floor would hand back a full 10 mA the source
+// really does offer.
+func floorToWireStep(a float64) float64 { return math.Floor(a*100+cmpEps) / 100 }
+
 // SPRAVSBandSplitV is the boundary between the SPR AVS APDO's two current
 // bands: the 9-15 V band and the 15-20 V band (USB-PD 3.2).
 const SPRAVSBandSplitV = 15.0
@@ -644,8 +742,8 @@ const SPRAVSBandSplitV = 15.0
 // CurrentAt reports the current this PDO can supply at v volts, in amps.
 //
 // It is the only correct way to ask what a PDO offers, and every verdict in this
-// package goes through it. Reading a value field instead is wrong for two of the
-// six classes and dangerous for all of them:
+// package goes through it. Reading a value field instead is wrong for three of
+// the six classes and dangerous for all of them:
 //
 //   - An SPR AVS APDO carries two band-specific limits and the applicable one
 //     depends on v. MaxCurrentA is the larger, so an APDO offering 5.00 A below
@@ -653,6 +751,9 @@ const SPRAVSBandSplitV = 15.0
 //     the direction that damages hardware.
 //   - An EPR AVS APDO carries no current at all, only a power budget
 //     (SPEC.md §9.4); the current it can supply is PDP/V and falls as V rises.
+//   - A PPS APDO that sets the Power Limited bit holds its Maximum Current only
+//     where its power budget allows: a 45 W source advertising 3.3-11 V at 5 A
+//     supplies 4.09 A at 11 V, not 5.
 //   - Any class can decode to a current no cable carries, so the answer is
 //     bounded by MaxCableCurrentA.
 func (p PDO) CurrentAt(v float64) float64 {
@@ -675,7 +776,23 @@ func (p PDO) currentAt(v float64) (usable, declared float64) {
 		if p.PDPWatts <= 0 || v <= 0 {
 			return 0, 0
 		}
-		return boundCurrent(float64(p.PDPWatts) / v)
+		return boundCurrent(floorToWireStep(float64(p.PDPWatts) / v))
+	case KindPPS:
+		// An APDO that sets the Power Limited bit does not hold its Maximum
+		// Current across the range: what the source supplies at v is
+		// min(maxI, PDP/v). The budget is inferred from the fixed PDOs rather
+		// than scanned (applyPPSPowerBudget), so it is applied only where it
+		// reduces the answer — it can never raise one — and every verdict it
+		// decides says so (CaveatPPSPowerLimited). Where no budget could be
+		// inferred the advertised figure stands and the disclosure carries the
+		// whole weight.
+		usable, declared = reportable(p.MaxCurrentA, p.DeclaredMaxCurrentA)
+		if p.PPSPowerLimited && p.PPSBudgetW > 0 && v > 0 {
+			if a := floorToWireStep(float64(p.PPSBudgetW) / v); a < usable {
+				usable = a
+			}
+		}
+		return usable, declared
 	case KindSPRAVS:
 		if v > SPRAVSBandSplitV {
 			return reportable(p.MaxCurrent20VA, p.DeclaredMaxCurrent20VA)

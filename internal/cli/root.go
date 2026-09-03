@@ -31,6 +31,17 @@ type App struct {
 	Port string
 	// Transport selects the link: "rawmidi" (default) or "usb".
 	Transport string
+	// midiPortVIDConfirmed records that the rawmidi port this run opened was
+	// traced to a USB device carrying the Tundra Labs vendor ID, rather than
+	// matched on its name or taken as the only port on the system (SPEC.md
+	// §3.4). openRawMIDI sets it; midiPresenceMeaningful is what reads it.
+	//
+	// It is not about which unit is on the other end -- it is about whether
+	// rawmidi.Discover can recognise that unit again. Discover classifies a
+	// port by vendor ID, and the weaker tiers exist only inside the selection
+	// this process already made, so a port taken by name or by fallback is one
+	// Discover will keep answering "not a VFLEX" about, whatever is attached.
+	midiPortVIDConfirmed bool
 	// AsJSON is --json.
 	AsJSON bool
 	// Timeout is the per-command response timeout (--timeout).
@@ -87,13 +98,48 @@ func Execute() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// signal.NotifyContext removes the default terminate disposition for the
+	// whole process and restores it only in stop(), which is deferred until the
+	// command has finished unwinding -- so between the first Ctrl-C and the last
+	// deferred Close every further SIGINT was buffered and dropped, and the
+	// conventional "press it again to give up" did nothing. Most of the unwind
+	// honours the context promptly, but not all of it: a bulk write to a stalled
+	// bootloader endpoint is a 5 s ioctl, framer.Close waits out its reader, and
+	// a rawmidi write to a device that has stopped draining its output FIFO is an
+	// *os.File write with no deadline at all. Re-arming as soon as the context is
+	// cancelled hands that decision back to the user.
+	//
+	// disarm keeps a normal exit quiet: the deferred stop() cancels this same
+	// context, and without cancelling the registration first the notice below
+	// would print after every successful run. Deferred order does it -- disarm
+	// runs before stop.
+	disarm := context.AfterFunc(ctx, func() {
+		fmt.Fprintln(os.Stderr, "gflex: interrupted; releasing the device. Press Ctrl-C again to quit\n"+
+			"  immediately, which skips the release -- on --transport usb that is what leaves the\n"+
+			"  ALSA MIDI port missing until the device is replugged (SPEC.md §4.2).")
+		stop()
+	})
+	defer disarm()
+
 	err := root.ExecuteContext(ctx)
 	if err == nil {
 		return ExitOK
 	}
 	code := ExitCode(err)
 	if errors.Is(err, context.Canceled) {
-		fmt.Fprintln(os.Stderr, "gflex: interrupted")
+		// The error text goes out with the line, rather than being thrown away.
+		// A cancelled command is not always a harmless one: a Ctrl-C between
+		// CMD_JUMP_APP_TO_BOOTLOADER and CMD_BOOTLOAD_END leaves the unit in the
+		// bootloader with no MIDI interface, and SPEC.md §13.6 requires the tool
+		// to say that and that the unit is still re-flashable. The flash path
+		// narrates that through Diag as it happens (bootloaderPhaseFailure,
+		// postFlashFailure), but every other caller's guidance lives in the error
+		// it returns -- along with which command was in flight when the signal
+		// landed, which a fixed line cannot say either.
+		//
+		// The per-code hint stays suppressed: "the device did not answer" is the
+		// wrong advice for a wait the user ended themselves.
+		fmt.Fprintf(os.Stderr, "gflex: interrupted: %v\n", err)
 		return code
 	}
 	fmt.Fprintf(os.Stderr, "gflex: %v\n", err)

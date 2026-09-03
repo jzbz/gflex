@@ -188,32 +188,47 @@ func TestFirstConfigurationValue(t *testing.T) {
 
 // sysfsDevice builds a Device whose SysPath points at a fixture directory. It
 // deliberately has no usable fd: these tests only exercise the sysfs read.
-func sysfsDevice(t *testing.T, attr string) *Device {
+//
+// attr is a pointer because an absent bConfigurationValue and one that exists
+// holding nothing are different states, and only the first is a device that
+// cannot be read: the kernel renders an unconfigured device as an empty file
+// (see sysfsConfiguration).
+func sysfsDevice(t *testing.T, attr *string) *Device {
 	t.Helper()
 	dir := t.TempDir()
-	if attr != "" {
-		if err := os.WriteFile(filepath.Join(dir, "bConfigurationValue"), []byte(attr), 0o644); err != nil {
+	if attr != nil {
+		if err := os.WriteFile(filepath.Join(dir, "bConfigurationValue"), []byte(*attr), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	return &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007", SysPath: dir}, claimed: map[int]claimState{}}
 }
 
+// attrValue names a fixture attribute's contents; nil means the file is absent.
+func attrValue(s string) *string { return &s }
+
 func TestSysfsConfiguration(t *testing.T) {
 	tests := []struct {
 		name  string
-		attr  string
+		attr  *string
 		want  uint8
 		wantK bool
 	}{
-		{"configured", "1\n", 1, true},
-		{"unconfigured", "0\n", 0, true},
-		{"high value", "255\n", 255, true},
-		{"absent", "", 0, false},
-		{"not a number", "wat\n", 0, false},
+		{"configured", attrValue("1\n"), 1, true},
+		// What the kernel actually writes for an unconfigured device:
+		// usb_actconfig_show emits nothing when udev->actconfig is NULL, so the
+		// attribute reads back empty. That is a definite 0, not an unreadable
+		// device -- the GET_CONFIGURATION fallback exists for a bootloader that
+		// may well stall the request, so it must not be the answer here.
+		{"unconfigured", attrValue(""), 0, true},
+		// A renderer that does spell it out is read the same way.
+		{"unconfigured written out", attrValue("0\n"), 0, true},
+		{"high value", attrValue("255\n"), 255, true},
+		{"absent", nil, 0, false},
+		{"not a number", attrValue("wat\n"), 0, false},
 		// Out of range for a bConfigurationValue; treated as unreadable rather
 		// than truncated to a byte that would select something real.
-		{"out of range", "256\n", 0, false},
+		{"out of range", attrValue("256\n"), 0, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,12 +246,29 @@ func TestSysfsConfiguration(t *testing.T) {
 	}
 }
 
+// An unconfigured device is the one state EnsureConfigured exists for
+// (SPEC.md §10.1 phase 2), and it is the state sysfs answers with an empty
+// attribute rather than with a number. Reading that as "cannot tell" would put
+// the question on the bus as GET_CONFIGURATION, which is what asking sysfs first
+// exists to avoid on a bootloader apt to stall it. There is no usable fd here,
+// so any fallback surfaces as an error instead of passing unnoticed.
+func TestConfigurationReadsAnUnconfiguredDeviceFromSysfs(t *testing.T) {
+	d := sysfsDevice(t, attrValue(""))
+	got, err := d.Configuration(context.Background())
+	if err != nil {
+		t.Fatalf("Configuration: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("Configuration = %d, want 0 for a device the kernel never configured", got)
+	}
+}
+
 // A device that already reports a configuration must not be written to: usbfs
 // turns a redundant SET_CONFIGURATION into usb_reset_configuration(), and this
 // runs immediately before a firmware write. There is no fd here, so any attempt
 // to issue the ioctl would fail loudly rather than silently pass.
 func TestEnsureConfiguredLeavesAConfiguredDeviceAlone(t *testing.T) {
-	d := sysfsDevice(t, "1\n")
+	d := sysfsDevice(t, attrValue("1\n"))
 	got, err := d.EnsureConfigured(context.Background())
 	if err != nil {
 		t.Fatalf("EnsureConfigured: %v", err)

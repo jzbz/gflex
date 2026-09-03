@@ -179,9 +179,17 @@ func emitDeviceInfo(f Formatter, info *proto.DeviceInfo, all bool) {
 	}
 
 	if all {
+		// The vendor-read set is named rather than pointed at. "Fields above the
+		// LED setting" was false for three of the fields it covered: chip uuid,
+		// hardware id and mfg date are commands 9, 10 and 12, which the vendor
+		// app never issues (SPEC.md §6.4) and which infoReadCmds appends only
+		// under --all -- yet they print with the identity strings at the top,
+		// above the LED row. A list cannot drift out of step with the display
+		// order the way a position can.
 		f.Note("")
-		f.Note("Fields above the LED setting are read by the vendor app too; the rest are not,")
-		f.Note("and a missing one only means the firmware did not answer (SPEC.md §6.4).")
+		f.Note("serial, firmware, output voltage, current limit, voltage limits and the LED setting")
+		f.Note("are read by the vendor app too; every other field here is best-effort, and a missing")
+		f.Note("one only means the firmware did not answer (SPEC.md §6.4).")
 	}
 }
 

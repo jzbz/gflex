@@ -628,7 +628,12 @@ func TestLoadOptionsPageSizeIsValidated(t *testing.T) {
 	const ceiling = MaxChunkSize * ChunksPerPage
 	raw := page(0, 16)
 
-	for _, bad := range []int{-8, 7, ceiling + ChunksPerPage, 1 << 40} {
+	// math.MaxInt-7 is the largest page size an int can hold that is still
+	// divisible by ChunksPerPage, so it clears the divisibility rule and has to
+	// be caught by the ceiling. Written against math.MaxInt rather than as a
+	// terabyte because the tests build for 32-bit too, where a literal 1<<40
+	// does not fit an int at all.
+	for _, bad := range []int{-8, 7, ceiling + ChunksPerPage, math.MaxInt - 7} {
 		if _, err := ParseImage(raw, LoadOptions{PageSize: bad}); err == nil {
 			t.Errorf("ParseImage with PageSize %d was accepted", bad)
 		} else if !errors.Is(err, ErrBadPageLength) {
@@ -647,8 +652,8 @@ func TestLoadOptionsPageSizeIsValidated(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: 1 << 40}); err == nil {
-		t.Error("LoadFileWithOptions with a terabyte page size was accepted")
+	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: math.MaxInt - 7}); err == nil {
+		t.Error("LoadFileWithOptions with an unrepresentable page size was accepted")
 	}
 	// The ceiling itself stays usable from every entry point.
 	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: ceiling}); err != nil {
@@ -831,6 +836,70 @@ func TestChunkedPagesAreOrderedByPageID(t *testing.T) {
 	if !bytes.Equal(fw.Pages[0], first) || !bytes.Equal(fw.Pages[1], second) {
 		t.Error("pages were left in array order instead of pg_id order")
 	}
+}
+
+// A payload that numbers some of its pages and not others is refused, not
+// quietly demoted to array order. Falling back throws away the ids that WERE
+// stated, so a page declaring pg_id 5 gets written to address 0 -- the same
+// silent mis-assembly a gap or a duplicate is refused for, and just as
+// invisible afterwards, since the device computes its CRC over whatever it was
+// told to write.
+func TestChunkedPagesMustAllStateAPageIDOrNoneAtAll(t *testing.T) {
+	page := seqPage(t, 0, 320)
+	chunks := func() string {
+		n := len(page) / ChunksPerPage
+		var sb strings.Builder
+		sb.WriteString("{")
+		for c := 0; c < ChunksPerPage; c++ {
+			if c > 0 {
+				sb.WriteString(",")
+			}
+			fmt.Fprintf(&sb, `"%d":%s`, c, numberArray(page[c*n:(c+1)*n]))
+		}
+		sb.WriteString("}")
+		return sb.String()
+	}()
+
+	for _, tc := range []struct {
+		name, doc string
+	}{
+		{
+			name: "an object with no pg_id beside one with it",
+			doc: fmt.Sprintf(`{"app_bin":[{"pg_id":1,"chunks":%s},{"chunks":%s}],"crc":7}`,
+				chunks, chunks),
+		},
+		{
+			name: "a bare page array beside a numbered object",
+			doc: fmt.Sprintf(`{"app_bin":[{"pg_id":1,"chunks":%s},%s],"crc":7}`,
+				chunks, numberArray(page)),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseImage([]byte(tc.doc), LoadOptions{})
+			if err == nil {
+				t.Fatal("accepted a payload that states a page id on some elements only")
+			}
+			if !errors.Is(err, ErrBadPageLength) {
+				t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+			}
+			if !strings.Contains(err.Error(), "every page states its id or none does") {
+				t.Errorf("error = %v, want it to name the rule", err)
+			}
+		})
+	}
+
+	// A payload that never claimed a page number keeps array order, which is
+	// all it can offer.
+	t.Run("no element states one", func(t *testing.T) {
+		doc := fmt.Sprintf(`{"app_bin":[%s,%s],"crc":7}`, numberArray(page), numberArray(seqPage(t, 9, 320)))
+		fw, err := ParseImage([]byte(doc), LoadOptions{})
+		if err != nil {
+			t.Fatalf("ParseImage: %v", err)
+		}
+		if !bytes.Equal(fw.Pages[0], page) {
+			t.Error("an unnumbered payload must keep array order")
+		}
+	})
 }
 
 func TestChunkedPageRejectsBadGeometry(t *testing.T) {

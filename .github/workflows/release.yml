@@ -48,7 +48,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Tracks the toolchain in go.mod, exactly as ci.yml does, so a
-          # release is built with the Go the tree declares.
+          # release is built with the Go the tree declares. go.mod names a
+          # minor version and no toolchain directive, so that is a range:
+          # check-latest resolves it to the newest 1.26.x on the day of the
+          # build. See what the build step below says about reproducing one.
           go-version-file: go.mod
           check-latest: true
 
@@ -82,9 +85,17 @@ jobs:
           fi
           # The build date is the tagged commit's date, not the time of the
           # build. Together with -trimpath and a version that comes from the
-          # tag, that leaves nothing in the binary that changes between two
+          # tag, that leaves nothing this workflow injects varying between two
           # builds of the same tag; a wall-clock stamp would be the one thing
           # standing in the way of reproducing a release.
+          #
+          # The toolchain is the part that still varies, and it is not this
+          # workflow's to stamp: setup-go above resolves go.mod's "go 1.26" to
+          # the newest patch of the day, and runtime.Version() is compiled into
+          # the binary (gflex version prints it). So two builds of one tag
+          # either side of a Go point release differ in bytes. Reproducing a
+          # published binary means building with the toolchain "go version -m"
+          # reports for it, not whichever 1.26.x happens to be current.
           builddate="$(git log -1 --format=%cI)"
           # These three variables exist in internal/cli/version.go for exactly
           # this. The import path has to be spelled in full and a typo in it
@@ -192,18 +203,23 @@ jobs:
           esac
           # No backticks anywhere in this body: the heredoc is unquoted so that
           # $VERSION expands, which also makes backticks command substitution.
-          # Indented lines are Markdown code blocks and need none.
+          # Indented lines are Markdown code blocks and need none. The trailing
+          # && in that block is literal text to an unquoted heredoc and needs no
+          # escaping either -- and it is load-bearing, not formatting: without
+          # it a reader who pastes the block installs a binary whose signature
+          # just failed.
           notes=$(cat <<EOF
           Static Linux binaries. They are cgo-free and depend on nothing at runtime -- no shared
           libraries, no Go toolchain, no browser.
 
-              gpg --verify SHA256SUMS.asc SHA256SUMS
-              sha256sum --ignore-missing -c SHA256SUMS
+              gpg --verify SHA256SUMS.asc SHA256SUMS &&
+              sha256sum --ignore-missing -c SHA256SUMS &&
               install -m 0755 gflex-$VERSION-linux-amd64 ~/.local/bin/gflex
 
-          SHA256SUMS.asc is signed by hand once this workflow has published, because the signing key
-          never goes near CI; the README's "Verifying a download" says where to get that key and
-          which fingerprint it has to be.
+          Chained on purpose: a bad signature or a failed checksum stops that paste before install
+          runs. SHA256SUMS.asc is signed by hand once this workflow has published, because the
+          signing key never goes near CI; the README's "Verifying a download" says where to get that
+          key and which fingerprint it has to be.
 
           The USB transport and every firmware operation need a udev rule; run **gflex install-udev**
           or see the README's Install section.

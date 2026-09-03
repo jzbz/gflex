@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -33,6 +34,11 @@ func newFlashTestApp() (*App, *bytes.Buffer, *bytes.Buffer) {
 		Timeout:   proto.DefaultTimeout,
 		stdout:    out,
 		stderr:    errOut,
+		// These tests exercise the paths that run after a port has been opened,
+		// and the port openRawMIDI opens in the ordinary case is one the vendor
+		// ID identified -- which is what makes the ALSA node a usable presence
+		// signal (see midiPresenceMeaningful).
+		midiPortVIDConfirmed: true,
 	}
 	return app, out, errOut
 }
@@ -71,7 +77,18 @@ func baseOpts() flashOpts {
 
 type connectFn = func(context.Context) (*usbfs.Device, usbfs.Interface, error)
 
+// stubConnect substitutes the bootloader connect seam for a stub that ignores
+// the retry options, which is what all but the fail-fast tests care about.
 func stubConnect(t *testing.T, fn connectFn) {
+	t.Helper()
+	stubConnectWithOptions(t, func(ctx context.Context, _ bootloader.ConnectOptions) (*usbfs.Device, usbfs.Interface, error) {
+		return fn(ctx)
+	})
+}
+
+// stubConnectWithOptions is stubConnect for a test that needs to see which
+// retry policy the CLI asked for.
+func stubConnectWithOptions(t *testing.T, fn func(context.Context, bootloader.ConnectOptions) (*usbfs.Device, usbfs.Interface, error)) {
 	t.Helper()
 	prev := connectBootloader
 	connectBootloader = fn
@@ -180,6 +197,162 @@ func TestFirmwareVersionNotesFirmwareTooOld(t *testing.T) {
 	}
 	if got := countDeviceReads(t, dev, proto.CmdFirmwareVersion); got != 1 {
 		t.Errorf("the device saw %d CMD_FIRMWARE_VERSION reads, want exactly 1", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// firmware fetch
+// ---------------------------------------------------------------------------
+
+// TestFetchDryRunLeavesTheSerialWithNobody pins interlock 8 of SPEC.md §13 on
+// the one command that ignored it. `firmware fetch` read the serial off the
+// unit, opened a TLS WebSocket to the vendor, handed the serial over, pulled
+// the image down and wrote -o -- all under a flag whose help says it sends
+// nothing. The frame it sends is a fixed CMD_SERIAL_NUMBER read, so §13.8's
+// only escape ("the frame cannot be known without first reading the device",
+// which is why `flash --fetch` refuses the combination) does not apply: the
+// frame is printed and the rest of the command does not happen.
+func TestFetchDryRunLeavesTheSerialWithNobody(t *testing.T) {
+	stubFetch(t, func(context.Context, string, string, time.Duration) (*bootloader.Firmware, error) {
+		t.Error("--dry-run contacted the vendor service")
+		return flashTestImage(), nil
+	})
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+	out := filepath.Join(t.TempDir(), "image.json")
+
+	if err := tr.run(t, "--dry-run", "firmware", "fetch", "-o", out); err != nil {
+		t.Fatalf("`--dry-run firmware fetch`: %v", err)
+	}
+	if frames := dev.Sent(); len(frames) != 0 {
+		t.Errorf("--dry-run sent %v to the device", cmdNames(frames))
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Errorf("--dry-run wrote %s", out)
+	}
+	// The frame it would have sent still has to be printed, or "sends nothing"
+	// has quietly become "does nothing".
+	if said := tr.stdout.String(); !strings.Contains(said, proto.CmdSerialNumber.String()) {
+		t.Errorf("--dry-run printed no frame table:\n%s", said)
+	}
+}
+
+// TestRawFetchWithoutAnOutputIsRefusedBeforeTheSerialIsRead: --raw needs -o,
+// and both halves are on the command line, so nothing has to happen first to
+// find that out. The refusal used to come after the serial had been read off
+// the unit, handed to the vendor and paid for with the whole download -- every
+// side effect the combination is refused for, performed and then discarded.
+func TestRawFetchWithoutAnOutputIsRefusedBeforeTheSerialIsRead(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "firmware", "fetch", "--raw")
+	if err == nil {
+		t.Fatal("`firmware fetch --raw` without -o was accepted")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	if frames := dev.Sent(); len(frames) != 0 {
+		t.Errorf("a usage error was answered only after reading the device: %v", cmdNames(frames))
+	}
+}
+
+// TestAFetchFailureIsNotReportedAsADeviceTimeout: the vendor service is not the
+// device. Every way a download runs out of time carries a shape isTimeout
+// matches -- the budget expires as context.DeadlineExceeded, a stalled dial as
+// a net.Error whose Timeout() is true -- so wrapping it bare exited 5, which
+// README's table defines as "Timed out waiting for the device", under the hint
+// that says the device did not answer and offers -v to trace MIDI traffic. The
+// serial read had already succeeded by then; no device was involved at all.
+func TestAFetchFailureIsNotReportedAsADeviceTimeout(t *testing.T) {
+	const endpoint = "wss://lab.example/bootloader"
+	stubFetch(t, func(context.Context, string, string, time.Duration) (*bootloader.Firmware, error) {
+		return nil, fmt.Errorf("bootloader: fetching firmware: %w", context.DeadlineExceeded)
+	})
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "firmware", "fetch", "--ws-url", endpoint)
+	if err == nil {
+		t.Fatal("an unreachable vendor service was reported as success")
+	}
+	if code := ExitCode(err); code == ExitTimeout {
+		t.Errorf("a network failure exited ExitTimeout (%d), which is the device's timeout", ExitTimeout)
+	} else if code != ExitFailure {
+		t.Errorf("ExitCode = %d, want ExitFailure (%d): %v", code, ExitFailure, err)
+	}
+	if !suppressHint(err) {
+		t.Error("the per-code hint was not suppressed; it diagnoses a device that was never asked anything")
+	}
+	msg := err.Error()
+	for _, want := range []string{endpoint, "--fetch-timeout", "not the device"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the failure does not point at the network (missing %q): %s", want, msg)
+		}
+	}
+}
+
+// The same wording has to reach `flash --fetch`, which fails a layer lower.
+func TestAFetchFailureInsideAFlashIsAlsoANetworkFailure(t *testing.T) {
+	stubFetch(t, func(context.Context, string, string, time.Duration) (*bootloader.Firmware, error) {
+		return nil, fmt.Errorf("bootloader: fetching firmware: %w", context.DeadlineExceeded)
+	})
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.fetch = true
+	o.wsURL = bootloader.DefaultWSURL
+
+	_, err := app.loadFirmware(context.Background(), o, "VFX-0001")
+	if err == nil {
+		t.Fatal("a failed download was reported as a loaded image")
+	}
+	if code := ExitCode(err); code != ExitFailure {
+		t.Errorf("ExitCode = %d, want ExitFailure (%d): %v", code, ExitFailure, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// firmware bootloader
+// ---------------------------------------------------------------------------
+
+// TestFirmwareBootloaderJumpIsGatedByTheConfirmation is the wiring test for the
+// same action SPEC.md §13.10 makes `raw 02 14` confirm, reached by its own
+// command. The confirmation here is a direct app.confirm rather than an
+// app.apply(CheckFlash(...)), so interlock_test.go's tables cannot see it, and
+// nothing else drove the command: deleting the confirm block left the whole
+// suite green while `gflex firmware bootloader </dev/null` dropped a unit off
+// the bus mid-session, where only a firmware flash or a power cycle reaches it.
+func TestFirmwareBootloaderJumpIsGatedByTheConfirmation(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "firmware", "bootloader")
+	if err == nil {
+		t.Fatal("`firmware bootloader` jumped the unit with nobody to confirm it")
+	}
+	if code := ExitCode(err); code != ExitRefused {
+		t.Errorf("ExitCode = %d, want ExitRefused (%d): %v", code, ExitRefused, err)
+	}
+	if tr.sent(t, proto.CmdJumpAppToBootloader) {
+		t.Fatalf("the jump frame reached the device despite the refusal; frames: %v", cmdNames(dev.Sent()))
+	}
+}
+
+// Its positive control: with --yes the same jump goes out, so the refusal above
+// came from the interlock and not from the plumbing. --transport usb is what
+// keeps this quick -- the evidence report then prints its "cannot be confirmed
+// on this transport" note instead of polling sysfs for a disconnect that this
+// fake device is in no position to perform.
+func TestFirmwareBootloaderJumpProceedsWithYes(t *testing.T) {
+	dev := fake.NewTypical()
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "firmware", "bootloader", "--yes", "--transport", "usb"); err != nil {
+		t.Fatalf("`firmware bootloader --yes`: %v", err)
+	}
+	if !tr.sent(t, proto.CmdJumpAppToBootloader) {
+		t.Errorf("--yes did not reach the device; frames: %v", cmdNames(dev.Sent()))
 	}
 }
 
@@ -341,7 +514,9 @@ func TestCRCMismatchSentinelSurvives(t *testing.T) {
 
 	app, _, _ := newFlashTestApp()
 	o := baseOpts()
-	o.path = "/tmp/fw.json"
+	o.path = "/tmp/fw.bin"
+	o.pageSize = 320
+	o.crc = 0x30
 	_, err := app.runUpdate(context.Background(), app.newFormatter(), nil, usbfs.Interface{},
 		flashTestImage(), o, "VFX-0001")
 	if err == nil {
@@ -354,9 +529,62 @@ func TestCRCMismatchSentinelSurvives(t *testing.T) {
 		t.Errorf("exit code %d, want ExitFailure (%d)", code, ExitFailure)
 	}
 	msg := err.Error()
-	for _, want := range []string{"--recover", "/tmp/fw.json"} {
+	// The geometry flags are part of "how to resume" and not decoration. The
+	// line used to name the image alone, and a raw .bin resumed that way is
+	// refused for carrying no CRC -- with advice to add --force, which then
+	// re-splits it at the 512-byte default and flashes it unverified at a
+	// geometry the user never asked for (SPEC.md §10.2, §14.12).
+	for _, want := range []string{"--recover", "/tmp/fw.bin", "--page-size 320", "--crc 0x30"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the failure does not say how to resume (missing %q): %s", want, msg)
+		}
+	}
+}
+
+// TestTheResumeCommandKeepsEveryFlagThatDecidesWhatIsFlashed covers the same
+// property for the flags the CRC-mismatch case does not carry, and its
+// converse: a flag left at its default must not appear, or the line stops being
+// something to paste and starts being something to edit.
+func TestTheResumeCommandKeepsEveryFlagThatDecidesWhatIsFlashed(t *testing.T) {
+	app, _, _ := newFlashTestApp()
+	app.Transport = transportUSB
+	o := baseOpts()
+	o.path = "fw.bin"
+	o.pageSize = 320
+	o.crc = 0x30
+	o.force = true
+	o.ackFirst = true
+
+	got := app.resumeCommand(o)
+	for _, want := range []string{
+		"--transport usb", "firmware flash --recover", "fw.bin",
+		"--page-size 320", "--crc 0x30", "--force", "--ack-mode", "--yes",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the resume command drops %q: %s", want, got)
+		}
+	}
+
+	app.Transport = transportRawMIDI
+	o = baseOpts()
+	o.fetch = true
+	o.wsURL = "wss://lab.example/bootloader"
+	o.fetchTimeout = 90 * time.Second
+	got = app.resumeCommand(o)
+	for _, want := range []string{"--fetch", "--ws-url wss://lab.example/bootloader", "--fetch-timeout 1m30s"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the resume command drops %q, so the retry would go somewhere else: %s", want, got)
+		}
+	}
+	// The defaults are the tool's, not the user's, and restating them adds
+	// nothing a reader has to check.
+	o = baseOpts()
+	o.path = "fw.json"
+	o.wsURL = bootloader.DefaultWSURL
+	got = app.resumeCommand(o)
+	for _, unwanted := range []string{"--transport", "--ws-url", "--fetch-timeout", "--crc", "--page-size", "--force"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("the resume command states the default %s: %s", unwanted, got)
 		}
 	}
 }
@@ -382,6 +610,91 @@ func TestSerialMismatchPromisesNothingWasFlashed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Nothing has been flashed") {
 		t.Errorf("the message does not say nothing was flashed: %v", err)
+	}
+	// "Nothing has been flashed" is true and, on its own, misleading: without
+	// --recover this error is only reachable after phase 1 jumped the addressed
+	// unit and watched it leave the bus, so a literal retry cannot find it and
+	// fails in phase 1 as a missing device. SPEC.md §13.6 wants the state said.
+	for _, want := range []string{"bootloader mode", "re-flashable", "--recover"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the message does not say where the jumped unit is (missing %q): %v", want, err)
+		}
+	}
+
+	// Under --recover no jump was issued by this command, so the sentence would
+	// be someone else's news.
+	o := baseOpts()
+	o.recover = true
+	_, err = app.runUpdate(context.Background(), app.newFormatter(), nil, usbfs.Interface{},
+		flashTestImage(), o, "VFX-0001")
+	if err == nil {
+		t.Fatal("a serial mismatch under --recover was not reported as an error")
+	}
+	if strings.Contains(err.Error(), "The unit this command jumped") {
+		t.Errorf("--recover claimed a jump it never made: %v", err)
+	}
+}
+
+// TestAnInterruptedFlashSaysWhereTheUnitIs is the counterpart of
+// TestInterruptionAfterASuccessfulFlashReportsSuccess for the window before
+// CMD_BOOTLOAD_END -- the whole multi-second stream, where a Ctrl-C is most
+// likely to land and where the image may be half written. Execute prints
+// nothing but "gflex: interrupted" for an error chained to context.Canceled, so
+// the §13.6 guidance in the returned error's text reached nobody: the unit sat
+// in the bootloader with no MIDI interface, and every later gflex command
+// reported a missing device with hints about udev rules and busy ports.
+func TestAnInterruptedFlashSaysWhereTheUnitIs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stubUpdate(t, func(_ context.Context, _ *usbfs.Device, _ usbfs.Interface, _ *bootloader.Firmware,
+		_ bootloader.UpdateOptions,
+	) (*bootloader.UpdateResult, error) {
+		// What Flasher.Flash returns from its pause points when the context
+		// ends mid-stream: ctxwait.Sleep's own error, bare.
+		cancel()
+		return &bootloader.UpdateResult{}, ctx.Err()
+	})
+
+	app, _, errOut := newFlashTestApp()
+	f := app.newFormatter()
+	o := baseOpts()
+	o.path = "/tmp/fw.json"
+	_, err := app.runUpdate(ctx, f, nil, usbfs.Interface{}, flashTestImage(), o, "VFX-0001")
+	if err == nil {
+		t.Fatal("an interrupted update did not report an error")
+	}
+	err = app.bootloaderPhaseFailure(f, o, err)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the interruption's own error was lost from the chain: %v", err)
+	}
+	said := errOut.String()
+	for _, want := range []string{
+		"bootloader mode",        // where the unit is
+		"CMD_BOOTLOAD_END",       // and why it is still there
+		"re-flashable",           // SPEC.md §13 interlock 6, in as many words
+		"--recover /tmp/fw.json", // and the command that resumes
+	} {
+		if !strings.Contains(said, want) {
+			t.Errorf("an interrupted flash said nothing about %q: %q", want, said)
+		}
+	}
+}
+
+// The other half: a failure that already explains itself must not be narrated
+// twice. Execute prints those, so the guidance would appear once on stderr and
+// again under "gflex:", which is how a message stops being read.
+func TestAFailureThatExplainsItselfIsNotNarratedTwice(t *testing.T) {
+	app, _, errOut := newFlashTestApp()
+	o := baseOpts()
+	o.path = "/tmp/fw.json"
+	err := app.updateError(fmt.Errorf("%w: device reports 0x12, image declares 0x34",
+		bootloader.ErrCRCMismatch), o)
+
+	if got := app.bootloaderPhaseFailure(app.newFormatter(), o, err); got != err {
+		t.Errorf("the original error was replaced: %v", got)
+	}
+	if said := errOut.String(); said != "" {
+		t.Errorf("a self-explanatory failure was also narrated on stderr: %q", said)
 	}
 }
 
@@ -461,6 +774,55 @@ func TestCRCOverrideIsAppliedToTheImage(t *testing.T) {
 	}
 	if !fw.CRCKnown || fw.CRC != 0x00 {
 		t.Errorf("--crc 0 did not make the image verifiable: CRCKnown=%v CRC=0x%02x", fw.CRCKnown, fw.CRC)
+	}
+}
+
+// TestReplacingADeclaredCRCSaysSo: --crc also overrides the value an image
+// declares, which is deliberate -- it is the only way to re-flash an image
+// whose declared CRC is known wrong -- but it is also the one route by which an
+// image that failed verification can be walked through to CMD_BOOTLOAD_END on
+// the next run. The mismatch prints the byte the device computed, and typing
+// that back in makes the comparison compare the device with itself, after which
+// the run reports the image as verified. Silence there is what makes it look
+// like verification; a raw .bin, which declares nothing to replace, must stay
+// quiet.
+func TestReplacingADeclaredCRCSaysSo(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "fw.json")
+	if err := os.WriteFile(jsonPath,
+		[]byte(`{"app_bin": [[1,2,3,4,5,6,7,8]], "app_version": "5.1.0", "crc": 52}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binPath := filepath.Join(dir, "fw.bin")
+	if err := os.WriteFile(binPath, bytes.Repeat([]byte{0x11}, bootloader.DefaultPageSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app, _, errOut := newFlashTestApp()
+	o := baseOpts()
+	o.path = jsonPath
+	o.crc = 0x12
+	fw, err := app.loadFirmware(context.Background(), o, "")
+	if err != nil {
+		t.Fatalf("loadFirmware: %v", err)
+	}
+	if fw.CRC != 0x12 {
+		t.Errorf("--crc did not take: expected CRC 0x%02x", fw.CRC)
+	}
+	said := errOut.String()
+	for _, want := range []string{"0x12", "0x34"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the replacement did not name %s: %q", want, said)
+		}
+	}
+
+	errOut.Reset()
+	o.path = binPath
+	if _, err := app.loadFirmware(context.Background(), o, ""); err != nil {
+		t.Fatalf("loadFirmware: %v", err)
+	}
+	if said := errOut.String(); said != "" {
+		t.Errorf("a raw .bin declares no CRC, so there is nothing to warn about: %q", said)
 	}
 }
 
@@ -768,7 +1130,11 @@ func TestJumpIsNotClaimedConfirmedOnUSBTransport(t *testing.T) {
 	if app.midiPresenceMeaningful() {
 		t.Fatal("the ALSA node is treated as meaningful on --transport usb")
 	}
-	if err := app.confirmJump(context.Background(), app.newFormatter(), "VFX-0001"); err != nil {
+	watched := func(context.Context, bool, time.Duration) error {
+		t.Error("the ALSA node was polled on a transport whose answer means nothing")
+		return nil
+	}
+	if err := app.confirmJump(context.Background(), app.newFormatter(), "VFX-0001", watched); err != nil {
 		t.Fatalf("confirmJump aborted the update on a transport that simply cannot observe it: %v", err)
 	}
 	said := errOut.String()
@@ -778,9 +1144,65 @@ func TestJumpIsNotClaimedConfirmedOnUSBTransport(t *testing.T) {
 
 	errOut.Reset()
 	app.Transport = transportUSB
-	app.reportJumpEvidence(context.Background(), app.newFormatter())
+	app.reportJumpEvidence(context.Background(), app.newFormatter(), watched)
 	if !strings.Contains(errOut.String(), "NOT be confirmed") {
 		t.Errorf("`firmware bootloader` implied a confirmation it never had: %q", errOut.String())
+	}
+}
+
+// TestAnInterruptedDisconnectWaitIsNotReportedAsATimeout: waitForDevice returns
+// the context's own error when a Ctrl-C lands in the poll, and both callers
+// treated every error as the three-second timeout. On the flash path that
+// produced a message claiming an observation that was never made, promising
+// nothing had been flashed, and then reconnecting with the dead context purely
+// to print "could not identify the VFLEX still on the bus: context canceled" --
+// for a unit that by then had almost certainly jumped. On the `firmware
+// bootloader` path it produced the same false three-second claim.
+//
+// The jump frame goes out before either wait begins, so neither outcome is a
+// failed jump: confirmJump hands the cancellation back with its chain intact,
+// and reportJumpEvidence stays a note.
+func TestAnInterruptedDisconnectWaitIsNotReportedAsATimeout(t *testing.T) {
+	interrupted := func(context.Context, bool, time.Duration) error {
+		return context.Canceled
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	app, _, errOut := newFlashTestApp()
+	err := app.confirmJump(ctx, app.newFormatter(), "VFX-0001", interrupted)
+	if err == nil {
+		t.Fatal("an interrupted confirmation was reported as a confirmed jump")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the interruption's own error was lost from the chain: %v", err)
+	}
+	if msg := err.Error(); strings.Contains(msg, "did not disconnect") {
+		t.Errorf("a Ctrl-C was reported as a jump that did not take: %s", msg)
+	}
+	if said := errOut.String(); strings.Contains(said, "could not identify") {
+		t.Errorf("the dead context was used for a diagnostic read: %q", said)
+	}
+
+	// The timeout it really is must keep its own wording, or the branch above
+	// would have swallowed the case it exists to distinguish.
+	errOut.Reset()
+	timedOut := func(context.Context, bool, time.Duration) error {
+		return codedf(ExitFailure, "timed out after %s waiting for the VFLEX to disconnect", disconnectTimeout)
+	}
+	err = app.confirmJump(context.Background(), app.newFormatter(), "VFX-0001", timedOut)
+	if err == nil || !strings.Contains(err.Error(), "did not disconnect") {
+		t.Errorf("a genuine timeout no longer says the jump was unconfirmed: %v", err)
+	}
+
+	errOut.Reset()
+	app.reportJumpEvidence(ctx, app.newFormatter(), interrupted)
+	said := errOut.String()
+	if strings.Contains(said, "still visible") {
+		t.Errorf("`firmware bootloader` claimed a %s observation it never made: %q", disconnectTimeout, said)
+	}
+	if !strings.Contains(said, "interrupted") {
+		t.Errorf("the interruption was not reported at all: %q", said)
 	}
 }
 
@@ -804,7 +1226,7 @@ func TestBootloaderConnectIsNotWrappedInASecondRetryLoop(t *testing.T) {
 
 	app, _, errOut := newFlashTestApp()
 	start := time.Now()
-	_, _, err := openBootloaderInterface(context.Background(), app.newFormatter())
+	_, _, err := openBootloaderInterface(context.Background(), app.newFormatter(), false)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -849,12 +1271,82 @@ func TestBootloaderConnectInterruptionIsNotReportedAsAMissingDevice(t *testing.T
 	})
 
 	app, _, _ := newFlashTestApp()
-	_, _, err := openBootloaderInterface(ctx, app.newFormatter())
+	_, _, err := openBootloaderInterface(ctx, app.newFormatter(), false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("the interruption was swallowed: %v", err)
 	}
 	if code := ExitCode(err); code == ExitNoDevice {
 		t.Error("an interrupted connect was reported as a missing device")
+	}
+}
+
+// TestBootloaderOpenFailuresKeepTheirClass: the bootloader is raw usbfs on
+// /dev/bus/usb, which is exactly what `gflex install-udev` exists for, so the
+// missing-rule case is the ordinary one here -- and it exited 3, "no device
+// found", while the same cause on `gflex --transport usb info` exits 6. README
+// calls the codes stable enough to branch on, so a script that runs
+// install-udev on 6 never fired. Two things caused it, and both are fixed here:
+// %v flattened the chain so no sentinel survived, and an explicit CodedError
+// wins over every classification ExitCode would have made anyway.
+func TestBootloaderOpenFailuresKeepTheirClass(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wantCode int
+		wantIs   error
+		udev     bool // whether a udev rule is the fix
+	}{
+		{
+			name: "a missing udev rule",
+			err: fmt.Errorf("bootloader: opening /dev/bus/usb/001/004: %w",
+				&usbfs.Error{Op: "open", Path: "/dev/bus/usb/001/004", Errno: syscall.EACCES,
+					Class: usbfs.ErrPermission}),
+			wantCode: ExitPermission,
+			wantIs:   usbfs.ErrPermission,
+			udev:     true,
+		},
+		{
+			name: "an interface someone else holds",
+			err: fmt.Errorf("bootloader: claiming interface 0: %w",
+				&usbfs.Error{Op: "claim", Errno: syscall.EBUSY, Class: usbfs.ErrBusy}),
+			wantCode: ExitBusy,
+			wantIs:   usbfs.ErrBusy,
+		},
+		{
+			// --recover against a unit that never left its application. The
+			// open worked, so a udev rule is not the fix, and the package's own
+			// message already names both ways forward.
+			name:     "a unit still running its application",
+			err:      fmt.Errorf("bootloader: %w: /dev/bus/usb/001/004 is running its application", bootloader.ErrApplicationMode),
+			wantCode: ExitFailure,
+			wantIs:   bootloader.ErrApplicationMode,
+		},
+		{
+			name:     "no VFLEX at all",
+			err:      errors.New("bootloader: no device with vendor 0x37BF is attached"),
+			wantCode: ExitNoDevice,
+			udev:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubConnect(t, func(context.Context) (*usbfs.Device, usbfs.Interface, error) {
+				return nil, usbfs.Interface{}, tc.err
+			})
+			app, _, _ := newFlashTestApp()
+			_, _, err := openBootloaderInterface(context.Background(), app.newFormatter(), false)
+			if err == nil {
+				t.Fatal("a failed connect was not reported as an error")
+			}
+			if code := ExitCode(err); code != tc.wantCode {
+				t.Errorf("exit code %d, want %d: %v", code, tc.wantCode, err)
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("the %v sentinel did not survive the wrap: %v", tc.wantIs, err)
+			}
+			if got := strings.Contains(err.Error(), "install-udev"); got != tc.udev {
+				t.Errorf("udev advice present = %v, want %v: %v", got, tc.udev, err)
+			}
+		})
 	}
 }
 
@@ -1086,7 +1578,7 @@ func TestInterruptionAfterASuccessfulFlashReportsSuccess(t *testing.T) {
 		t.Fatalf("runUpdate: %v", err)
 	}
 
-	err = app.awaitApplicationReturn(ctx, f, res)
+	err = app.awaitApplicationReturn(ctx, f, baseOpts(), res)
 	if err == nil {
 		t.Fatal("an interrupted post-jump wait did not report an error")
 	}
@@ -1119,7 +1611,7 @@ func TestInterruptionAfterASuccessfulFlashReportsSuccess(t *testing.T) {
 func TestPostFlashFailureKeepsTheFailuresIdentity(t *testing.T) {
 	app, _, errOut := newFlashTestApp()
 	cause := codedf(ExitNoDevice, "no device with vendor 0x37BF came back on the USB bus within 15s after the jump")
-	err := app.postFlashFailure(app.newFormatter(),
+	err := app.postFlashFailure(app.newFormatter(), baseOpts(),
 		&bootloader.UpdateResult{CRC: 0x5A, CRCChecked: true, JumpedToApp: true},
 		"waiting for the unit to come back in application mode", cause)
 
@@ -1146,7 +1638,7 @@ func TestPostFlashFailureKeepsTheFailuresIdentity(t *testing.T) {
 // established, exactly as reportReplayIncomplete's wording is pinned not to.
 func TestPostFlashFailureDoesNotClaimAnUnverifiedImageWasVerified(t *testing.T) {
 	app, _, errOut := newFlashTestApp()
-	_ = app.postFlashFailure(app.newFormatter(),
+	_ = app.postFlashFailure(app.newFormatter(), baseOpts(),
 		&bootloader.UpdateResult{Unverified: true, JumpedToApp: true},
 		"reconnecting to the unit", errors.New("no device"))
 	said := errOut.String()
@@ -1155,6 +1647,50 @@ func TestPostFlashFailureDoesNotClaimAnUnverifiedImageWasVerified(t *testing.T) 
 	}
 	if !strings.Contains(said, "no CRC") {
 		t.Errorf("the report does not say the image was never verified: %q", said)
+	}
+	// The honesty above ended one line too early: "Do NOT re-flash the unit for
+	// this" rests on a unit whose firmware is known good, which is precisely
+	// what --force did not establish. A unit that does not come back after
+	// being started on an unverified image is the case where the "still
+	// re-flashable" reassurance stops applying on its own, and re-flashing is
+	// then the fix rather than the mistake (SPEC.md §10.5, §13.6).
+	if strings.Contains(said, "Do NOT re-flash") {
+		t.Errorf("an unverified image that did not come back was protected from a re-flash: %q", said)
+	}
+	for _, want := range []string{bootloaderLEDNote, "--recover"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the report does not say how to get an unresponsive unit back (missing %q): %q",
+				want, said)
+		}
+	}
+}
+
+// TestAnUndeliveredJumpIsNotReportedAsAStartedImage: postFlashFailure's opening
+// line asserts that the jump was sent, and the field that records the send is
+// UpdateResult.JumpedToApp. Asserting it on any other authority is how a unit
+// sitting in the bootloader comes to be described to its owner as running the
+// new image, with "Do NOT re-flash" forbidding the one action that would get it
+// out (SPEC.md §10.5).
+func TestAnUndeliveredJumpIsNotReportedAsAStartedImage(t *testing.T) {
+	app, _, errOut := newFlashTestApp()
+	o := baseOpts()
+	o.path = "/tmp/fw.json"
+	err := app.postFlashFailure(app.newFormatter(), o,
+		&bootloader.UpdateResult{CRC: 0x5A, CRCChecked: true},
+		"waiting out the post-jump settle", errors.New("interrupted"))
+
+	said := errOut.String()
+	if strings.Contains(said, "Do NOT re-flash") {
+		t.Errorf("a unit still in the bootloader was told not to be re-flashed: %q", said)
+	}
+	for _, want := range []string{"CMD_BOOTLOAD_END", bootloaderLEDNote, "re-flashable", "--recover /tmp/fw.json"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the report does not say the unit never left the bootloader (missing %q): %q",
+				want, said)
+		}
+	}
+	if err == nil || strings.Contains(err.Error(), "SUCCEEDED") {
+		t.Errorf("the returned error claims a completed update: %v", err)
 	}
 }
 
@@ -1237,6 +1773,60 @@ func TestFetchedImageSaveIsAtomic(t *testing.T) {
 	}
 }
 
+// TestASavedImageRoundTripsWhereBase64WouldNot pins the page encoding. Handing
+// [][]byte to encoding/json renders each page as base64, and the loader's rule
+// is that a string of nothing but hex digits IS hex -- which base64 can be. A
+// page of zero bytes whose length is a multiple of 3 encodes to an unpadded run
+// of 'A': all hex digits, even length, and read back as two thirds as many
+// 0xAA bytes. The 320-byte pages the vendor service sends today always carry
+// '=' padding and hide it; 240, 480 and 960 are equally valid eight-chunk
+// geometries and do not.
+//
+// The two failures it produced are both here: a mixed image the tool could not
+// read back at all, and an all-zero image that loaded cleanly as different
+// bytes at a different geometry -- and would then have been flashed.
+func TestASavedImageRoundTripsWhereBase64WouldNot(t *testing.T) {
+	const pageSize = 480 // 8 chunks of 60 bytes, and divisible by 3
+
+	for _, tc := range []struct {
+		name  string
+		pages [][]byte
+	}{
+		{
+			name:  "one zero-filled page among others",
+			pages: [][]byte{bytes.Repeat([]byte{0xA5}, pageSize), make([]byte, pageSize)},
+		},
+		{
+			name:  "an image that is entirely zero",
+			pages: [][]byte{make([]byte, pageSize), make([]byte, pageSize)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "image.json")
+			app, _, _ := newFlashTestApp()
+			fw := &bootloader.Firmware{Pages: tc.pages, Version: "5.1.0", CRC: 0x5A, CRCKnown: true}
+			if err := app.reportFetched(app.newFormatter(), fw, path); err != nil {
+				t.Fatalf("reportFetched: %v", err)
+			}
+
+			back, err := bootloader.LoadFile(path)
+			if err != nil {
+				t.Fatalf("the saved image does not load: %v", err)
+			}
+			if len(back.Pages) != len(fw.Pages) || back.PageSize() != pageSize {
+				t.Fatalf("round trip gave %d pages of %d bytes, want %d of %d",
+					len(back.Pages), back.PageSize(), len(fw.Pages), pageSize)
+			}
+			for i := range fw.Pages {
+				if !bytes.Equal(back.Pages[i], fw.Pages[i]) {
+					t.Errorf("page %d came back as different bytes (first %#02x, want %#02x)",
+						i, back.Pages[i][0], fw.Pages[i][0])
+				}
+			}
+		})
+	}
+}
+
 // The half that matters: a save that fails must leave whatever was at that path
 // alone. os.WriteFile truncates in place, so the old behaviour committed a
 // zero-length file before writing a byte -- and this path is a trust input to
@@ -1274,5 +1864,71 @@ func TestFetchedImageSaveLeavesThePreviousFileIntactWhenItFails(t *testing.T) {
 	}
 	if string(got) != old {
 		t.Errorf("the previously saved image was damaged by a failed write:\n%q", got)
+	}
+}
+
+// TestBootloaderFailFastOnlyUnderRecover pins which side of the flash asks
+// Connect to give up early on a unit still running the application.
+//
+// Under --recover no jump was issued: the user is asserting the unit is already
+// in the bootloader, so an application-mode answer is settled and re-asking for
+// the full window only delays the message saying so. On the ordinary path a
+// jump has just gone out and that same refusal is expected while the unit
+// resets, so failing fast there would abandon a flash about to succeed.
+func TestBootloaderFailFastOnlyUnderRecover(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		recover bool
+		want    bool
+	}{
+		{"recover asserts nothing is in flight", true, true},
+		{"a jump was just issued", false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got bootloader.ConnectOptions
+			stubConnectWithOptions(t, func(_ context.Context, opts bootloader.ConnectOptions) (*usbfs.Device, usbfs.Interface, error) {
+				got = opts
+				return nil, usbfs.Interface{}, errors.New("stub: no bootloader")
+			})
+			app, _, _ := newFlashTestApp()
+			_, _, err := openBootloaderInterface(context.Background(), app.newFormatter(), tt.recover)
+			if err == nil {
+				t.Fatal("openBootloaderInterface succeeded against a stub that always fails")
+			}
+			if got.FailFastOnApplicationMode != tt.want {
+				t.Errorf("FailFastOnApplicationMode = %v, want %v", got.FailFastOnApplicationMode, tt.want)
+			}
+		})
+	}
+}
+
+// TestPresenceIsNotMeaningfulOnAPortOnlyThisRunIdentified pins the second half
+// of midiPresenceMeaningful.
+//
+// devicePresent asks rawmidi.Discover, which classifies a port by vendor ID.
+// The weaker tiers of SPEC.md §3.4 -- a name substring, or the sole port on the
+// system -- belong to the selection openRawMIDI made and mean nothing to
+// Discover, so a unit reached that way reads as absent the whole time it is
+// attached. Treating the node as evidence there makes a jump look confirmed on
+// an observation never made, and makes the post-flash wait for the unit's
+// return one that can never be satisfied.
+func TestPresenceIsNotMeaningfulOnAPortOnlyThisRunIdentified(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport string
+		confirmed bool
+		want      bool
+	}{
+		{"rawmidi, vendor ID identified the port", transportRawMIDI, true, true},
+		{"rawmidi, matched by name or taken as the only port", transportRawMIDI, false, false},
+		{"usb detaches the kernel driver either way", transportUSB, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := &App{Transport: tt.transport, midiPortVIDConfirmed: tt.confirmed}
+			if got := app.midiPresenceMeaningful(); got != tt.want {
+				t.Errorf("midiPresenceMeaningful() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

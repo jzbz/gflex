@@ -1,6 +1,9 @@
 package session
 
 import (
+	"fmt"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -48,6 +51,52 @@ func newTestSession(t *testing.T, opts Options) (*Session, *fake.Device) {
 	s := New(d.Transport(), opts)
 	t.Cleanup(func() { _ = s.Close() })
 	return s, d
+}
+
+// enodevWrites wraps a Device's transport with the one thing fake.Device
+// deliberately will not do: fail the WRITE after the device has gone.
+//
+// Its Unplug doc says so in terms -- "a real unplug may fail the write as well;
+// that is the transport's own error path" -- because a fake that failed writes
+// could not stage the send-succeeds-then-no-answer shape the other unplug tests
+// need. But the send leg is a distinct classification problem: the framer gates
+// SendFrame on its own done channel, which a reader dying from a transport
+// error never closes, so the next command is still transmitted into a port that
+// is gone. On real hardware the kernel has already swapped in the disconnected
+// file operations by then and rawmidi returns the errno verbatim
+// (`rawmidi: write %s: %w`), which is exactly what this reproduces.
+type enodevWrites struct {
+	proto.Transport
+	dead atomic.Bool
+}
+
+// unplug makes every subsequent WriteMIDI fail with ENODEV. Reads are left
+// alone: a test that wants those to fail too calls fake.Device.Unplug as well.
+func (t *enodevWrites) unplug() { t.dead.Store(true) }
+
+func (t *enodevWrites) WriteMIDI(p []byte) error {
+	if t.dead.Load() {
+		return fmt.Errorf("rawmidi: write /dev/snd/midiC1D0: %w", syscall.ENODEV)
+	}
+	return t.Transport.WriteMIDI(p)
+}
+
+// newFailingWriteSession is newTestSession with the transport above spliced in,
+// so a test can kill the send leg at a chosen moment.
+func newFailingWriteSession(t *testing.T, opts Options) (*Session, *fake.Device, *enodevWrites) {
+	t.Helper()
+	d := fake.New()
+	d.SetDefault(nil)
+	tr := &enodevWrites{Transport: d.Transport()}
+	if opts.ByteDelay == 0 {
+		opts.ByteDelay = time.Nanosecond
+	}
+	if opts.Timeout == 0 {
+		opts.Timeout = 2 * time.Second
+	}
+	s := New(tr, opts)
+	t.Cleanup(func() { _ = s.Close() })
+	return s, d, tr
 }
 
 // mustBuild builds a raw protocol frame for injection via Device.Push and for

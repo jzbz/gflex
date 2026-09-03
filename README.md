@@ -161,17 +161,23 @@ Every release attaches Linux binaries for **amd64** and **arm64**, built and che
 architecture they target, plus a `SHA256SUMS` file listing both and a `SHA256SUMS.asc` signing that
 list: [github.com/jzbz/gflex/releases](https://github.com/jzbz/gflex/releases).
 
-`uname -m` says which one you want — `x86_64` is amd64, `aarch64` is arm64. Download it and both
-checksum files alongside it, then:
+`uname -m` says which one you want — `x86_64` is amd64, `aarch64` is arm64. The block below names
+amd64, so swap that for `arm64` if that is yours. Download the binary and both checksum files
+alongside it, then:
 
 ```bash
-gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum --ignore-missing -c SHA256SUMS
-install -m 0755 gflex-*-linux-amd64 ~/.local/bin/gflex
+gpg --verify SHA256SUMS.asc SHA256SUMS &&
+sha256sum --ignore-missing -c SHA256SUMS &&
+install -m 0755 gflex-*-linux-amd64 ~/.local/bin/gflex &&
 gflex version
 ```
 
-[Verifying a download](#verifying-a-download) below is what makes that first line mean anything:
-where the signing key comes from, and which fingerprint it has to be.
+Those `&&`s are the point of the block, not decoration: a bad signature or a failed checksum stops
+the paste right there, before `install` puts anything on your PATH. Without them a shell prints the
+error and installs the binary anyway.
+
+[Verifying a download](#verifying-a-download) below is what makes those first two lines mean
+anything: where the signing key comes from, and which fingerprint it has to be.
 
 ### Verifying a download
 
@@ -186,8 +192,12 @@ or from a keyserver, which is the better of the two — it does not come from th
 release:
 
 ```bash
-gpg --locate-keys jz@jz.bz
+gpg --keyserver hkps://keys.openpgp.org --recv-keys 252B901C88853CF9F9392559249738C8641C3359
 ```
+
+That asks by fingerprint rather than by address: a keyserver can hold more than one key for
+`jz@jz.bz`, and an address is not enough to say which one was meant. It is the same fingerprint
+checked below.
 
 Either way the fingerprint below is what to trust, not where you got it. Then check the signature
 before the files:
@@ -353,7 +363,7 @@ gflex firmware flash firmware.json --recover   # unit already stuck in the bootl
 | `--ws-url` | Override that service's endpoint. It must be TLS (`wss://`); a `ws://` URL is refused, because the image and the CRC it is checked against arrive in the same document. If the endpoint really is cleartext, say so with `ws+insecure://` |
 | `--fetch-timeout` | Budget for the whole download (default 15 s). `--timeout` bounds MIDI commands, not this |
 | `--recover` | Skip the jump; talk straight to a unit already in the bootloader |
-| `--crc <byte>` | Supply the expected CRC for an image that carries none (a raw `.bin`) |
+| `--crc <byte>` | Expected CRC for an image that carries none (a raw `.bin`). It also **replaces** the CRC an image does carry — verification then checks the value you supplied, not the image's, and the replacement is warned about on stderr |
 | `--force` | Flash an unverifiable image anyway — see below |
 | `--ack-mode` | Stream with acknowledgements from the start: slower, more robust |
 | `--page-size <n>` | Page size used to split a raw `.bin` (default 512). A JSON image and `--fetch` carry their own page split, so it cannot be combined with either |
@@ -482,6 +492,9 @@ range validation whatsoever** — it will happily write any 16-bit value. This t
 frame can't be known without first reading the device (`firmware flash --recover`/`--fetch`, and
 `vlimit set`/`calibrate adc` given only half of a pair).
 
+`gflex firmware fetch --dry-run` prints the single serial read it would send and stops there: the device
+is not opened, the vendor service is not contacted, and `-o` is not written.
+
 A bare number in `voltage set` / `current set` is always volts or amps, never guessed from
 magnitude — `voltage set 12000` is refused rather than quietly read as 12000 mV, because
 magnitude-guessing would turn a typo into a 1000× over-volt.
@@ -502,7 +515,9 @@ and attaches a load to whatever voltage was already there.
 likelihood: the udev rule isn't installed (`sudo gflex install-udev`, then replug); the device is in
 bootloader mode from an interrupted flash (slow-blinking white LED — use `gflex firmware flash
 --recover`); or it genuinely isn't plugged in. Note the tool matches on USB vendor `0x37bf`, so a
-device that enumerates but isn't a VFLEX won't be picked up unless it's your only MIDI port.
+device that enumerates but isn't a VFLEX won't be picked up unless it's your only MIDI port. A port
+that can't be traced back to a USB device at all is still matched on a `vflex` name substring;
+`gflex devices` marks that weaker tier as `yes (name only)`, and `--json` as `identified_by: "name"`.
 
 **"Device busy"** (exit 4). Something else holds the ALSA rawmidi node, which is exclusive per
 direction. **Check the browser first.** The vendor ships a functionally identical web app at
@@ -513,6 +528,10 @@ what opens the node on its behalf, so don't go looking for the browser among the
 `/dev/snd/midiC*D*`. Read `/proc/asound/seq/clients` instead: the `Werewolf VFLEX` port lists what
 it is connected to and connected from, one entry per direction, and that is the real holder.
 PipeWire, JACK and a DAW are the other candidates.
+
+On `--transport usb`, exit 4 means something else entirely: another usbfs holder — a second
+`gflex --transport usb`, or a WebUSB tab — has claimed the interface. None of the ALSA advice above
+applies to that case, and gflex prints no hint for it.
 
 Closing the other client is the fix. `--transport usb` also works — it bypasses ALSA entirely — but
 it is not free: on at least one host and kernel a single run of it left the device with no

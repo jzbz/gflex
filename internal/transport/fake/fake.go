@@ -214,11 +214,28 @@ func (d *Device) ClearFaults() {
 // current bytes, a write replaces them and echoes the new value back. This is
 // what most of the VFLEX's read/write commands do, and it is what makes a
 // write-then-read-back sequence return the value that was written.
+//
+// A write carrying the scratchpad flag is the exception: it is acknowledged and
+// echoed but never stored, because that is what hardware does. The flag is
+// validate-and-discard, measured on two units and two commands (SPEC.md §5.1,
+// §14.4: tx 04 d2 17 70 -> rx 04 12 17 70, with the voltage still reading
+// 5000). The echo looking exactly like a successful write is the whole hazard,
+// so the double has to be able to stage it.
+//
+// The acknowledgement echoes the REQUEST payload, which is the shape
+// CMD_VOLTAGE_MV was measured to send. §14.4 is explicit that this is
+// per-command and not a property of the flag -- CMD_CURRENT_LIMIT_MA answered
+// the same kind of write with the value it held instead (tx 04 d3 0f a0 ->
+// rx 04 13 13 88) -- so a test that cares about that command's echo has to
+// script it with SetHandler rather than generalise from here.
 func (d *Device) SetRegister(cmd proto.Cmd, initial []byte) {
 	d.StoreRegister(cmd, initial)
 	d.SetHandler(cmd, func(f proto.Frame) []byte {
 		if f.Write {
-			d.StoreRegister(cmd, f.Payload)
+			if !f.Scratchpad {
+				d.StoreRegister(cmd, f.Payload)
+			}
+			return append([]byte{}, f.Payload...)
 		}
 		v, _ := d.Register(cmd)
 		return v
@@ -486,13 +503,15 @@ func (d *Device) dispatch(raw []byte) {
 }
 
 // reply builds, corrupts if asked to, encodes and queues one response.
+//
+// An over-long payload is deliberately NOT clamped to proto.MaxPayloadLen. The
+// frame goes out whole, declaring its real length, and the host's own receive
+// state machine drops it for declaring more than 64 bytes (SPEC.md §3.3) --
+// which is what a device emitting an over-long frame would produce, a command
+// that times out. Truncating instead would hand the host a well-formed 64-byte
+// frame it happily parses, turning the one droppable case a responder can stage
+// into a successful exchange.
 func (d *Device) reply(req proto.Frame, payload []byte, fault Fault) {
-	if len(payload) > proto.MaxPayloadLen {
-		// A real device cannot exceed this either: the receiver drops anything
-		// over 64 bytes, so there is no point emitting it.
-		payload = payload[:proto.MaxPayloadLen]
-	}
-
 	cmd := req.Cmd
 	if fault.Mismatch {
 		cmd = fault.MismatchCmd
@@ -507,7 +526,10 @@ func (d *Device) reply(req proto.Frame, payload []byte, fault Fault) {
 	// scratchpad flag is never echoed on any path.
 	frame, err := proto.Build(cmd, payload, req.Write, false)
 	if err != nil {
-		return // unreachable: payload was clamped above
+		// Only a payload past the 253-byte length-field ceiling gets here. The
+		// response is suppressed, which is itself the drop such a frame would
+		// produce: nothing that long can be put on the wire at all.
+		return
 	}
 	if fault.BadLength {
 		frame[0] = fault.LengthByte

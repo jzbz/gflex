@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jzbz/gflex/internal/framer"
 	"github.com/jzbz/gflex/internal/proto"
 )
 
@@ -561,6 +562,39 @@ func TestDecoderOverlongFrameTruncates(t *testing.T) {
 	}
 }
 
+// TestCodecsAgreeOnEveryByte crosses this package's device-side MIDI codec
+// against internal/framer's host-side one, in both directions, for every byte
+// value.
+//
+// Each codec is already round-tripped against itself (framer's
+// TestRoundTripAllBytes, FuzzFrameRoundTrip below), and a self round-trip is
+// exactly what a symmetric bug survives: a nibble-masking change made on both
+// sides of one implementation encodes and decodes back to itself and proves
+// nothing. Feeding one implementation's output to the other is what catches it,
+// and is the reason midi.go carries a second implementation rather than
+// importing framer (SPEC.md §12).
+func TestCodecsAgreeOnEveryByte(t *testing.T) {
+	for i := 0; i <= 0xFF; i++ {
+		b := byte(i)
+		frame := []byte{0x03, byte(proto.CmdSerialNumber), b}
+
+		// Host encoder into the device decoder: what the framer transmits is
+		// what this package's receive state machine has to accept.
+		got := newFrameDecoder().feed(framer.EncodeMIDI(frame))
+		if len(got) != 1 || !bytes.Equal(got[0], frame) {
+			t.Fatalf("byte %#02x: framer.EncodeMIDI decoded here as %x, want %x", b, got, frame)
+		}
+
+		// Device encoder into the host decoder: the return leg, where a
+		// velocity-0 byte would be reread as a start marker by a decoder that
+		// keyed on anything but the status byte (SPEC.md §3.2).
+		back := framer.NewDecoder().Feed(encodeFrameMIDI(frame))
+		if len(back) != 1 || !bytes.Equal(back[0], frame) {
+			t.Fatalf("byte %#02x: encodeFrameMIDI decoded by framer as %x, want %x", b, back, frame)
+		}
+	}
+}
+
 func TestPushAndPushMIDI(t *testing.T) {
 	d := New()
 	defer d.Close()
@@ -617,6 +651,57 @@ func TestRegisters(t *testing.T) {
 	}
 	if _, ok := d.Register(proto.CmdCurrentLimitMa); ok {
 		t.Error("Register reported an unset command as present")
+	}
+}
+
+// TestScratchpadWriteIsAcknowledgedAndDiscarded pins SPEC.md §14.4 on the
+// double: a write carrying CMD_FLAG_SCRATCHPAD answers with the value it was
+// given and changes nothing, so the acknowledgement is indistinguishable from a
+// committed write. That is measured behaviour (tx 04 d2 17 70 -> rx 04 12 17
+// 70, voltage still 5000 on two units), and it is the case the CLI's raw-write
+// warning describes; a double that stored the value could not stage it.
+func TestScratchpadWriteIsAcknowledgedAndDiscarded(t *testing.T) {
+	d := New()
+	defer d.Close()
+	h := newHost(t, d)
+
+	d.SetRegister(proto.CmdVoltageMv, proto.EncodeU16(5000))
+
+	w, err := proto.Build(proto.CmdVoltageMv, proto.EncodeU16(6000), true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, w)
+	// The response carries the requested 6000 mV. The scratchpad bit is cleared,
+	// as it is on every response path; the write bit survives because the fake
+	// echoes that one deliberately, where hardware answers 04 12 17 70.
+	if got, want := h.mustRecv(t), []byte{0x04, 0x92, 0x17, 0x70}; !bytes.Equal(got, want) {
+		t.Errorf("scratchpad write echo = %x, want %x", got, want)
+	}
+
+	if v, ok := d.Register(proto.CmdVoltageMv); !ok || !bytes.Equal(v, proto.EncodeU16(5000)) {
+		t.Errorf("register after a scratchpad write = %x (%v), want 1388", v, ok)
+	}
+	h.send(t, proto.Read(proto.CmdVoltageMv))
+	if got, want := h.mustRecv(t), []byte{0x04, 0x12, 0x13, 0x88}; !bytes.Equal(got, want) {
+		t.Errorf("read-back after a scratchpad write = %x, want %x", got, want)
+	}
+}
+
+// TestOverlongResponseIsDroppedByTheHost pins that a responder returning more
+// than 62 bytes produces the drop hardware would, not a truncated frame the
+// host accepts. The frame goes out declaring its real length and the receive
+// state machine discards it for exceeding the 64-byte cap (SPEC.md §3.3), which
+// is the only failure the protocol has: the command times out.
+func TestOverlongResponseIsDroppedByTheHost(t *testing.T) {
+	d := New()
+	defer d.Close()
+	h := newHost(t, d)
+
+	d.SetResponse(proto.CmdSerialNumber, make([]byte, 70))
+	h.send(t, proto.Read(proto.CmdSerialNumber))
+	if f, ok := h.recv(t, 100*time.Millisecond); ok {
+		t.Errorf("over-long response was delivered as %x, want a drop", f)
 	}
 }
 
@@ -757,6 +842,57 @@ func TestTypicalPDOLogChunks(t *testing.T) {
 	h.send(t, []byte{0x03, byte(proto.CmdPDOLog), 0x00})
 	if got := h.mustRecv(t); !bytes.Equal(got[3:], make([]byte, pdoLogChunkBytes)) {
 		t.Errorf("chunk 0 after erase = %x, want zeros", got)
+	}
+}
+
+// TestTypicalPDOLogServesAShortCapture covers a log stored at the 90 bytes
+// SPEC.md §9.3 defines rather than the 96 twelve chunks carry. The final window
+// runs past the end of the blob, and it is still answered, zero-padded the way
+// the six spare bytes read on hardware: refusing it would leave the host
+// retrying chunk 11 until its chunk timeout gave up three times over.
+func TestTypicalPDOLogServesAShortCapture(t *testing.T) {
+	d := NewTypical()
+	defer d.Close()
+	h := newHost(t, d)
+
+	capture := TypicalPDOLog()[:90]
+	d.StoreRegister(proto.CmdPDOLog, capture)
+
+	var blob []byte
+	for i := range pdoLogChunks {
+		h.send(t, []byte{0x03, byte(proto.CmdPDOLog), byte(i)})
+		got := h.mustRecv(t)
+		if len(got) != 2+1+pdoLogChunkBytes {
+			t.Fatalf("chunk %d response is %d bytes: %x", i, len(got), got)
+		}
+		blob = append(blob, got[3:]...)
+	}
+	want := make([]byte, pdoLogChunks*pdoLogChunkBytes)
+	copy(want, capture)
+	if !bytes.Equal(blob, want) {
+		t.Errorf("downloaded log = %x\nwant             %x", blob, want)
+	}
+}
+
+// TestTypicalLEDColourWriteHasNoReadSide pins SPEC.md §6.2: every
+// CMD_FLASH_LED_SEQUENCE_ADVANCED frame is answered with the command code and
+// an empty payload. The device says nothing about how it parsed the colour, so
+// nothing may be read back out of the response.
+func TestTypicalLEDColourWriteHasNoReadSide(t *testing.T) {
+	d := NewTypical()
+	defer d.Close()
+	h := newHost(t, d)
+
+	w, err := proto.Write(proto.CmdFlashLEDSeqAdvanced, []byte{0x0A, 0x01, 0x06, 0x02, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, w)
+	// 0x8d rather than hardware's 0x0d: the fake echoes the write flag on every
+	// response deliberately, so a host that forgot to mask the command byte
+	// fails here (see reply). The empty payload is the part this pins.
+	if got, want := h.mustRecv(t), []byte{0x02, 0x8D}; !bytes.Equal(got, want) {
+		t.Errorf("led colour ack = %x, want %x", got, want)
 	}
 }
 
@@ -1030,10 +1166,19 @@ func FuzzFrameDecoder(f *testing.F) {
 
 // FuzzFrameRoundTrip asserts that any frame the encoder accepts decodes back to
 // itself, including every byte value and every velocity-0 hazard.
+//
+// The seed corpus carries every byte value in the payload position, because a
+// plain `go test` run -- which is what CI does -- executes the seeds and
+// nothing else. Leaving the three hand-written frames as the whole corpus made
+// the claim above true only under `go test -fuzz`, which nobody runs on a
+// schedule, and a value-specific nibble bug would have sailed through.
 func FuzzFrameRoundTrip(f *testing.F) {
 	f.Add([]byte{0x02, 0x08})
 	f.Add([]byte{0x04, 0x92, 0x2E, 0xE0})
 	f.Add([]byte{0x03, 0x8F, 0x00})
+	for b := range 256 {
+		f.Add([]byte{byte(b)})
+	}
 
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		if len(payload) > proto.MaxPayloadLen {

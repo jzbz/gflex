@@ -78,6 +78,33 @@ func newRawCommand(app *App) *cobra.Command {
 					}
 				}
 
+				// The receive state machine of SPEC.md §3.3 discards anything
+				// over MaxFrameLen, so a 65-byte frame can only ever be a
+				// one-way probe. Asked before the dry run and before the
+				// device is opened, because everything needed to answer it is
+				// on the command line: session.exchange refuses the same frame,
+				// but only after app.connect has claimed the device -- and on
+				// --transport usb claiming it detaches snd-usb-audio, which on
+				// at least one kernel costs the ALSA MIDI port until replug
+				// (SPEC.md §4.2) for a frame that was never going to be sent.
+				// It also arrives as a generic failure there, where the sibling
+				// length-byte mistake one gate up is a usage error.
+				if !proto.FitsMIDI(raw) {
+					if !noACK {
+						return codedf(ExitUsage,
+							"the frame is %d bytes; the device's MIDI receive path drops anything over %d\n"+
+								"  (SPEC.md §3.3), so waiting for a response would only time out. Pass --no-ack\n"+
+								"  to send it anyway, fire-and-forget.",
+							len(raw), proto.MaxFrameLen)
+					}
+					// Probing the firmware's real receive ceiling is exactly
+					// what this command is for, so --no-ack still sends it --
+					// but "sent" must not read as "received" when SPEC.md §3.3
+					// says the frame is dropped on arrival.
+					f.Diag("warning: this frame is %d bytes and the device's receive path drops anything "+
+						"over %d (SPEC.md §3.3); expect nothing to happen", len(raw), proto.MaxFrameLen)
+				}
+
 				if app.DryRun {
 					if err := app.applyDryRun(f, CheckRawFrame(parsed)); err != nil {
 						return err

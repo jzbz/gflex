@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/jzbz/gflex/internal/framer"
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/usbfs"
 )
 
 // TestMonitorLoopAlwaysReportsTheTerminalError is the regression test for
@@ -223,5 +225,121 @@ func TestMonitorDroppedFramesNeverReachTheFrameChannel(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "drop") {
 		t.Errorf("the monitor printed no drop line for a malformed frame:\n%s", out.String())
+	}
+}
+
+// idleTransport reads nothing until it is closed, and reports err from Close --
+// the shape of a usbfs transport whose interface was released while
+// snd-usb-audio declined to rebind (SPEC.md §4.2).
+type idleTransport struct {
+	closed chan struct{}
+	once   sync.Once
+	err    error
+}
+
+func (t *idleTransport) ReadMIDI([]byte) (int, error) { <-t.closed; return 0, io.EOF }
+func (t *idleTransport) WriteMIDI([]byte) error       { return nil }
+func (t *idleTransport) Name() string                 { return "idle" }
+func (t *idleTransport) Close() error {
+	t.once.Do(func() { close(t.closed) })
+	return t.err
+}
+
+// TestMonitorReportsAnUnreboundDriver covers the one close error that has to be
+// printed rather than discarded, on the one command that does not close through
+// conn.
+//
+// monitor drives the framer directly, so conn.Close -- whose whole purpose is
+// this warning -- never runs for it, while `monitor --transport usb` is exactly
+// what the tool tells a user to run when another MIDI client holds the rawmidi
+// node (SPEC.md §4.1). Without this the monitor ended at exit 0 saying nothing,
+// the ALSA node was gone until replug, and the next ordinary command reported
+// no device with nothing connecting the two.
+func TestMonitorReportsAnUnreboundDriver(t *testing.T) {
+	tr := &idleTransport{
+		closed: make(chan struct{}),
+		err:    fmt.Errorf("releasing interface 1: %w", usbfs.ErrDriverNotRebound),
+	}
+	var out, errOut bytes.Buffer
+	app := &App{stdout: &out, stderr: &errOut, ByteDelay: time.Nanosecond}
+	app.testTransport = func(context.Context) (proto.Transport, string, error) {
+		return tr, "usb:test", nil
+	}
+
+	if err := app.runMonitor(context.Background(), 20*time.Millisecond); err != nil {
+		t.Fatalf("runMonitor: %v", err)
+	}
+	got := errOut.String()
+	for _, want := range []string{"warning", "unplugged and plugged back in", "--transport usb"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the monitor's close said nothing about %q:\n%s", want, got)
+		}
+	}
+}
+
+// An ordinary close error stays as silent here as it does in conn.Close: a
+// warning printed on every unremarkable close is one nobody reads by the time
+// it matters.
+func TestMonitorIsSilentAboutAnOrdinaryCloseError(t *testing.T) {
+	tr := &idleTransport{closed: make(chan struct{}), err: errors.New("some other close failure")}
+	var out, errOut bytes.Buffer
+	app := &App{stdout: &out, stderr: &errOut, ByteDelay: time.Nanosecond}
+	app.testTransport = func(context.Context) (proto.Transport, string, error) {
+		return tr, "usb:test", nil
+	}
+
+	if err := app.runMonitor(context.Background(), 20*time.Millisecond); err != nil {
+		t.Fatalf("runMonitor: %v", err)
+	}
+	if strings.Contains(errOut.String(), "warning") {
+		t.Errorf("an ordinary close error was reported as the rebind failure:\n%s", errOut.String())
+	}
+}
+
+// TestMonitorLoopDrainsWhatIsBufferedWhenTheContextEnds is the regression test
+// for the --for deadline landing on a burst.
+//
+// The framer keeps decoding into its 16-slot buffer until runMonitor's deferred
+// Close, and select picks uniformly among ready cases, so once the context was
+// done each iteration was a coin flip between printing what had arrived and
+// abandoning it -- on the command whose whole job is to be the record of what
+// the device sent (SPEC.md §14.13, §14.14). The terminal error was the worse
+// half: an unplug that raced the deadline left ENODEV unread in errs and the
+// command exited 0 with nothing printed. The iterations cover the orderings.
+func TestMonitorLoopDrainsWhatIsBufferedWhenTheContextEnds(t *testing.T) {
+	frame := proto.Read(proto.CmdSerialNumber)
+	const wantFrames = 3
+
+	for i := 0; i < 40; i++ {
+		frames := make(chan []byte, 16)
+		for j := 0; j < wantFrames; j++ {
+			frames <- frame
+		}
+		errs := make(chan error, 4)
+		errs <- errors.New("device unplugged (ENODEV)")
+		drops := make(chan monitorDrop, 4)
+		drops <- monitorDrop{at: time.Now(), reason: "length byte exceeds accumulator", buffered: []byte{0x02}}
+
+		// Neither framer channel is closed: the reader is still running, which
+		// is the state a --for expiry or a Ctrl-C actually finds them in.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		var out bytes.Buffer
+		app := &App{stdout: &out, stderr: io.Discard}
+		err := app.monitorLoop(ctx, frames, errs, drops)
+
+		if err == nil {
+			t.Fatalf("iteration %d: a transport failure waiting at the deadline exited 0", i)
+		}
+		if !strings.Contains(err.Error(), "ENODEV") {
+			t.Fatalf("iteration %d: returned error %v does not carry the transport failure", i, err)
+		}
+		if got := strings.Count(out.String(), proto.Hex(frame)); got != wantFrames {
+			t.Fatalf("iteration %d: %d of %d decoded frames were printed:\n%s", i, got, wantFrames, out.String())
+		}
+		if !strings.Contains(out.String(), "length byte exceeds accumulator") {
+			t.Errorf("iteration %d: a pending drop notice was abandoned:\n%s", i, out.String())
+		}
 	}
 }

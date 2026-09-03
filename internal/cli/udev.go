@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/jzbz/gflex/internal/proto"
 )
 
 // udevRules is the rule file from SPEC.md §4.4.
@@ -146,7 +148,22 @@ func (a *App) installUdev(ctx context.Context, f Formatter, path string) error {
 	}
 
 	reloaded := runUdevadm(ctx, f, "control", "--reload-rules")
-	triggered := runUdevadm(ctx, f, "trigger")
+	// runUdevadm reports a failure and carries on, which is right for a udevadm
+	// that would not run -- the rule file is written either way -- but wrong for
+	// a cancelled one. exec.CommandContext SIGKILLs the child when the signal
+	// context ends, and Start returns ctx.Err() when it has ended already, so
+	// without this a Ctrl-C landed in the same branch as "udevadm is missing":
+	// the report went on to say the install had completed apart from a manual
+	// reload, and the process exited 0 on a run the operator had aborted.
+	// Checked between the two calls as well, so an interrupted run does not go
+	// on to spawn a system-wide trigger it is about to kill.
+	if err := ctx.Err(); err != nil {
+		return udevadmInterrupted(f, path, err)
+	}
+	triggered := runUdevadm(ctx, f, udevTriggerArgs...)
+	if err := ctx.Err(); err != nil {
+		return udevadmInterrupted(f, path, err)
+	}
 	f.KV("reloaded", "rules reloaded", reloaded, boolWord(reloaded))
 	f.KV("triggered", "rules triggered", triggered, boolWord(triggered))
 
@@ -159,6 +176,37 @@ func (a *App) installUdev(ctx context.Context, f Formatter, path string) error {
 	}
 	f.Note("  gflex devices")
 	return nil
+}
+
+// udevadmInterrupted ends a cancelled install: the rule file is already in
+// place, so say what is left to do and hand the cancellation back.
+//
+// The advice goes out through Diag rather than Note. Note only buffers, and
+// App.run skips Flush on a command that returns an error, so a Note here would
+// be dropped at exactly the moment the operator needs to know that the file
+// landed and only the reload is missing.
+func udevadmInterrupted(f Formatter, path string, err error) error {
+	f.Diag("%s is written, but udevadm did not finish. Reload manually, then replug the VFLEX:", path)
+	f.Diag("  sudo udevadm control --reload-rules && sudo udevadm trigger")
+	return err
+}
+
+// udevTriggerArgs re-emits the uevent for the devices this rule can match, and
+// for nothing else.
+//
+// An argument-less `udevadm trigger` replays action=change across the whole of
+// sysfs, re-running every installed rule and every RUN+= program on the system
+// as root -- while the rule installed here matches one vendor ID on one
+// subsystem (see 70-gflex.rules). This file already declines to resolve udevadm
+// through PATH for the same reason: what runs behind the euid-0 gate should be
+// no larger than it has to be. The trigger stays unconditional, including on
+// the `unchanged` path: the file being identical does not mean it was ever
+// loaded, and `gflex install-udev --print | sudo tee` followed by no reload is
+// precisely the state this command exists to repair.
+var udevTriggerArgs = []string{
+	"trigger",
+	"--subsystem-match=usb",
+	fmt.Sprintf("--attr-match=idVendor=%04x", proto.VendorID),
 }
 
 // writeRuleFile installs the embedded rule at path.

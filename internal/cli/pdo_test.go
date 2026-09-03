@@ -8,6 +8,7 @@ import (
 
 	"github.com/jzbz/gflex/internal/pdo"
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/session"
 	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
@@ -362,5 +363,59 @@ func TestPDOOutputSaysWhenNothingIsFlagged(t *testing.T) {
 	}
 	if got := renderPDOLog(t, log); !strings.Contains(got, "nothing flagged") {
 		t.Errorf("a log with both flag words clear says nothing about them:\n%s", got)
+	}
+}
+
+// TestPDOVendorStringsAgreeAcrossPackages pins the two copies of the SPEC.md
+// §9.6 vendor strings to each other.
+//
+// The same two conditions are checked twice on the way to the user: session
+// rejects a short or all-zero blob as it comes off the wire, and pdo rejects it
+// again when the blob is decoded. Both must answer in the vendor's own words,
+// because §9.6's whole point is that a user searching the string the vendor's
+// app printed finds the same text here. The packages are deliberately
+// decoupled -- pdo is pure computation over 90 bytes and imports nothing
+// (SPEC.md §12) -- so nothing but this test stops one copy from being reworded
+// and the message the user sees depending on which layer caught it. This file
+// is the natural home: cli is the one package that imports both.
+func TestPDOVendorStringsAgreeAcrossPackages(t *testing.T) {
+	pairs := []struct {
+		what            string
+		session, decode error
+	}{
+		{"invalid log length", session.ErrPDOLogLength, pdo.ErrShortLog},
+		{"empty log", session.ErrPDOLogEmpty, pdo.ErrEmptyLog},
+	}
+	for _, p := range pairs {
+		t.Run(p.what, func(t *testing.T) {
+			if p.session.Error() != p.decode.Error() {
+				t.Errorf("the download and decode layers word the %s case differently:\n  session: %q\n  pdo:     %q",
+					p.what, p.session.Error(), p.decode.Error())
+			}
+		})
+	}
+}
+
+// TestPowerLimitedPPSIsMarkedInTheTable pins the scan table against the verdict
+// beneath it. A power-limited PPS APDO cannot hold its advertised Maximum
+// Current across its range, and PDO.CurrentAt bounds it, so a table printing
+// the advertised figure unqualified would contradict the verdict -- in the
+// optimistic direction, which is the one that damages a load.
+func TestPowerLimitedPPSIsMarkedInTheTable(t *testing.T) {
+	tests := []struct {
+		name string
+		in   pdo.PDO
+		want string
+	}{
+		{"not power limited", pdo.PDO{Kind: pdo.KindPPS, MaxCurrentA: 5}, "5 A"},
+		{"power limited with an inferred budget", pdo.PDO{Kind: pdo.KindPPS, MaxCurrentA: 5, PPSPowerLimited: true, PPSBudgetW: 45}, "5 A [power limited; source budget ~45 W]"},
+		{"power limited, nothing to infer from", pdo.PDO{Kind: pdo.KindPPS, MaxCurrentA: 5, PPSPowerLimited: true}, "5 A [power limited; source budget unknown]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pdoCurrent(tt.in); got != tt.want {
+				t.Errorf("pdoCurrent() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

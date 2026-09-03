@@ -2,6 +2,7 @@ package bootloader
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
@@ -369,6 +370,18 @@ func (h *headerLimitReader) unbound() { h.unlimited = true }
 // history of the run it applied to.
 const insecureWSScheme = "ws+insecure"
 
+// Bounds on the server-controlled text quoted back into an error. Everything
+// the endpoint chose outright — an HTTP reason phrase, the head of a reply this
+// package could not parse — is worth a glance rather than a screenful;
+// maxServerTextLen is for a message that is mostly ours and merely quotes the
+// endpoint inside it, which a TLS failure naming the certificate's own DNS
+// names does. All of it is sanitised as well as bounded — see closeError for
+// the same discipline applied to a Close frame's reason.
+const (
+	maxServerPhraseLen = 64
+	maxServerTextLen   = 256
+)
+
 // wsDial opens a WebSocket connection and completes the opening handshake.
 func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	u, err := url.Parse(rawURL)
@@ -405,6 +418,21 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: dialing %s: %w", errWebsocket, rawURL, err)
 	}
+	// Everything below this line is plain blocking I/O on the socket: the
+	// upgrade request write and http.ReadResponse watch nothing but the
+	// deadline set below, which is the whole --fetch-timeout budget. Closing the
+	// socket is the only way to interrupt a read already in progress, so the
+	// hook FetchRaw arms for the frame stream is armed here too — it cannot wait
+	// until wsDial returns, or a Ctrl-C against a server that stalls before its
+	// 101 does nothing for as long as the operator asked the fetch to run.
+	//
+	// The TCP connection is captured in its own variable rather than closed
+	// through conn: conn is reassigned to the TLS connection below, and the hook
+	// runs on the context's goroutine. Closing the socket underneath the TLS
+	// layer unblocks the wrapped reads just as well.
+	tcp := conn
+	stop := context.AfterFunc(ctx, func() { tcp.Close() })
+	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
@@ -412,7 +440,19 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 		tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
 		if err := tc.HandshakeContext(ctx); err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("%w: TLS handshake with %s: %w", errWebsocket, host, err)
+			// The text of a handshake failure is partly the endpoint's to
+			// choose: x509.HostnameError prints the certificate's DNS names
+			// unquoted, and the parser accepts any byte under 0x80 in one, so an
+			// on-path attacker presenting a self-signed certificate whose SAN
+			// carries ESC has the operator's terminal — hostname verification
+			// runs before the chain is built, so it reaches this message
+			// without needing a trusted certificate. Same discipline as the
+			// Close reason and the version string, same helper. The chain is
+			// rendered rather than wrapped for that reason; nothing matches on
+			// a TLS error here, and a cancelled handshake is reported by
+			// FetchRaw's own context check.
+			return nil, fmt.Errorf("%w: TLS handshake with %s: %s", errWebsocket, host,
+				printableASCII(err.Error(), maxServerTextLen))
 		}
 		conn = tc
 	}
@@ -463,10 +503,21 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		conn.Close()
-		return nil, fmt.Errorf("%w: server answered %s, expected 101 Switching Protocols", errWebsocket, resp.Status)
+		// resp.Status carries the server's reason phrase verbatim — net/http
+		// validates the three-digit code and nothing else — so it is one more
+		// piece of server-controlled text on its way to a terminal.
+		return nil, fmt.Errorf("%w: server answered %s, expected 101 Switching Protocols",
+			errWebsocket, printableASCII(resp.Status, maxServerPhraseLen))
 	}
+	// Connection is a list header, and RFC 9110 §5.3 makes repeated field lines
+	// one comma-joined list, so a server (or a proxy in front of one) may
+	// legitimately answer "Connection: keep-alive" and "Connection: Upgrade" on
+	// separate lines. Header.Get returns only the first of them, which refused a
+	// handshake RFC 6455 §4.1 requires the client to accept; every line is
+	// searched instead. Upgrade stays an equality test on the single value,
+	// because §4.1 asks for a match of the whole field, not for a token in it.
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
-		!headerHasToken(resp.Header.Get("Connection"), "upgrade") {
+		!anyHeaderHasToken(resp.Header.Values("Connection"), "upgrade") {
 		conn.Close()
 		return nil, fmt.Errorf("%w: server did not confirm the upgrade", errWebsocket)
 	}
@@ -492,6 +543,18 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 func headerHasToken(value, token string) bool {
 	for _, part := range strings.Split(value, ",") {
 		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyHeaderHasToken applies headerHasToken across every field line a header
+// name appeared on, which is how a list header spread over several lines has to
+// be read (RFC 9110 §5.3).
+func anyHeaderHasToken(values []string, token string) bool {
+	for _, v := range values {
+		if headerHasToken(v, token) {
 			return true
 		}
 	}
@@ -542,6 +605,15 @@ func FetchRaw(ctx context.Context, wsURL, serial string, timeout time.Duration) 
 
 	c, err := wsDial(ctx, wsURL)
 	if err != nil {
+		// The handshake is now interruptible (see wsDial), and what an
+		// interrupted one returns is whatever the closed socket produced — an
+		// i/o timeout, a read on a closed connection. Report the interruption
+		// itself, as the frame-stream branch below already does, or a Ctrl-C
+		// comes back as a timeout with the CLI's "the device did not answer"
+		// hint attached to a failure that involved no device.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("bootloader: fetching firmware: %w", ctxErr)
+		}
 		return nil, fmt.Errorf("bootloader: fetching firmware: %w", err)
 	}
 	defer c.Close()
@@ -575,10 +647,40 @@ func FetchRaw(ctx context.Context, wsURL, serial string, timeout time.Duration) 
 // the raw payload reachable is what makes a shape change diagnosable instead of
 // merely fatal (SPEC.md §10.3 describes the shape as of one observation; the
 // service is free to change it, and did not consult us).
+//
+// Only JSON is accepted here. The raw-binary reading ParseImage falls back to
+// for a local file is not a shape a network reply can have (SPEC.md §10.3), and
+// allowing it would turn any plain-text answer into a flashable image.
 func Fetch(ctx context.Context, wsURL, serial string, timeout time.Duration) (*Firmware, error) {
 	msg, err := FetchRaw(ctx, wsURL, serial, timeout)
 	if err != nil {
 		return nil, err
+	}
+	// The service answers with one JSON blob (SPEC.md §10.3), so the format
+	// sniff ParseImage performs has no business on this path: it reads anything
+	// that does not begin '{' or '[' as a raw binary image, and a raw image is a
+	// local-file shape. Left to it, a plain-text answer — "Unknown serial
+	// number", a proxy's 502 page, a maintenance notice — becomes a perfectly
+	// valid one-page image of the reply text padded with 0xFF, carrying no
+	// version and no CRC. The user is then told "this firmware image carries no
+	// CRC ... re-run with --force", which diagnoses the wrong problem entirely
+	// and, taken at face value, writes an error message into flash and starts
+	// it. Refuse the reply for what it is instead.
+	trimmed := bytes.TrimLeft(msg, " \t\r\n")
+	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		// Only the head of the reply is quoted, and it is sliced before it is
+		// turned into a string: the message may be megabytes, and neither
+		// copying nor scanning all of it belongs in an error path. One byte
+		// past the ceiling, so that a longer reply still comes back marked as
+		// truncated.
+		excerpt := trimmed
+		if len(excerpt) > maxServerPhraseLen+1 {
+			excerpt = excerpt[:maxServerPhraseLen+1]
+		}
+		return nil, fmt.Errorf("bootloader: firmware payload for %q (%d bytes): %w: the service answered "+
+			"with something that is not JSON (%q); `gflex firmware fetch --raw -o <file>` saves the reply "+
+			"verbatim for a look", serial, len(msg), ErrBadPageLength,
+			printableASCII(string(excerpt), maxServerPhraseLen))
 	}
 	fw, err := ParseImage(msg, LoadOptions{})
 	if err != nil {

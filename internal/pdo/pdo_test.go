@@ -18,29 +18,36 @@ import (
 // 0x0002D12C, used here (and tested explicitly in TestFixed9V3AWord).
 // ---------------------------------------------------------------------------
 const (
-	fixed5V3A   uint32 = 0x0001912C
-	fixed9V3A   uint32 = 0x0002D12C
-	fixed9V15A  uint32 = 0x0002D096 // 9 V @ 1.50 A
-	fixed12V3A  uint32 = 0x0003C12C
-	fixed15V3A  uint32 = 0x0004B12C
-	fixed20V5A  uint32 = 0x000641F4
-	fixed28V5A  uint32 = 0x0008C1F4 // EPR
-	fixed28V3A  uint32 = 0x0008C12C // EPR
-	fixed48V5A  uint32 = 0x000F01F4 // EPR
-	fixed33V3A  uint32 = 0x0001092C // 3.3 V - below the 5 V floor, invalid
-	fixed9V0A   uint32 = 0x0002D000 // zero current, invalid
-	battery     uint32 = 0x4F00F0B4 // 3-12 V, 45 W
-	variablePDO uint32 = 0x8F01912C // 5-12 V, 3 A
-	pps3311V3A  uint32 = 0xC0DC213C // PPS 3.3-11.0 V, 3.00 A
-	pps3311V2A  uint32 = 0xC0DC2128 // PPS 3.3-11.0 V, 2.00 A
-	pps3321V5A  uint32 = 0xC1A42164 // PPS 3.3-21.0 V, 5.00 A
-	eprAVS140W  uint32 = 0xD230968C // EPR AVS 15.0-28.0 V, 140 W
-	eprAVS84W   uint32 = 0xD2309654 // EPR AVS 15.0-28.0 V, 84 W  (3 A at 28 V)
-	eprAVS240W  uint32 = 0xD3C096F0 // EPR AVS 15.0-48.0 V, 240 W (cable-capped)
-	eprAVSBad   uint32 = 0xD2309600 // 15.0-28.0 V, 0 W -> invalid -> cable fault
-	sprAVS      uint32 = 0xE00515F4 // 3.25 A @20 V, 5.00 A @15 V
-	sprAVS2A    uint32 = 0xE00320C8 // 2.00 A at both points
-	augReserved uint32 = 0xF0001234 // subtype 3
+	fixed5V3A    uint32 = 0x0001912C
+	fixed9V3A    uint32 = 0x0002D12C
+	fixed9V15A   uint32 = 0x0002D096 // 9 V @ 1.50 A
+	fixed12V3A   uint32 = 0x0003C12C
+	fixed15V3A   uint32 = 0x0004B12C
+	fixed20V5A   uint32 = 0x000641F4
+	fixed20V225A uint32 = 0x000640E1 // 20 V @ 2.25 A - a 45 W source's top fixed object
+	fixed28V5A   uint32 = 0x0008C1F4 // EPR
+	fixed28V3A   uint32 = 0x0008C12C // EPR
+	fixed48V5A   uint32 = 0x000F01F4 // EPR
+	fixed33V3A   uint32 = 0x0001092C // 3.3 V - below the 5 V floor, invalid
+	fixed9V0A    uint32 = 0x0002D000 // zero current, invalid
+	battery      uint32 = 0x4F00F0B4 // 3-12 V, 45 W
+	variablePDO  uint32 = 0x8F01912C // 5-12 V, 3 A
+	pps3311V3A   uint32 = 0xC0DC213C // PPS 3.3-11.0 V, 3.00 A
+	pps3311V2A   uint32 = 0xC0DC2128 // PPS 3.3-11.0 V, 2.00 A
+	pps3321V5A   uint32 = 0xC1A42164 // PPS 3.3-21.0 V, 5.00 A
+	pps3321V3A   uint32 = 0xC1A4213C // PPS 3.3-21.0 V, 3.00 A
+	pps3311V5A   uint32 = 0xC0DC2164 // PPS 3.3-11.0 V, 5.00 A
+	// The same APDO with bit 27, "PPS Power Limited", set: 5 A x 11 V is 55 W,
+	// which the 45 W source advertising it cannot deliver. The USB-PD power
+	// rules make this the ordinary shape of a wide PPS range, not an oddity.
+	pps3311V5APL uint32 = 0xC8DC2164
+	eprAVS140W   uint32 = 0xD230968C // EPR AVS 15.0-28.0 V, 140 W
+	eprAVS84W    uint32 = 0xD2309654 // EPR AVS 15.0-28.0 V, 84 W  (3 A at 28 V)
+	eprAVS240W   uint32 = 0xD3C096F0 // EPR AVS 15.0-48.0 V, 240 W (cable-capped)
+	eprAVSBad    uint32 = 0xD2309600 // 15.0-28.0 V, 0 W -> invalid -> cable fault
+	sprAVS       uint32 = 0xE00515F4 // 3.25 A @20 V, 5.00 A @15 V
+	sprAVS2A     uint32 = 0xE00320C8 // 2.00 A at both points
+	augReserved  uint32 = 0xF0001234 // subtype 3
 )
 
 // Objects that advertise more current than any cable can carry. Every current
@@ -672,6 +679,147 @@ func TestBoundCurrentUnaffectedBelowCeiling(t *testing.T) {
 	hand := PDO{Kind: KindFixed, VoltageV: 9, MaxCurrentA: 42}
 	if a := hand.CurrentAt(9); !nearly(a, MaxCableCurrentA) {
 		t.Errorf("hand-built PDO CurrentAt = %v, want %v", a, MaxCableCurrentA)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The PPS "Power Limited" bit and the budget it implies
+// ---------------------------------------------------------------------------
+
+// TestDecodePPSPowerLimitedBit pins bit 27 as a field of its own. It used to be
+// left in Raw, which credited a power-limited range with its Maximum Current at
+// every voltage; the two words below differ in nothing else, so any drift in the
+// surrounding masks shows up here as well.
+func TestDecodePPSPowerLimitedBit(t *testing.T) {
+	plain := decodePDO(0, pps3311V5A)
+	limited := decodePDO(0, pps3311V5APL)
+
+	if plain.PPSPowerLimited {
+		t.Error("PPSPowerLimited set on an APDO with bit 27 clear")
+	}
+	if !limited.PPSPowerLimited {
+		t.Errorf("PPSPowerLimited = false for 0x%08X, whose bit 27 is set", pps3311V5APL)
+	}
+	// Bit 27 sits between the max-voltage field and the subtype, so a mask that
+	// swallowed it would move the range as well.
+	for _, f := range []struct {
+		name       string
+		plain, lim float64
+		want       float64
+	}{
+		{"MinVoltageV", plain.MinVoltageV, limited.MinVoltageV, 3.3},
+		{"MaxVoltageV", plain.MaxVoltageV, limited.MaxVoltageV, 11},
+		{"MaxCurrentA", plain.MaxCurrentA, limited.MaxCurrentA, 5},
+	} {
+		if !nearly(f.plain, f.want) || !nearly(f.lim, f.want) {
+			t.Errorf("%s = %v / %v, want %v for both", f.name, f.plain, f.lim, f.want)
+		}
+	}
+	if plain.Kind != KindPPS || limited.Kind != KindPPS || !plain.Valid || !limited.Valid {
+		t.Errorf("kind/validity disturbed: %+v / %+v", plain, limited)
+	}
+}
+
+// TestPPSPowerBudgetInferredFromFixedPDOs covers the arithmetic a power-limited
+// APDO needs and the log cannot supply. The source's PDP is carried in
+// Source_Capabilities_Extended, which this scan never sees (SPEC.md §9.3), so it
+// is inferred from the fixed PDOs the USB-PD power rules build from it: the
+// 45 W shape below tops out at 20 V x 2.25 A.
+func TestPPSPowerBudgetInferredFromFixedPDOs(t *testing.T) {
+	l := simpleLog(t, fixed5V3A, fixed9V3A, fixed15V3A, fixed20V225A, pps3311V5APL)
+	pps := mustPDO(t, l, 4)
+	if pps.PPSBudgetW != 45 {
+		t.Fatalf("PPSBudgetW = %d, want 45 (20 V x 2.25 A)", pps.PPSBudgetW)
+	}
+	// 45 W over the range: the advertised 5 A stands where the budget allows it
+	// and gives way where it does not.
+	for _, tc := range []struct {
+		v, want float64
+	}{
+		{5, 5},     // 9.00 A by budget, so the APDO's own limit binds
+		{9, 5},     // exactly 5.00 A by budget
+		{10, 4.5},  // 4.50 A
+		{11, 4.09}, // 4.0909... A, rounded DOWN to the wire step
+	} {
+		if got := pps.CurrentAt(tc.v); !nearly(got, tc.want) {
+			t.Errorf("CurrentAt(%v) = %v, want %v", tc.v, got, tc.want)
+		}
+	}
+
+	// With bit 27 clear the same source says nothing about a budget and the
+	// advertised figure stands everywhere.
+	plain := simpleLog(t, fixed5V3A, fixed9V3A, fixed15V3A, fixed20V225A, pps3311V5A)
+	q := mustPDO(t, plain, 4)
+	if q.PPSBudgetW != 0 {
+		t.Errorf("PPSBudgetW = %d for an APDO that is not power limited", q.PPSBudgetW)
+	}
+	if got := q.CurrentAt(11); !nearly(got, 5) {
+		t.Errorf("CurrentAt(11) = %v, want 5: nothing may be deducted without the bit", got)
+	}
+}
+
+// TestPPSPowerBudgetDeclinedWithoutEvidence pins the two cases where there is
+// nothing to infer from. The mandatory 5 V object is on every source, so 15 W
+// says as much about this one as about any other, and an EPR source's objects
+// above 20 V describe a budget its SPR PPS range cannot draw on.
+func TestPPSPowerBudgetDeclinedWithoutEvidence(t *testing.T) {
+	only5V := simpleLog(t, fixed5V3A, pps3311V5APL)
+	if got := mustPDO(t, only5V, 1); got.PPSBudgetW != 0 {
+		t.Errorf("PPSBudgetW = %d from the mandatory 5 V object alone", got.PPSBudgetW)
+	}
+	if got := mustPDO(t, only5V, 1).CurrentAt(11); !nearly(got, 5) {
+		t.Errorf("CurrentAt(11) = %v, want 5: a guess must not bound a verdict", got)
+	}
+
+	// 28 V x 5 A is 140 W, but that is the EPR budget; the SPR objects say 45 W.
+	epr := simpleLog(t, fixed5V3A, fixed9V3A, fixed15V3A, fixed20V225A, fixed28V5A, pps3311V5APL)
+	if got := mustPDO(t, epr, 5); got.PPSBudgetW != 45 {
+		t.Errorf("PPSBudgetW = %d, want 45: EPR objects must not raise an SPR budget", got.PPSBudgetW)
+	}
+}
+
+// TestPPSPowerBudgetUsesTheDeclaredCurrent guards the interaction with the cable
+// ceiling: a fixed PDO clamped from 10.23 A to 5 A would otherwise understate
+// the source and over-tighten every PPS answer, turning a conservative bound
+// into a wrong one.
+func TestPPSPowerBudgetUsesTheDeclaredCurrent(t *testing.T) {
+	l := simpleLog(t, fixed5V3A, fixed9V1023A, pps3311V5APL)
+	if got := mustPDO(t, l, 2); got.PPSBudgetW != 92 { // 9 V x 10.23 A = 92.07 W
+		t.Errorf("PPSBudgetW = %d, want 92 (9 V x the declared 10.23 A)", got.PPSBudgetW)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Derived currents round down
+// ---------------------------------------------------------------------------
+
+// TestDerivedCurrentNeverExceedsTheBudget sweeps the currents this package
+// computes rather than decodes. Both are quotients of a whole-watt budget by a
+// voltage, and round2 rounded them to nearest: 140 W at 36 V is 3.8889 A and was
+// reported as 3.89 A, which then answered "yes" to a request for 3.89 A. Five
+// milliamps is nothing on the wire and everything to an invariant the package
+// states in half a dozen places.
+func TestDerivedCurrentNeverExceedsTheBudget(t *testing.T) {
+	for pdp := 1; pdp <= 255; pdp++ {
+		eprAVS := PDO{Kind: KindEPRAVS, MinVoltageV: 15, MaxVoltageV: 48, PDPWatts: pdp}
+		pps := PDO{Kind: KindPPS, MinVoltageV: 3.3, MaxVoltageV: 21, MaxCurrentA: MaxCableCurrentA,
+			PPSPowerLimited: true, PPSBudgetW: pdp}
+		for tenths := 150; tenths <= 480; tenths++ {
+			v := float64(tenths) / 10
+			budget := float64(pdp) / v
+			if a := eprAVS.CurrentAt(v); a > budget+cmpEps && a < MaxCableCurrentA {
+				t.Fatalf("EPR AVS %d W at %v V reports %v A, above the %v A the budget allows", pdp, v, a, budget)
+			}
+			if a := pps.CurrentAt(v); a > budget+cmpEps && a < MaxCableCurrentA {
+				t.Fatalf("PPS %d W at %v V reports %v A, above the %v A the budget allows", pdp, v, a, budget)
+			}
+		}
+	}
+	// And the floor must not throw away a step the source really offers: 23 W at
+	// 20 V is exactly 1.15 A, though the quotient evaluates to 1.1499999999999999.
+	p := PDO{Kind: KindEPRAVS, MinVoltageV: 15, MaxVoltageV: 48, PDPWatts: 23}
+	if got := p.CurrentAt(20); !nearly(got, 1.15) {
+		t.Errorf("CurrentAt(20) = %v, want 1.15: flooring must not cost a whole wire step", got)
 	}
 }
 

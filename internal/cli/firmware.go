@@ -2,12 +2,15 @@ package cli
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -51,7 +54,7 @@ const bootloaderLEDNote = "the LED blinks white slowly while the unit is in boot
 var (
 	updateFirmware    = bootloader.Update
 	fetchFirmware     = bootloader.Fetch
-	connectBootloader = bootloader.Connect
+	connectBootloader = bootloader.ConnectWithOptions
 )
 
 func newFirmwareCommand(app *App) *cobra.Command {
@@ -142,10 +145,40 @@ func newFirmwareFetchCommand(app *App) *cobra.Command {
 			"number with the vendor, exactly as the vendor's own app does.\n\n" +
 			"With -o the image is saved in a form `firmware flash <file>` can read back, so an\n" +
 			"update can be inspected first, applied later, and re-applied without the network if\n" +
-			"a flash has to be retried.",
+			"a flash has to be retried.\n\n" +
+			"--dry-run prints the one frame this command would send and stops there: the serial\n" +
+			"is not read, the vendor service is not contacted, and -o is not written.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return app.run(cmd, func(ctx context.Context, f Formatter) error {
+				// Answerable from the command line alone, so it is answered
+				// before the device is opened. This refusal used to come after
+				// the serial had been read off the unit, handed to the vendor
+				// and paid for with the whole download -- every side effect the
+				// combination was being refused for, performed first and then
+				// thrown away. The flash command's own flag checks all run
+				// ahead of runFlash for the same reason.
+				if raw && outPath == "" {
+					return codedf(ExitUsage, "--raw needs -o: the payload is not something to print")
+				}
+				// SPEC.md §13.8 refuses --dry-run only where the frame cannot
+				// be known without first reading the device, which is why
+				// `flash --fetch` refuses the combination outright. Nothing
+				// like that applies here: the only frame this command sends is
+				// a fixed CMD_SERIAL_NUMBER read. What the frame does not cover
+				// is the rest of the command -- the serial goes to the vendor
+				// over the network and -o overwrites a file -- and "send
+				// nothing" has to cover those too, or a dry run leaves this
+				// unit's serial with the vendor exactly as a real one does.
+				if app.DryRun {
+					if err := app.dryRun(f, proto.Read(proto.CmdSerialNumber)); err != nil {
+						return err
+					}
+					f.Note("")
+					f.Note("The vendor service was not contacted, nothing was downloaded, and -o was")
+					f.Note("not written.")
+					return nil
+				}
 				serial, err := app.readSerialQuietly(ctx, f)
 				if err != nil {
 					return err
@@ -159,21 +192,20 @@ func newFirmwareFetchCommand(app *App) *cobra.Command {
 					// thing that makes the difference diagnosable.
 					msg, err := bootloader.FetchRaw(ctx, wsURL, serial, timeout)
 					if err != nil {
-						return fmt.Errorf("fetching the image for serial %s: %w", serial, err)
+						return fetchError(wsURL, serial, timeout, err)
 					}
 					f.KV("bytes", "payload", len(msg), fmt.Sprintf("%d bytes (unparsed)", len(msg)))
-					if outPath == "" {
-						return codedf(ExitUsage, "--raw needs -o: the payload is not something to print")
-					}
 					if err := writeFileAtomic(outPath, msg, 0o644); err != nil {
-						return fmt.Errorf("writing %s: %w", outPath, err)
+						return localFileError("writing", outPath, err)
 					}
 					f.KV("path", "saved", outPath, outPath)
 					return nil
 				}
-				fw, err := bootloader.Fetch(ctx, wsURL, serial, timeout)
+				// Through the same seam `flash --fetch` uses, so that one stub
+				// drives both commands' download in a test.
+				fw, err := fetchFirmware(ctx, wsURL, serial, timeout)
 				if err != nil {
-					return fmt.Errorf("fetching the image for serial %s: %w", serial, err)
+					return fetchError(wsURL, serial, timeout, err)
 				}
 				return app.reportFetched(f, fw, outPath)
 			})
@@ -192,6 +224,25 @@ func newFirmwareFetchCommand(app *App) *cobra.Command {
 	fl.BoolVar(&raw, "raw", false,
 		"save the service's reply verbatim instead of parsing it; needs -o, and is for diagnosing a payload this tool cannot read")
 	return cmd
+}
+
+// fetchError phrases a download from the vendor service that did not arrive.
+//
+// The three fetch call sites used to wrap with a bare %w, which left the exit
+// code to the classifier -- and every way a fetch runs out of time carries a
+// shape isTimeout matches: the download's own budget expires as
+// context.DeadlineExceeded, and a dial or a TLS handshake that stalls arrives
+// as a net.Error whose Timeout() is true. So an unreachable endpoint exited 5,
+// which README's table defines as "Timed out waiting for the device", under the
+// hint that says the device did not answer and offers -v to trace the raw
+// traffic. No device is involved in this failure at all: the serial read has
+// already succeeded by the time a fetch can fail. ExitFailure with the endpoint
+// named, and the per-code hint replaced by the guidance that actually fits.
+func fetchError(wsURL, serial string, timeout time.Duration, err error) error {
+	return codedSelfExplanatory(ExitFailure,
+		"fetching the image for serial %s: %w\n"+
+			"  This is a network failure, not the device. Check that %s is reachable, or raise\n"+
+			"  --fetch-timeout (currently %s).", serial, err, wsURL, timeout)
 }
 
 // reportFetched prints what the service returned and optionally saves it.
@@ -222,7 +273,7 @@ func (a *App) reportFetched(f Formatter, fw *bootloader.Firmware, outPath string
 	// 0o644 rather than 0o600: a firmware image is not a secret, and a file the
 	// user cannot read back with ordinary tooling defeats the point of saving it.
 	if err := writeFileAtomic(outPath, data, 0o644); err != nil {
-		return fmt.Errorf("writing %s: %w", outPath, err)
+		return localFileError("writing", outPath, err)
 	}
 	f.KV("path", "saved", outPath, outPath)
 	return nil
@@ -231,15 +282,31 @@ func (a *App) reportFetched(f Formatter, fw *bootloader.Firmware, outPath string
 // marshalFirmware renders a fetched image in the JSON shape ParseImage accepts,
 // so that what is saved is something the flash path can actually read back.
 //
-// The pages are written as an array of arrays, which is the shape that carries
+// The pages are written one element per page, which is the shape that carries
 // its own page split -- writing a flat byte list instead would discard the
 // geometry and leave the reader guessing at --page-size, on the one path where
 // a wrong split can flash and even verify cleanly (SPEC.md §10.2).
+//
+// Each page is hex, and not the base64 that encoding/json renders a []byte as
+// for free. The reader's rule is that a string of nothing but hex digits IS hex
+// (bootloader.decodeByteString), and base64 can satisfy it: a page of zero
+// bytes whose length is a multiple of 3 encodes to an unpadded run of 'A',
+// which is all hex digits and of even length, and reads back as two thirds as
+// many 0xAA bytes. At 480-byte pages -- a valid eight-chunk geometry -- that
+// makes this tool refuse the file it wrote itself for uneven pages, and on an
+// all-zero image it loads a different geometry and different bytes and offers
+// them for flashing. Hex has no such collision: hex.EncodeToString emits only
+// 0-9a-f, so it is always even-length, always all-hex, and can never begin with
+// the "0x" the reader strips.
 func marshalFirmware(fw *bootloader.Firmware) ([]byte, error) {
+	pages := make([]string, len(fw.Pages))
+	for i, p := range fw.Pages {
+		pages[i] = hex.EncodeToString(p)
+	}
 	doc := map[string]any{
 		"app_version": fw.Version,
 		"page_size":   fw.PageSize(),
-		"app_bin":     fw.Pages,
+		"app_bin":     pages,
 	}
 	if fw.CRCKnown {
 		doc["crc"] = fw.CRC
@@ -291,7 +358,7 @@ func newFirmwareBootloaderCommand(app *App) *cobra.Command {
 					return fmt.Errorf("jumping to the bootloader: %w", jerr)
 				}
 				f.KV("bootloader", "mode", "bootloader", "jump sent; "+bootloaderLEDNote)
-				app.reportJumpEvidence(ctx, f)
+				app.reportJumpEvidence(ctx, f, waitForDevice)
 				return nil
 			})
 		},
@@ -301,13 +368,27 @@ func newFirmwareBootloaderCommand(app *App) *cobra.Command {
 // midiPresenceMeaningful reports whether the presence of a VFLEX ALSA rawmidi
 // node tracks the device rather than this process.
 //
-// waitForDevice watches for that node. Under --transport usb the node is not in
-// play at all: usbmidi.Open claims the MIDI interface with a kernel-driver
-// detach (SPEC.md §4.2), so snd-usb-audio is unbound and the node is gone
-// whether or not the device jumped -- and on a headless box the driver may
-// never have been loaded. Its absence there proves nothing, and its presence
-// proves nothing either.
-func (a *App) midiPresenceMeaningful() bool { return a.Transport != transportUSB }
+// waitForDevice watches for that node, through devicePresent, which asks
+// rawmidi.Discover and accepts a port only where the vendor ID says VFLEX.
+// Two things can make that answer say nothing about the device:
+//
+// Under --transport usb the node is not in play at all: usbmidi.Open claims the
+// MIDI interface with a kernel-driver detach (SPEC.md §4.2), so snd-usb-audio is
+// unbound and the node is gone whether or not the device jumped -- and on a
+// headless box the driver may never have been loaded. Its absence there proves
+// nothing, and its presence proves nothing either.
+//
+// And on rawmidi, a port reached through the weaker tiers of §3.4 -- matched on
+// a name substring, or taken because it was the only port on the system -- is
+// one Discover will go on classifying as "not a VFLEX", because those tiers
+// live in the selection this process made and not in Discover. devicePresent
+// therefore reads false for such a unit the whole time it is attached, which
+// makes a jump look instantly confirmed on evidence never gathered, and makes
+// the post-flash wait for the unit's return one that can never be satisfied.
+// Saying "not confirmed" is the honest answer in both cases.
+func (a *App) midiPresenceMeaningful() bool {
+	return a.Transport != transportUSB && a.midiPortVIDConfirmed
+}
 
 // reportJumpEvidence says what is actually known about a bare `firmware
 // bootloader` jump, which has no later step to fall back on.
@@ -316,7 +397,14 @@ func (a *App) midiPresenceMeaningful() bool { return a.Transport != transportUSB
 // (SPEC.md §10.1). Where that evidence cannot be gathered the user is told so
 // outright: printing nothing would leave a successful-looking line implying a
 // confirmation that never happened.
-func (a *App) reportJumpEvidence(ctx context.Context, f Formatter) {
+//
+// waitDev abstracts waitForDevice, as scanHandover does and for the same
+// reason: what this function has to get right is what it says about each
+// outcome, and no outcome but "no VFLEX node here" is reachable on a host with
+// no VFLEX attached.
+func (a *App) reportJumpEvidence(ctx context.Context, f Formatter,
+	waitDev func(context.Context, bool, time.Duration) error,
+) {
 	if !a.midiPresenceMeaningful() {
 		f.Diag("note: the jump could NOT be confirmed on --transport %s. The only proof available "+
 			"is the device leaving the bus, and this transport detaches the kernel MIDI driver "+
@@ -324,7 +412,21 @@ func (a *App) reportJumpEvidence(ctx context.Context, f Formatter) {
 			a.Transport, bootloaderLEDNote)
 		return
 	}
-	if err := waitForDevice(ctx, false, disconnectTimeout); err != nil {
+	if err := waitDev(ctx, false, disconnectTimeout); err != nil {
+		// A wait that was cancelled is not a wait that ran out. waitForDevice
+		// returns the context's own error (connect.go), and the wording below
+		// would then report a three-second observation that was never made.
+		//
+		// It stays a note rather than becoming a failure: the jump frame went
+		// out before this wait began and nothing about it failed, so returning
+		// the error would report a successful jump as a failed one and take the
+		// buffered "jump sent" line down with it, since Flush runs only on
+		// success (root.go).
+		if ctx.Err() != nil {
+			f.Diag("note: interrupted before the disconnect could be observed, so the jump is "+
+				"unconfirmed. Check the LED instead: %s.", bootloaderLEDNote)
+			return
+		}
 		f.Diag("warning: the device was still visible after %s; the jump may not have taken",
 			disconnectTimeout)
 	}
@@ -451,8 +553,14 @@ func newFirmwareFlashCommand(app *App) *cobra.Command {
 	// A string parsed by parseCRCByte rather than IntVar, for the reason given
 	// there: a CRC is compared rather than applied, so a misread value fails
 	// silently by matching for the wrong reason.
-	fl.StringVar(&crcArg, "crc", "", "expected CRC byte, when the image does not carry one; "+
-		"decimal, or hex with an explicit 0x prefix")
+	// The help says "replaces" as well as "supplies", because the flag does
+	// both and only said the first: an image that declares a CRC has it
+	// overridden, silently until loadFirmware started warning about it. A flag
+	// whose documented scope is narrower than its behaviour is how a user comes
+	// to believe verification is checking the vendor's value when it is
+	// checking theirs.
+	fl.StringVar(&crcArg, "crc", "", "expected CRC byte for an image that carries none (a raw .bin); "+
+		"replaces the value an image does carry. Decimal, or hex with an explicit 0x prefix")
 	fl.BoolVar(&ackFirst, "ack-mode", false, "stream in acknowledged mode from the start (slower, more robust)")
 	// A string parsed by parseDecimalInt rather than IntVar, for the reason
 	// given there: pflag parses an integer flag with base 0, so `--page-size
@@ -557,18 +665,25 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 		if jerr != nil {
 			return fmt.Errorf("jumping to the bootloader: %w", jerr)
 		}
-		if err := a.confirmJump(ctx, f, appSerial); err != nil {
-			return err
+		// From here to CMD_BOOTLOAD_END the unit is off the bus with no MIDI
+		// interface, so every error return goes through bootloaderPhaseFailure:
+		// a Ctrl-C in any of these waits reaches the user as nothing but
+		// "gflex: interrupted" otherwise, and SPEC.md §13 interlock 6 wants the
+		// state said out loud.
+		if err := a.confirmJump(ctx, f, appSerial, waitForDevice); err != nil {
+			return a.bootloaderPhaseFailure(f, o, err)
 		}
 		if err := ctxwait.Sleep(ctx, bootloaderModeSwitchDelay); err != nil {
-			return err
+			return a.bootloaderPhaseFailure(f, o, err)
 		}
 	}
 
 	// --- phase 2: bootloader mode -------------------------------------------
-	dev, iface, err := openBootloaderInterface(ctx, f)
+	// Under --recover the unit was already in the bootloader when the command
+	// started, so the same guidance applies from here either way.
+	dev, iface, err := openBootloaderInterface(ctx, f, o.recover)
 	if err != nil {
-		return err
+		return a.bootloaderPhaseFailure(f, o, err)
 	}
 	// Deferred, and not closed the moment the flash is over the way the MIDI
 	// port is above. bootloader.Update's caller contract lists closing the
@@ -605,7 +720,13 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 		// serial and enforces the match before a single page is written.
 		blSerial, serr := bootloader.NewFlasher(dev, iface).Serial(ctx)
 		if serr != nil {
-			return fmt.Errorf("reading the serial number from the bootloader: %w", serr)
+			// The state goes in the message as well as through the helper: a
+			// read that timed out rather than being interrupted is printed by
+			// Execute, and "reading the serial number from the bootloader:
+			// timed out" says nothing about where that leaves the unit.
+			return a.bootloaderPhaseFailure(f, o, fmt.Errorf(
+				"reading the serial number from the bootloader: %w\n"+
+					"  %s, and it is still re-flashable", serr, bootloaderLEDNote))
 		}
 		f.Diag("bootloader serial %s", blSerial)
 		expectSerial = blSerial
@@ -616,17 +737,17 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 		// and the confirmation prompt names what is about to be flashed.
 		fw, err = a.loadFirmware(ctx, o, expectSerial)
 		if err != nil {
-			return err
+			return a.bootloaderPhaseFailure(f, o, err)
 		}
 		if err := a.apply(ctx, f, CheckFlash(len(fw.Pages), fw.Version, fw.CRCKnown, o.force)); err != nil {
-			return err
+			return a.bootloaderPhaseFailure(f, o, err)
 		}
 	}
 
 	// --- phase 3: flash, verify, and jump back ------------------------------
 	res, err := a.runUpdate(ctx, f, dev, iface, fw, o, expectSerial)
 	if err != nil {
-		return err
+		return a.bootloaderPhaseFailure(f, o, err)
 	}
 	if res.CRCChecked {
 		f.KV("crc", "crc", res.CRC, fmt.Sprintf("0x%02x (verified)", res.CRC))
@@ -643,7 +764,7 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 	// here reads as a failed update, discards the buffered crc line (Flush
 	// runs only on success), and sends someone to re-flash firmware that is
 	// fine.
-	if err := a.awaitApplicationReturn(ctx, f, res); err != nil {
+	if err := a.awaitApplicationReturn(ctx, f, o, res); err != nil {
 		return err
 	}
 
@@ -653,9 +774,34 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 		// The flash is already over and it worked; only the replay is lost. Say
 		// which is which, or "reconnecting after the update: no device" reads as
 		// a failed update and sends someone to flash it again.
-		return a.postFlashFailure(f, res, "reconnecting to the unit", err)
+		return a.postFlashFailure(f, o, res, "reconnecting to the unit", err)
 	}
 	defer c.Close()
+
+	// The replay ahead writes the ADC calibration, the tolerance, the current
+	// limit and -- when forced, or when the window read back implausible -- the
+	// widest voltage window there is, so it has to land on the unit that was
+	// flashed and no other. Nothing so far establishes that it will: phase 4's
+	// presence check is satisfied by ANY VFLEX port (devicePresent, connect.go),
+	// so with a second unit attached it can be satisfied while the flashed unit
+	// is still re-enumerating, and OpenAuto then sees exactly one VFLEX -- the
+	// other one -- and opens it unambiguously. Identity across a re-enumeration
+	// is the invariant the bootloader half already enforces
+	// (UpdateOptions.ExpectSerial); this is where it has to hold on the way
+	// back, and it costs one read.
+	//
+	// A read that failed is not a mismatch. The protocol has no NACK (SPEC.md
+	// §5.2), so a dropped response is routine, and refusing to replay onto the
+	// right unit because one read went missing would cost more than the case
+	// this guards.
+	if got, serr := c.Session.SerialNumber(ctx); serr != nil {
+		f.Diag("warning: could not confirm the reconnected unit's serial (%v); "+
+			"replaying the settings for %s", serr, serial)
+	} else if got != serial {
+		return a.postFlashFailure(f, o, res, "identifying the unit that came back",
+			fmt.Errorf("%w: it reports serial %s, not %s; the settings were NOT replayed",
+				errWrongUnit, got, serial))
+	}
 
 	// Read the new version before the replay rather than after it: the replay
 	// needs it. It is an ordinary read and changes nothing, so it does not
@@ -783,7 +929,7 @@ func reportReplayIncomplete(f Formatter, rep replayReport, res *bootloader.Updat
 		}
 	}
 	f.Diag("each line names the setting and the value the replay wanted. Do NOT re-flash for this;")
-	f.Diag("write them yourself -- `gflex vlimit set --low <mV> --high <mV>`, `gflex current set <mA>`,")
+	f.Diag("write them yourself -- `gflex vlimit set --low <n>mV --high <n>mV`, `gflex current set <n>mA`,")
 	f.Diag("`gflex tolerance set --nominal <mV>`, `gflex calibrate adc --offset <n> --scale <n>`,")
 	f.Diag("`gflex authlock set <level>` -- and check the result with `gflex info --all`.")
 }
@@ -942,20 +1088,71 @@ func (a *App) updateError(err error, o flashOpts) error {
 		// The unit is in the bootloader and re-flashable; the package's own
 		// message says so, so only the command that resumes is added here.
 		return codedSelfExplanatory(ExitFailure,
-			"%w.\n  Retry with:  gflex firmware flash --recover %s --yes", err, recoverArg(o))
+			"%w.\n  Retry with:  %s", err, a.resumeCommand(o))
 	case errors.Is(err, bootloader.ErrSerialMismatch):
 		// Identity is checked before anything is written, so this one really
 		// can promise that nothing was flashed.
-		return codedSelfExplanatory(ExitFailure,
-			"%w.\n  Nothing has been flashed. Disconnect any other VFLEX and retry.", err)
+		msg := "%w.\n  Nothing has been flashed. Disconnect any other VFLEX and retry."
+		if !o.recover {
+			// Without --recover this error is only reachable after phase 1 sent
+			// CMD_JUMP_APP_TO_BOOTLOADER and confirmJump watched the unit leave
+			// the bus, so the unit this command addressed is sitting in the
+			// bootloader with no MIDI interface. "Retry" taken literally then
+			// fails in phase 1 with a generic no-device report, and SPEC.md
+			// §13.6 asks for the opposite: state where the unit is and that it
+			// is re-flashable. Under --recover no jump was issued and the
+			// sentence would be someone else's news.
+			msg += fmt.Sprintf("\n  The unit this command jumped is still in bootloader mode (%s)\n"+
+				"  and is re-flashable. Resume with:  %s", bootloaderLEDNote, a.resumeCommand(o))
+		}
+		return codedSelfExplanatory(ExitFailure, msg, err)
 	}
 	return fmt.Errorf("updating the firmware: %w\n  %s, and the unit is still re-flashable", err, bootloaderLEDNote)
+}
+
+// bootloaderPhaseFailure states where the unit has been left, for the failures
+// between the jump and CMD_BOOTLOAD_END that would otherwise tell the user
+// nothing at all.
+//
+// Execute prints "gflex: interrupted" and not one word of the error for a chain
+// carrying context.Canceled (root.go), and that is exactly what a Ctrl-C during
+// the multi-second stream produces: Flasher.Flash returns ctxwait.Sleep's own
+// ctx.Err(), and every wait after the jump -- the mode-switch settle, the
+// bootloader open, the serial read -- returns it bare on purpose. So the unit
+// is sitting in bootloader mode with no MIDI interface and possibly a
+// half-written image, no other command in this tool can find it, and SPEC.md
+// §13 interlock 6 -- state clearly that the unit is still in bootloader mode
+// and is re-flashable -- is met by nothing. postFlashFailure solved the same
+// problem for the window after CMD_BOOTLOAD_END; this is its counterpart for
+// the window before it. The guidance goes out through Diag, which reaches
+// stderr immediately, and the error is returned unchanged so the exit code and
+// the sentinels are what they were.
+//
+// Only the cancelled case is narrated. Every other failure here -- a CRC
+// mismatch, a serial mismatch, a bootloader that would not open -- carries its
+// own text saying the same thing, and Execute prints it; saying it twice is how
+// a message stops being read.
+func (a *App) bootloaderPhaseFailure(f Formatter, o flashOpts, err error) error {
+	if !errors.Is(err, context.Canceled) {
+		return err
+	}
+	f.Diag("")
+	f.Diag("interrupted with the unit in bootloader mode. The update did not finish, so")
+	f.Diag("CMD_BOOTLOAD_END was not sent and the unit has not jumped back into its application:")
+	f.Diag("%s, and it is still re-flashable.", bootloaderLEDNote)
+	f.Diag("No other gflex command can reach it until it is flashed or power-cycled. Resume with:")
+	f.Diag("  %s", a.resumeCommand(o))
+	return err
 }
 
 // confirmJump establishes that the unit really did leave the bus, which is the
 // only evidence the unacknowledged jump produces (SPEC.md §10.1), and aborts
 // the update before anything is written if it did not.
-func (a *App) confirmJump(ctx context.Context, f Formatter, appSerial string) error {
+//
+// waitDev is the same seam reportJumpEvidence takes, for the same reason.
+func (a *App) confirmJump(ctx context.Context, f Formatter, appSerial string,
+	waitDev func(context.Context, bool, time.Duration) error,
+) error {
 	if !a.midiPresenceMeaningful() {
 		f.Diag("note: the jump cannot be confirmed on --transport %s -- this transport detaches the "+
 			"kernel MIDI driver itself, so the port is absent either way. Continuing to the "+
@@ -963,8 +1160,21 @@ func (a *App) confirmJump(ctx context.Context, f Formatter, appSerial string) er
 			"is written.", a.Transport)
 		return nil
 	}
-	if err := waitForDevice(ctx, false, disconnectTimeout); err == nil {
+	err := waitDev(ctx, false, disconnectTimeout)
+	if err == nil {
 		return nil
+	}
+	// An interrupted wait is not a jump that failed to take, and must not be
+	// dressed up as one. waitForDevice returns the context's own error
+	// (connect.go), and the wording below would claim a three-second
+	// observation that never happened, promise that nothing was flashed -- true
+	// here, but beside the point once the jump frame has gone out -- and then
+	// reconnect with a dead context purely to print "could not identify the
+	// VFLEX still on the bus: context canceled". Returning the error as it
+	// stands keeps the context.Canceled chain, which is what tells the caller
+	// to say where the unit actually is (bootloaderPhaseFailure).
+	if ctx.Err() != nil {
+		return err
 	}
 	return codedSelfExplanatory(ExitFailure,
 		"the device did not disconnect within %s, so the jump to the bootloader was not confirmed.\n"+
@@ -1065,15 +1275,21 @@ func (a *App) waitForApplicationMode(ctx context.Context, timeout time.Duration)
 // reading as a failed update, when the firmware was already written, verified
 // and jumped into. Every error return is therefore phrased by
 // postFlashFailure.
-func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, res *bootloader.UpdateResult) error {
+func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, o flashOpts,
+	res *bootloader.UpdateResult,
+) error {
 	if err := ctxwait.Sleep(ctx, postJumpDelay); err != nil {
-		return a.postFlashFailure(f, res, "waiting out the post-jump settle", err)
+		return a.postFlashFailure(f, o, res, "waiting out the post-jump settle", err)
 	}
 	if err := a.waitForApplicationMode(ctx, reenumerationTimeout); err != nil {
-		return a.postFlashFailure(f, res, "waiting for the unit to come back in application mode", err)
+		return a.postFlashFailure(f, o, res, "waiting for the unit to come back in application mode", err)
 	}
 	return nil
 }
+
+// errWrongUnit is phase 5's identity failure: the unit that answered the
+// reconnect is not the unit that was flashed.
+var errWrongUnit = errors.New("the reconnected unit is not the one that was flashed")
 
 // postFlashFailure phrases every error that can occur once the update itself
 // is over: the image verified (or its unverified start was explicitly forced)
@@ -1082,6 +1298,14 @@ func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, res *boot
 // whose firmware is fine is the most dangerous operation this tool has
 // (SPEC.md §10, §13.6), and a generic failure exit is exactly what sends
 // someone to do it.
+//
+// That instruction is earned, not automatic, so it is written out only where
+// the two things it rests on are both true. A jump that was not delivered
+// leaves the unit in the bootloader, and an image nothing verified is not a
+// unit known to be healthy; in either case re-flashing is the fix rather than
+// the mistake, and SPEC.md §13.6's requirement to say the unit is re-flashable
+// is what applies. Both branches take their LED wording and their resume
+// command from the same places every other message here does.
 //
 // Everything the user needs survives two exit paths that would otherwise
 // swallow it: Flush runs only on success, so the buffered crc-verified line
@@ -1094,28 +1318,75 @@ func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, res *boot
 // error keeps the original chain (sentinels, exit code) and suppresses the
 // generic per-code hint, which would diagnose a "missing" device that merely
 // re-enumerated slowly.
-func (a *App) postFlashFailure(f Formatter, res *bootloader.UpdateResult, what string, err error) error {
+func (a *App) postFlashFailure(f Formatter, o flashOpts, res *bootloader.UpdateResult,
+	what string, err error,
+) error {
 	f.Diag("")
+	if res == nil || !res.JumpedToApp {
+		// The bootloader layer refuses to report a jump it could not deliver,
+		// so this branch is not reached in an ordinary run -- but the claim
+		// below is made here, on this side of the package boundary, and it must
+		// rest on the field that records the send rather than on an invariant
+		// maintained a layer away. CMD_BOOTLOAD_END not delivered means the
+		// unit never left the bootloader, so "do NOT re-flash" would forbid the
+		// one action that gets it out (SPEC.md §10.5).
+		f.Diag("the flash itself finished -- %s -- but CMD_BOOTLOAD_END did not reach the unit, so it",
+			flashOutcomePhrase(res))
+		f.Diag("has NOT started that image: %s, and it is still re-flashable.", bootloaderLEDNote)
+		f.Diag("What failed is %s: %v", what, err)
+		f.Diag("Re-flash it with:  %s", a.resumeCommand(o))
+		return postFlashFailed(fmt.Sprintf(
+			"the image was written, but the unit was not started and %s failed", what), err)
+	}
+	if !res.CRCChecked {
+		// --force, on an image that carries no CRC: every byte was written and
+		// the unit was told to run it, and nothing checked what landed
+		// (SPEC.md §10.2, §14.12). "Do NOT re-flash" rests on a unit whose
+		// firmware is known good, which is precisely what was not established,
+		// and a unit that does not come back after being started on an
+		// unverified image is the case bootloader/firmware.go names as the one
+		// where the vendor's "still re-flashable" reassurance stops applying on
+		// its own. The honest instruction there is to look at the LED.
+		f.Diag("the firmware update ran to the end -- %s -- and the jump into it was sent.",
+			flashOutcomePhrase(res))
+		f.Diag("What failed is %s: %v", what, err)
+		f.Diag("Nothing established that the image is good, so do not read this as a healthy unit.")
+		f.Diag("If it does not come back and %s, it is in the bootloader,", bootloaderLEDNote)
+		f.Diag("where re-flashing is the fix -- ideally with an expected CRC to check against:")
+		f.Diag("  %s", a.resumeCommand(o))
+		f.Diag("")
+		postFlashReplayNote(f)
+		return postFlashFailed(fmt.Sprintf(
+			"the firmware was written and started unverified, but %s failed", what), err)
+	}
 	f.Diag("the firmware update itself SUCCEEDED -- %s -- and the jump into it was sent.",
 		flashOutcomePhrase(res))
-	if res != nil && res.CRCChecked {
-		// The crc-verified evidence, restated here because the buffered result
-		// block it was recorded in will never be flushed on this path.
-		f.Diag("verified CRC: 0x%02X", res.CRC)
-	}
+	// The crc-verified evidence, restated here because the buffered result
+	// block it was recorded in will never be flushed on this path.
+	f.Diag("verified CRC: 0x%02X", res.CRC)
 	f.Diag("Do NOT re-flash the unit for this. What failed is %s: %v", what, err)
 	f.Diag("")
+	postFlashReplayNote(f)
+	return postFlashFailed(fmt.Sprintf("the firmware update SUCCEEDED, but %s failed", what), err)
+}
+
+// postFlashReplayNote is the tail the two jumped-into-the-application branches
+// share: what the run did not get to, and how to do each part by hand.
+func postFlashReplayNote(f Formatter) {
 	f.Diag("what did not run is the replay of the settings a flash erases (SPEC.md §10.4) and the")
 	f.Diag("version read-back, so the unit is running the new image with those values as the flash")
 	f.Diag("left them. Reconnect and check `gflex info --all`; restore anything missing with")
-	f.Diag("`gflex vlimit set --low <mV> --high <mV>`, `gflex current set <mA>`,")
+	f.Diag("`gflex vlimit set --low <n>mV --high <n>mV`, `gflex current set <n>mA`,")
 	f.Diag("`gflex tolerance set --nominal <mV>`, `gflex calibrate adc --offset <n> --scale <n>`,")
 	f.Diag("`gflex authlock set <level>`, and read the version with `gflex firmware version`.")
-	return &CodedError{
-		Code:   ExitCode(err),
-		Err:    fmt.Errorf("the firmware update SUCCEEDED, but %s failed: %w", what, err),
-		NoHint: true,
-	}
+}
+
+// postFlashFailed couples one of those summaries with the failure that cut the
+// run short. The original error keeps its class so a script can still branch on
+// it, and the generic per-code hint is suppressed: it would diagnose a
+// "missing" device that merely re-enumerated slowly.
+func postFlashFailed(summary string, err error) error {
+	return &CodedError{Code: ExitCode(err), Err: fmt.Errorf("%s: %w", summary, err), NoHint: true}
 }
 
 // loadFirmware reads the image from disk, or fetches it for this serial, and
@@ -1133,7 +1404,7 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 		// o.fetchTimeout, not a.Timeout: see the --fetch-timeout flag.
 		fw, err = fetchFirmware(ctx, o.wsURL, serial, o.fetchTimeout)
 		if err != nil {
-			return nil, fmt.Errorf("fetching firmware for serial %s: %w", serial, err)
+			return nil, fetchError(o.wsURL, serial, o.fetchTimeout, err)
 		}
 	} else {
 		// --page-size is refused on every JSON image, because whether the
@@ -1166,7 +1437,7 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 		// is surfaced verbatim inside the wrap below.
 		fw, err = bootloader.LoadFileWithOptions(o.path, bootloader.LoadOptions{PageSize: o.pageSize})
 		if err != nil {
-			return nil, fmt.Errorf("loading %s: %w", o.path, err)
+			return nil, localFileError("loading", o.path, err)
 		}
 	}
 	if o.crc >= 0 {
@@ -1177,6 +1448,21 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 		// all. The two are recorded separately for a reason: a JSON image may
 		// legitimately declare a CRC of 0x00, and reading that as "no CRC
 		// supplied" would silently skip verification on a valid image.
+		//
+		// Replacing a value the image (or the vendor service) declared stays
+		// permitted -- it is the only spelling there is for re-flashing an
+		// image whose declared CRC is known wrong -- but it does not stay
+		// silent. It is the one way an image that failed verification can be
+		// walked through to CMD_BOOTLOAD_END on the next run: the mismatch
+		// prints the byte the device computed, and typing that back in makes
+		// the comparison compare the device with itself. What follows then
+		// reports the flash as verified, so the substitution has to be visible
+		// at the point it happens (SPEC.md §10.2, §13.6).
+		if fw.CRCKnown && uint8(o.crc) != fw.CRC {
+			a.stderrf("warning: --crc 0x%02x replaces the CRC 0x%02x this image declares; "+
+				"verification will check\n  the value you supplied, not the image's\n",
+				uint8(o.crc), fw.CRC)
+		}
 		fw.CRC = uint8(o.crc)
 		fw.CRCKnown = true
 	}
@@ -1228,13 +1514,21 @@ func fileLooksJSON(path string) (bool, error) {
 // after 8s"). Someone watching a stalled flash had no way to tell which one
 // they were in. One retry loop, and it belongs to the package that knows what
 // it is waiting for; do not add another here.
-func openBootloaderInterface(ctx context.Context, f Formatter) (*usbfs.Device, usbfs.Interface, error) {
+//
+// noJumpInFlight is set only by --recover, and it is what lets Connect give up
+// early on a unit that is still running the application. Everywhere else a jump
+// has just been issued and that refusal is expected and transient -- the unit is
+// mid-reset and has not left the bus yet -- so abandoning the window there would
+// give up on a flash that was about to succeed.
+func openBootloaderInterface(ctx context.Context, f Formatter, noJumpInFlight bool) (*usbfs.Device, usbfs.Interface, error) {
 	// Said before the call, not after a first failure: Connect blocks for its
 	// whole window, so a message that waits for one is a message nobody sees
 	// while they are waiting for it.
 	f.Diag("opening the bootloader interface (retrying for up to %s while the device enumerates)...",
 		bootloader.ConnectRetryWindow)
-	dev, iface, err := connectBootloader(ctx)
+	dev, iface, err := connectBootloader(ctx, bootloader.ConnectOptions{
+		FailFastOnApplicationMode: noJumpInFlight,
+	})
 	if err == nil {
 		return dev, iface, nil
 	}
@@ -1245,24 +1539,93 @@ func openBootloaderInterface(ctx context.Context, f Formatter) (*usbfs.Device, u
 	if ctx.Err() != nil {
 		return nil, usbfs.Interface{}, err
 	}
+	// Why the cause is classified here rather than left to ExitCode: an
+	// explicit CodedError anywhere in the chain wins (exit.go), so a single
+	// ExitNoDevice would answer for every cause -- and %v would have flattened
+	// the chain out of existence before ExitCode ever saw it. The same missing
+	// udev rule then exits 6 on `gflex --transport usb info`, which classifies
+	// (App.transportError), and 3 here, against a table README calls stable
+	// enough to branch on. The arms mirror transportError's, and every one
+	// wraps with %w so errors.Is still answers for a caller.
+	switch {
+	case errors.Is(err, usbfs.ErrPermission), errors.Is(err, fs.ErrPermission):
+		return nil, usbfs.Interface{}, coded(ExitPermission, fmt.Errorf(
+			"could not open the bootloader interface: %w\n"+
+				"  The bootloader is a raw USB interface, not MIDI, so it needs a udev rule:\n"+
+				"    sudo gflex install-udev\n"+
+				"  %s.", err, bootloaderLEDNote))
+	case errors.Is(err, usbfs.ErrBusy), errors.Is(err, syscall.EBUSY):
+		return nil, usbfs.Interface{}, coded(ExitBusy, fmt.Errorf(
+			"could not open the bootloader interface: %w\n  %s.", err, bootloaderLEDNote))
+	case errors.Is(err, bootloader.ErrApplicationMode):
+		// A unit running its application is not a unit that could not be
+		// found, and it does not need a udev rule -- the open worked. The
+		// package's own message already names both ways forward, so nothing is
+		// added and the per-code hint is suppressed.
+		return nil, usbfs.Interface{}, codedSelfExplanatory(ExitFailure,
+			"could not open the bootloader interface: %w", err)
+	}
 	hint := ""
 	if !usbPresent() {
 		hint = fmt.Sprintf("\n  No device with vendor 0x%04X is on the bus at all.", proto.VendorID)
 	}
 	// The window is not restated here: Connect owns the retry and names its own
 	// budget in the error being wrapped.
-	return nil, usbfs.Interface{}, codedf(ExitNoDevice,
-		"could not open the bootloader interface: %v%s\n"+
+	return nil, usbfs.Interface{}, coded(ExitNoDevice, fmt.Errorf(
+		"could not open the bootloader interface: %w%s\n"+
 			"  The bootloader is a raw USB interface, not MIDI, so it needs a udev rule:\n"+
 			"    sudo gflex install-udev\n"+
-			"  %s.", err, hint, bootloaderLEDNote)
+			"  %s.", err, hint, bootloaderLEDNote))
 }
 
-func recoverArg(o flashOpts) string {
-	if o.fetch {
-		return "--fetch"
+// resumeCommand renders the command that picks this update up again from
+// bootloader mode.
+//
+// Every flag that decides *what* gets flashed has to come along. The line used
+// to carry the image argument alone, and the omission is wrong in the one
+// direction that cannot be detected afterwards: a raw .bin flashed with
+// --page-size 320 --crc 0x30 was offered back as `--recover fw.bin --yes`,
+// which CheckFlash then refuses for carrying no CRC -- with advice to re-run
+// with --force, at which point the same file is split at the 512-byte default
+// and flashed and started unverified, at a geometry the user never asked for
+// and that a CRC could not have caught anyway (SPEC.md §10.2, §14.12). --ws-url
+// and --fetch-timeout are here for a milder version of it: without them a
+// resume aimed at a lab endpoint silently goes to production.
+//
+// Only the flags that survive a re-run are reproduced. --transport comes along
+// because it decides which stack opens the unit; the connection details that do
+// not change what is written -- --port, --timeout, --byte-delay -- are left to
+// the user's own shell history, which is where the whole command came from.
+func (a *App) resumeCommand(o flashOpts) string {
+	cmd := "gflex"
+	if a.Transport != "" && a.Transport != transportRawMIDI {
+		cmd += " --transport " + a.Transport
 	}
-	return o.path
+	cmd += " firmware flash --recover"
+	if o.fetch {
+		cmd += " --fetch"
+	} else {
+		cmd += " " + o.path
+	}
+	if o.pageSize != 0 {
+		cmd += fmt.Sprintf(" --page-size %d", o.pageSize)
+	}
+	if o.crc >= 0 {
+		cmd += fmt.Sprintf(" --crc 0x%02x", o.crc)
+	}
+	if o.force {
+		cmd += " --force"
+	}
+	if o.ackFirst {
+		cmd += " --ack-mode"
+	}
+	if o.fetch && o.wsURL != "" && o.wsURL != bootloader.DefaultWSURL {
+		cmd += " --ws-url " + o.wsURL
+	}
+	if o.fetch && o.fetchTimeout != 0 && o.fetchTimeout != bootloader.DefaultFetchTimeout {
+		cmd += " --fetch-timeout " + o.fetchTimeout.String()
+	}
+	return cmd + " --yes"
 }
 
 // progressWriter renders flash progress on stderr, and keeps the log lines the
@@ -1340,4 +1703,17 @@ func (a *App) dryRunFlash(f Formatter, fw *bootloader.Firmware) error {
 	f.Note("After the jump the device speaks raw bulk USB, not MIDI: the bootloader frames")
 	f.Note("carry the same [len, cmd|0x80] preamble but no nibble encoding (SPEC.md §10.2).")
 	return nil
+}
+
+// localFileError classifies a failure to read or write a file the user named on
+// the command line.
+//
+// Without it these reach ExitCode's bare permission arm, which exists for the
+// device nodes and answers EACCES with exit 6 and the "run sudo gflex
+// install-udev" hint -- advice that is wrong twice over for a path the user
+// typed: no udev rule governs it, and the fix is their own file mode. The
+// device paths keep that arm; a local file is a plain failure whose own text
+// already says which file and why, so the hint is suppressed.
+func localFileError(verb, path string, err error) error {
+	return codedSelfExplanatory(ExitFailure, "%s %s: %w", verb, path, err)
 }

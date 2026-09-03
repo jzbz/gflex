@@ -18,8 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jzbz/gflex/internal/framer"
@@ -51,6 +53,40 @@ var (
 	// failed" -- on a voltage write that would tell the user the rail is
 	// unchanged while it is live at the new value.
 	ErrReadBack = errors.New("write succeeded but could not be read back")
+
+	// ErrUnacknowledged marks a write whose frame was fully transmitted and
+	// then went unanswered. framer.SendFrame returns nil only once the last
+	// MIDI message -- the end-of-frame marker -- is on the wire, so the device
+	// received a complete, well-formed frame; and there being no NACK anywhere
+	// in this protocol (SPEC.md §5.2), a complete frame is acted on whether or
+	// not the host is still listening for the echo. What was lost is the
+	// acknowledgement, not necessarily the command.
+	//
+	// So it means the device's state is UNKNOWN. It does not mean the write
+	// failed, and it does not mean it succeeded. Callers must not report it as
+	// a failure: on a voltage write that tells the user the rail is unchanged
+	// while it may be live at the new value -- the same mistake ErrReadBack
+	// exists to prevent, one round trip earlier and with less known. The
+	// setting is non-volatile and the unit does not need the host attached to
+	// hold it (SPEC.md §1), so nothing takes it back on its own; read the value
+	// back before relying on it.
+	//
+	// It is attached in exactly one situation: the send returned nil and the
+	// wait that followed ended in ErrTimeout or a dead context. The two
+	// exclusions are as load-bearing as the rule.
+	//
+	//   - A send that FAILED gets no sentinel. SendFrame stops at the message
+	//     it could not write, so the frame is truncated and the device's
+	//     receive machine drops it for want of an end-of-frame marker
+	//     (SPEC.md §3.3): the write demonstrably did not land. Warning that the
+	//     rail may have moved would be a false alarm on the one message that
+	//     has to stay trustworthy.
+	//   - ErrTransportClosed gets none either. It is already a distinct,
+	//     permanent classification that names the link as the cause and is
+	//     acted on as such; a timeout and an interrupt are the two failures
+	//     that get rendered to the user as "the device refused it" and "the run
+	//     was aborted", which is what makes them worth marking.
+	ErrUnacknowledged = errors.New("write sent but not acknowledged")
 )
 
 // PermanentErr reports whether err is a failure no retry within this
@@ -62,6 +98,9 @@ var (
 // same way. The retry loops in this package (VoltageMv's ready retry,
 // FullPDOLog's chunk retry) must return these immediately rather than spend
 // their budget on attempts that cannot succeed.
+//
+// The sentinels above all come from the RECEIVE leg. A command whose SEND
+// fails produces none of them -- see deviceGone, which classifies that leg.
 //
 // ErrTimeout is deliberately NOT here: the protocol has no NACK, so a frame
 // lost in either direction surfaces only as a timeout, and re-asking is the
@@ -76,7 +115,41 @@ func PermanentErr(err error) bool {
 		errors.Is(err, ErrNoConnection) ||
 		errors.Is(err, framer.ErrClosed) ||
 		errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded)
+		errors.Is(err, context.DeadlineExceeded) ||
+		deviceGone(err)
+}
+
+// deviceGone reports whether err carries an errno meaning the device itself is
+// no longer attached. It is how PermanentErr sees an unplug that lands on the
+// send leg rather than on a wait.
+//
+// None of PermanentErr's other sentinels can describe that leg. framer.SendFrame
+// refuses only once the framer's done channel is closed, which Close does; a
+// reader that dies from a transport error closes its frames and errs channels
+// and leaves done alone, so the next command is still transmitted -- into a
+// port that is gone. The kernel swaps in the disconnected file operations the
+// moment the USB device disappears, so rawmidi's write returns ENODEV verbatim
+// and usbfs's Error unwraps to its own errno, and exchange reports either as
+// "send failed" with nothing PermanentErr recognised. The cost of not
+// recognising it is not academic: Info's optional block would tolerate nine
+// instant failures and hand back a report full of nil fields with a nil error,
+// which is indistinguishable from a unit that merely declines those commands,
+// and FullPDOLog and the scan wizard's serial re-read would spend their retry
+// budgets on a link that is gone.
+//
+// The set is the one internal/cli's ExitCode already maps to the no-device exit
+// code, so a link the CLI calls gone is a link this package stops retrying.
+// Matching the errnos rather than usbfs's class sentinel keeps layer 3 free of a
+// transport import and covers rawmidi, which returns the bare kernel error.
+//
+// Deliberately NOT "any failed send". A usbfs transfer that times out
+// (ETIMEDOUT) is a failed write to a device that is still there, and a second
+// go at it is exactly what the PDO chunk retry is for.
+func deviceGone(err error) bool {
+	return errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENXIO) ||
+		errors.Is(err, syscall.ESHUTDOWN) ||
+		errors.Is(err, os.ErrClosed)
 }
 
 // Options configures a Session. The zero value is valid and selects this
@@ -241,9 +314,37 @@ func (s *Session) exchange(ctx context.Context, cmd proto.Cmd, payload []byte, w
 	if err := s.fr.SendFrame(ctx, tx); err != nil {
 		// The vendor's transport swallows send failures and lets them surface
 		// as a timeout five seconds later (SPEC.md §7). Report them directly.
+		//
+		// This is also the boundary ErrUnacknowledged is defined against: the
+		// frame stopped at the message that could not be written, so it is
+		// truncated on the wire and the device drops it. Nothing was applied,
+		// and nothing below marks this error.
 		return proto.Frame{}, fmt.Errorf("%s: send failed (tx %s): %w", cmd, proto.Hex(tx), err)
 	}
-	return s.await(ctx, cmd, tx, timeout)
+
+	f, err := s.await(ctx, cmd, tx, timeout)
+	if err != nil && write {
+		// Past this point the whole frame, end-of-frame marker included, has
+		// left the host. A write that then goes unanswered is not a write that
+		// did not happen -- see ErrUnacknowledged.
+		err = unacknowledged(err)
+	}
+	return f, err
+}
+
+// unacknowledged marks err with ErrUnacknowledged when it is one of the two
+// outcomes that leave a transmitted write's fate unknown: no answer within the
+// deadline, or a context that ended while waiting for one. Anything else is
+// returned untouched; ErrUnacknowledged's declaration says why each exclusion
+// is there.
+func unacknowledged(err error) error {
+	switch {
+	case errors.Is(err, ErrTimeout),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %w", ErrUnacknowledged, err)
+	}
+	return err
 }
 
 // await blocks until a frame carrying cmd arrives, the deadline expires, or the
@@ -354,7 +455,13 @@ func (s *Session) await(ctx context.Context, cmd proto.Cmd, tx []byte, timeout t
 				// are never inspected.
 				continue
 			}
-			// Copy: the payload aliases the framer's receive buffer.
+			// The framer's decoder already hands over a fresh allocation per
+			// frame and aliases nothing later (framer.Decoder.Feed's contract,
+			// pinned by TestDecoderFramesAreCopies), and proto.Parse only
+			// sub-slices it -- so this copy is defence in depth against a
+			// decoder that someday reuses its accumulator, not a live aliasing
+			// hazard. Owning it here is what lets Do promise a payload the
+			// caller may retain whatever the layer below does.
 			f.Payload = append([]byte(nil), f.Payload...)
 			return f, nil
 		}

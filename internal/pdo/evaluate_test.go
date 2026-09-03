@@ -703,6 +703,126 @@ func TestEvaluateEPRAVSCoversSPRRequest(t *testing.T) {
 	wantMessage(t, m, "EPR AVS range")
 }
 
+// TestEvaluateEPRAVSUpgradeWhenAWeakerSPRObjectCovers is the other half of the
+// same deviation. Consulting the EPR side only when NOTHING in the SPR classes
+// covers the request left the rule half applied: a 140 W charger advertising
+// fixed 15 V 3 A beside an EPR AVS 15.0-28.0 V range answered "no, 3.00 A" at
+// 15 V and "yes, 5.00 A" at 18 V from one and the same scan, purely because
+// 18 V happened to have no fixed object. All three SPR arms could pick the
+// weaker object, so all three are covered here.
+func TestEvaluateEPRAVSUpgradeWhenAWeakerSPRObjectCovers(t *testing.T) {
+	cases := []struct {
+		name string
+		log  *Log
+		v    float64
+	}{
+		// An Apple 140 W adapter's shape: the fixed object at 15 V is the weak one.
+		{"fixed", simpleLog(t, fixed5V3A, fixed9V3A, fixed15V3A, fixed20V5A, fixed28V5A, eprAVS140W), 15},
+		{"pps", simpleLog(t, fixed5V3A, pps3321V3A, eprAVS140W), 18},
+		{"spr avs", simpleLog(t, fixed5V3A, sprAVS, eprAVS140W), 18},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.log.Evaluate(tc.v, 4)
+			checkMatch(t, m, true, ModeUpgradeEPRAVSMoreCurrent, 5)
+			wantMessage(t, m, "the EPR AVS range 15.0-28.0 V (140 W) supplies 5.00 A")
+			// The capability is an EPR object below 20 V, so the cable
+			// requirement follows it.
+			wantMessage(t, m, "required even below 20 V")
+		})
+	}
+
+	// An SPR object that can do the job keeps the verdict: the upgrade is gated
+	// on the shortfall, exactly as the EPR branch gates its own.
+	l := simpleLog(t, fixed5V3A, fixed15V3A, eprAVS140W)
+	m := l.Evaluate(15, 3)
+	checkMatch(t, m, true, ModeSPRFixed, 3)
+	if hasMessage(m, "eMarker") {
+		t.Errorf("an SPR verdict acquired an EPR cable requirement it does not need: %v", m.Messages)
+	}
+
+	// Moving off an SPR AVS object must not take its disclosure with it: the
+	// message that object left behind still quotes the assumed 9-20 V range.
+	m = cases[2].log.Evaluate(18, 4)
+	wantCaveat(t, m, CaveatSPRAVSAssumedRange)
+	wantMessage(t, m, "carries no voltage range on the wire")
+}
+
+// TestEvaluateEPRCableFaultOnAnSPRRangeRefusal is the SPR mirror of
+// TestEvaluateEPRCableFaultOnSPROnlySource. A refusal at 15 V or above is
+// exactly the refusal a cable that could not enter EPR produces, since an EPR
+// AVS range routinely starts at 15 V and would have covered the request; the SPR
+// refusal path explained itself purely in terms of fixed/PPS/SPR AVS objects and
+// never mentioned the fault the same scan recorded.
+func TestEvaluateEPRCableFaultOnAnSPRRangeRefusal(t *testing.T) {
+	// A 140 W charger scanned through a non-eMarked cable: EPR entry failed, so
+	// it advertised only its SPR objects.
+	l, err := Parse(buildLog(18000, 0, 4, 1, 0, Flag2EPRCableFail,
+		fixed5V3A, fixed9V3A, fixed15V3A, fixed20V5A))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	m := l.Evaluate(18, 3)
+	checkMatch(t, m, false, ModeNone, 0)
+	wantCaveat(t, m, CaveatEPRCableFail)
+	wantMessage(t, m, "an EPR AVS range (15 V and up) may have been hidden")
+
+	// Below 15 V no EPR AVS object could have covered the request whatever the
+	// cable did, so the fault explains nothing and must not be cited.
+	m = l.Evaluate(11, 3)
+	checkMatch(t, m, false, ModeNone, 0)
+	wantNoCaveat(t, m, CaveatEPRCableFail)
+	if hasMessage(m, "may have been hidden") {
+		t.Errorf("cable fault blamed for an 11 V refusal it cannot explain: %v", m.Messages)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a power-limited PPS range is not credited with its full current
+// ---------------------------------------------------------------------------
+
+// TestPPSPowerLimitedBoundsTheVerdict pins the verdict half of bit 27. The
+// decode ignored it, so a 45 W charger's 3.3-11 V / 5 A range was reported as
+// 5 A at every voltage in it and `scan --voltage 11 --current 4.5` answered
+// "yes" against a source that can supply 4.09 A there — a 22% over-report in the
+// direction that destroys hardware.
+func TestPPSPowerLimitedBoundsTheVerdict(t *testing.T) {
+	// The 45 W shape: 5/9/15 V at 3 A, 20 V at 2.25 A, PPS 3.3-11 V at 5 A with
+	// the Power Limited bit set.
+	l := simpleLog(t, fixed5V3A, fixed9V3A, fixed15V3A, fixed20V225A, pps3311V5APL)
+
+	m := l.Evaluate(11, 4.5)
+	checkMatch(t, m, false, ModeSPRPPS, 4.09)
+	wantCaveat(t, m, CaveatPPSPowerLimited)
+	wantMessage(t, m, "45 W permits 4.09 A at 11 V")
+	wantMessage(t, m, "inferred from the source's own fixed PDOs, not scanned")
+	wantMessage(t, m, "requested 4.50 A exceeds the 4.09 A available at 11 V")
+
+	// The same word with bit 27 clear says nothing about a budget, so the
+	// advertised figure stands and nothing is disclosed.
+	plain := simpleLog(t, fixed5V3A, fixed9V3A, fixed15V3A, fixed20V225A, pps3311V5A)
+	m = plain.Evaluate(11, 4.5)
+	checkMatch(t, m, true, ModeSPRPPS, 5)
+	wantNoCaveat(t, m, CaveatPPSPowerLimited)
+
+	// Where the budget does not bite, the bit costs the answer nothing and
+	// saying so would be noise: 45 W allows 9 A at 5 V.
+	m = l.Evaluate(5, 3)
+	checkMatch(t, m, true, ModeSPRFixed, 3)
+	wantNoCaveat(t, m, CaveatPPSPowerLimited)
+
+	// With nothing to infer a budget from, the advertised figure is all there
+	// is — which is exactly when the user needs telling that it may be
+	// optimistic.
+	guess := simpleLog(t, fixed5V3A, pps3311V5APL)
+	m = guess.Evaluate(11, 4.5)
+	checkMatch(t, m, true, ModeSPRPPS, 5)
+	wantCaveat(t, m, CaveatPPSPowerLimited)
+	wantMessage(t, m, "do not say what it is")
+	wantMessage(t, m, "Source_Capabilities_Extended")
+}
+
 // TestEvaluatePPSCoversAboveTheEPRThreshold is the EPR-side mirror of the same
 // SPEC.md §17 deviation: the vendor partitions candidates by the requested
 // voltage, so an above-20 V request never sees an SPR object. A PPS APDO's

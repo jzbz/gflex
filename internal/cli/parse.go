@@ -217,22 +217,39 @@ func parseCRCByte(arg string) (int, error) {
 
 // parseHexBytes parses the arguments of `gflex raw` into a byte slice.
 //
-// The arguments are joined and then stripped of the separators people naturally
-// type, so "02 08", "0208", "0x02 0x08" and "02:08" are all the same frame.
+// Separators are dropped and the digits that remain are paired, so "02 08",
+// "0208", "0x02 0x08" and "02:08" are all the same frame. Arguments without a
+// prefix are concatenated before the pairing, which is what makes "0208" work
+// and what makes a lone "4" a nibble rather than a byte: `raw 0 4 92 2E E0`
+// is the same four bytes as `raw 04 92 2E E0`.
+//
+// A "0x" prefix is treated as a boundary rather than as noise to delete. It is
+// the one separation the user wrote deliberately, and deleting it before the
+// pairing merged neighbouring tokens into bytes nobody typed: `raw 0x0 0x4 0x92
+// 0x2E 0xE0` -- five tokens -- became the four-byte frame 04 92 2e e0 and went
+// out as a 12000 mV write, while `raw 0x4 0x92 0x2E 0xE0` was refused for
+// having "an odd number of digits (7)", a count of digits the user never typed.
+// On the one command that reaches the rail without the SPEC.md §13 range checks
+// (see CheckRawFrame), substituting one frame for another silently is the worst
+// of the two.
 func parseHexBytes(args []string) ([]byte, error) {
-	joined := strings.Join(args, "")
 	var sb strings.Builder
-	sb.Grow(len(joined))
-	for i := 0; i < len(joined); i++ {
-		c := joined[i]
-		switch {
-		case c == ' ' || c == ',' || c == ':' || c == '-' || c == '_' || c == '\t':
-			continue
-		case c == '0' && i+1 < len(joined) && (joined[i+1] == 'x' || joined[i+1] == 'X'):
-			i++ // skip the "0x" prefix of a byte literal
-			continue
+	for _, arg := range args {
+		for _, tok := range strings.FieldsFunc(arg, isHexSeparator) {
+			digits := tok
+			if len(digits) > 1 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X') {
+				digits = digits[2:]
+				// Prefixed, so this token is a whole number of bytes on its own
+				// and cannot borrow a nibble from the next one. Name the token
+				// rather than counting the digits of the joined string.
+				if len(digits)%2 != 0 {
+					return nil, codedf(ExitUsage,
+						"hex token %q has an odd number of digits; every byte needs two -- write 0x0%s",
+						tok, digits)
+				}
+			}
+			sb.WriteString(digits)
 		}
-		sb.WriteByte(c)
 	}
 	h := sb.String()
 	if h == "" {
@@ -250,6 +267,16 @@ func parseHexBytes(args []string) ([]byte, error) {
 		out[i] = byte(v)
 	}
 	return out, nil
+}
+
+// isHexSeparator reports whether r is one of the separators people put between
+// hex bytes when they type or paste a frame.
+func isHexSeparator(r rune) bool {
+	switch r {
+	case ' ', ',', ':', '-', '_', '\t':
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

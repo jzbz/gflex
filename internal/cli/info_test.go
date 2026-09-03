@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +113,59 @@ func TestPlainInfoDoesNotAdvertiseAllOnlyCommands(t *testing.T) {
 	for c := range allOnly {
 		if !listed[c] {
 			t.Errorf("`info --all --dry-run` omits %s", c)
+		}
+	}
+}
+
+// TestInfoAllFootnoteNamesTheVendorReadFields is the regression test for a
+// footnote that pointed at a position in the output instead of naming a set.
+//
+// "Fields above the LED setting are read by the vendor app too" was false for
+// three of the fields it covered: chip uuid, hardware id and mfg date are
+// commands 9, 10 and 12, which the vendor app never issues (SPEC.md §6.4), and
+// they print with the other identity strings at the top of the block. So the
+// one line telling a user which readings the vendor app corroborates told them
+// the opposite for the three fields most likely to be missing.
+//
+// The list is derived from infoReadCmds(false) -- the commands a plain `info`
+// issues, which is exactly the vendor-read set -- so adding a command to that
+// list without saying so in the note fails here.
+func TestInfoAllFootnoteNamesTheVendorReadFields(t *testing.T) {
+	// The wording each vendor-read command appears under in the note.
+	labels := map[proto.Cmd]string{
+		proto.CmdSerialNumber:       "serial",
+		proto.CmdFirmwareVersion:    "firmware",
+		proto.CmdVoltageMv:          "output voltage",
+		proto.CmdCurrentLimitMa:     "current limit",
+		proto.CmdUserVLimit:         "voltage limits",
+		proto.CmdDisableLEDDuringOp: "LED setting",
+	}
+
+	// An empty DeviceInfo prints no rows at all, so what comes back is the
+	// footnote and nothing else -- a label that happens to name a printed row
+	// cannot satisfy the assertions below.
+	var out, errBuf bytes.Buffer
+	f := newFormatter(false, &out, &errBuf)
+	emitDeviceInfo(f, &proto.DeviceInfo{}, true)
+	if err := f.Flush(); err != nil {
+		t.Fatalf("flushing the formatter: %v", err)
+	}
+	note := out.String()
+
+	for _, c := range infoReadCmds(false) {
+		label, ok := labels[c]
+		if !ok {
+			t.Errorf("a plain `info` reads %s, which the footnote has no wording for", c)
+			continue
+		}
+		if !strings.Contains(note, label) {
+			t.Errorf("the footnote does not name %s (%q) as read by the vendor app:\n%s", c, label, note)
+		}
+	}
+	// And the three the vendor app never issues must not be claimed for it.
+	for _, absent := range []string{"chip uuid", "hardware id", "mfg date"} {
+		if strings.Contains(note, absent) {
+			t.Errorf("the footnote claims the vendor app reads %q:\n%s", absent, note)
 		}
 	}
 }

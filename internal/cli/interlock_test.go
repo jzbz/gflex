@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -147,6 +149,71 @@ func TestCheckVoltageWrapRefusalExplainsItself(t *testing.T) {
 	}
 }
 
+// TestRepairCommandsSurviveBeingPasted guards the trap in every `vlimit set`
+// command this file prints: those flags are parsed by ParseVoltage, where a
+// bare number is VOLTS and is never guessed from magnitude (SPEC.md §11), so
+// "--low 3300 --high 48000" asks for 3300 V and is refused on the 16-bit wrap
+// check. Both refusals below are reached with no working guard rail and exist
+// to say how to restore one, so an instruction that cannot be pasted leaves the
+// user stuck with the tool refusing every `voltage set`.
+func TestRepairCommandsSurviveBeingPasted(t *testing.T) {
+	args := regexp.MustCompile(`gflex vlimit set --low (\S+) --high (\S+)`)
+
+	// The unusable-window refusal prints a complete command, so it goes back
+	// through the parser and the interlock exactly as pasted.
+	malformed := CheckVoltage(VoltageRequest{
+		Mv: 9000, LimitLowMv: 48000, LimitHighMv: 3300, Limits: LimitsMalformed,
+	})
+	m := args.FindStringSubmatch(malformed.Refused)
+	if m == nil {
+		t.Fatalf("the unusable-window refusal prints no repair command:\n%s", malformed.Refused)
+	}
+	low, high := mustParseVoltage(t, m[1]), mustParseVoltage(t, m[2])
+	if low != int(proto.HardwareMinVoltageMv) || high != int(proto.HardwareMaxVoltageMv) {
+		t.Errorf("the printed repair command asks for [%d, %d] mV, not the [%d, %d] mV envelope it names",
+			low, high, proto.HardwareMinVoltageMv, proto.HardwareMaxVoltageMv)
+	}
+	if d := CheckVLimit(VLimitRequest{NewLowMv: low, NewHighMv: high}); !d.OK() {
+		t.Errorf("the repair command the refusal prints is itself refused when pasted:\n  %s --high %s\n  %s",
+			m[1], m[2], d.Refused)
+	}
+
+	// The outside-the-window refusal prints placeholders, so the numbers are
+	// substituted the way a user would and what has to survive is the unit
+	// around them.
+	outside := CheckVoltage(VoltageRequest{
+		Mv: 20000, LimitLowMv: 3300, LimitHighMv: 12000, Limits: LimitsValid,
+	})
+	p := args.FindStringSubmatch(outside.Refused)
+	if p == nil {
+		t.Fatalf("the outside-the-window refusal prints no repair command:\n%s", outside.Refused)
+	}
+	for _, tc := range []struct {
+		arg string
+		mv  int
+	}{{p[1], 3300}, {p[2], 48000}} {
+		filled := strings.Replace(tc.arg, "<n>", strconv.Itoa(tc.mv), 1)
+		got, err := ParseVoltage(filled)
+		if err != nil {
+			t.Errorf("the placeholder %q does not take a number: %q -> %v", tc.arg, filled, err)
+			continue
+		}
+		if got != tc.mv {
+			t.Errorf("%q filled in with %d mV parses as %d mV; the placeholder does not carry its unit",
+				tc.arg, tc.mv, got)
+		}
+	}
+}
+
+func mustParseVoltage(t *testing.T, arg string) int {
+	t.Helper()
+	mv, err := ParseVoltage(arg)
+	if err != nil {
+		t.Fatalf("the printed argument %q does not parse: %v", arg, err)
+	}
+	return mv
+}
+
 func TestCheckCurrent(t *testing.T) {
 	tests := []struct {
 		ma          int
@@ -187,10 +254,16 @@ func TestCheckVLimit(t *testing.T) {
 		req         VLimitRequest
 		wantRefused bool
 		wantConfirm bool
+		wantWarn    string // substring expected in some warning, "" for none required
 	}{
 		{name: "narrowing both ends", req: set(cur(3300, 48000), 4500, 12000)},
 		{name: "narrowing the top only", req: set(cur(3300, 48000), 3300, 20000)},
-		{name: "identical", req: set(cur(3300, 48000), 3300, 48000)},
+		// A ceiling above 20 V carries the §13.9 advisory here as well as on
+		// `voltage set`: the window is what makes such a request possible at
+		// all, and the cable and source it needs are the same either way.
+		{name: "identical", req: set(cur(3300, 48000), 3300, 48000), wantWarn: "eMarker"},
+		{name: "widening to the hardware ceiling", req: set(cur(3300, 12000), 3300, 48000),
+			wantConfirm: true, wantWarn: "eMarker"},
 		{name: "widening the top", req: set(cur(3300, 12000), 3300, 20000), wantConfirm: true},
 		{name: "widening the bottom", req: set(cur(4500, 12000), 3300, 12000), wantConfirm: true},
 		{name: "unknown current pair is assumed to widen", req: set(VLimitRequest{}, 3300, 48000), wantConfirm: true},
@@ -209,6 +282,9 @@ func TestCheckVLimit(t *testing.T) {
 			}
 			if d.OK() && d.Confirm != tt.wantConfirm {
 				t.Errorf("Confirm = %v, want %v", d.Confirm, tt.wantConfirm)
+			}
+			if tt.wantWarn != "" && !containsAny(d.Warnings, tt.wantWarn) {
+				t.Errorf("warnings %q do not mention %q", d.Warnings, tt.wantWarn)
 			}
 		})
 	}
@@ -250,7 +326,7 @@ func TestCheckAuthLock(t *testing.T) {
 }
 
 func TestCheckCalibrate(t *testing.T) {
-	d := CheckCalibrate(10, 20, 1, 2, true)
+	d := CheckCalibrate(10, 20, 1, 2, true, true, true)
 	if !d.OK() {
 		t.Fatalf("unexpected refusal %q", d.Refused)
 	}
@@ -261,9 +337,21 @@ func TestCheckCalibrate(t *testing.T) {
 		t.Errorf("the restore command must carry the previous values; got %q", d.Warnings)
 	}
 
-	unknown := CheckCalibrate(10, 20, 0, 0, false)
+	unknown := CheckCalibrate(10, 20, 0, 0, false, true, true)
 	if !containsAny(unknown.Warnings, "could not be read") {
 		t.Errorf("an unreadable previous calibration must be called out; got %q", unknown.Warnings)
+	}
+
+	// `calibrate adc --offset 10` keeps the scale it read, so the prompt must
+	// not offer to write it. The prompt is the whole of what --yes suppresses,
+	// and a wrong calibration is invisible afterwards (SPEC.md §13.5), so it
+	// has to describe the writes that will actually happen.
+	kept := CheckCalibrate(10, 20, 1, 20, true, true, false)
+	if !strings.Contains(kept.Prompt, "scale=20 (unchanged)") {
+		t.Errorf("the prompt offers to write a term the command keeps: %q", kept.Prompt)
+	}
+	if strings.Contains(kept.Prompt, "offset=10 (unchanged)") {
+		t.Errorf("the prompt calls the term it is writing unchanged: %q", kept.Prompt)
 	}
 }
 
@@ -286,6 +374,18 @@ func TestCheckFlash(t *testing.T) {
 	ok := CheckFlash(10, "5.0.1", true, false)
 	if !ok.OK() || !ok.Confirm {
 		t.Errorf("a normal flash should be allowed and confirmed, got refused=%q confirm=%v", ok.Refused, ok.Confirm)
+	}
+	// The prompt is the only moment interlock 6 gives anyone to say no, so it
+	// has to describe what really happens afterwards. The SPEC.md §10.4 replay
+	// writes factory defaults and never read this unit's own values, so a
+	// narrowed window can come back as [3300, 48000] -- calling that a
+	// restoration understated it in the direction §13.3 otherwise demands an
+	// explicit widening confirmation for.
+	if strings.Contains(ok.Prompt, "restored") {
+		t.Errorf("the flash prompt calls the factory-default replay a restoration: %q", ok.Prompt)
+	}
+	if !strings.Contains(ok.Prompt, "vlimit set") {
+		t.Errorf("the flash prompt does not say how to put a narrowed window back: %q", ok.Prompt)
 	}
 }
 
@@ -409,6 +509,87 @@ func TestCheckRawFrameDisruptiveCommands(t *testing.T) {
 				t.Errorf("warnings %q do not name the reason (%q)", d.Warnings, tc.wantWarn)
 			}
 		})
+	}
+}
+
+// TestCheckRawFrameGenericReasons covers the two reasons above the switch that
+// nothing else reaches on its own, and both are the sole gate on frames a user
+// can type today.
+//
+// Every write case elsewhere in this file is a command with an arm of its own --
+// CMD_VOLTAGE_MV has one, command 13 is caught by Undocumented -- so the generic
+// WRITE reason could be deleted outright and the suite stayed green while
+// `gflex raw 03 96 07` wrote a possibly irreversible auth lock level (SPEC.md
+// §6.3, §14.8) and `gflex raw 06 97 bb 80 0c e4` widened the guard rail, both on
+// a non-TTY with no --yes. No frame anywhere carried a code outside the table
+// either, so the same was true of the unknown-code reason.
+//
+// As in TestCheckRawFrameDisruptiveCommands, every case asserts the warning
+// TEXT: an assertion on Confirm alone passes as soon as any other reason fires
+// and measures nothing.
+func TestCheckRawFrameGenericReasons(t *testing.T) {
+	cases := []struct {
+		name     string
+		frame    proto.Frame
+		wantWarn string
+	}{
+		{
+			"a raw auth lock write",
+			proto.Frame{Cmd: proto.CmdAuthLock, Write: true, Payload: []byte{7}},
+			"WRITE frame",
+		},
+		{
+			"a raw window write",
+			proto.Frame{Cmd: proto.CmdUserVLimit, Write: true, Payload: []byte{0xbb, 0x80, 0x0c, 0xe4}},
+			"WRITE frame",
+		},
+		{
+			// A plain read, so the unknown-code reason is the only thing that
+			// can speak for it.
+			"the first code past the table",
+			proto.Frame{Cmd: proto.Cmd(29)},
+			"outside the known table",
+		},
+		{
+			"the last code the 6-bit field can carry",
+			proto.Frame{Cmd: proto.Cmd(0x3f)},
+			"outside the known table",
+		},
+		{
+			// The 0x80-less typo of `04 92 2e e0`: neither a read nor a write by
+			// SPEC.md §5.1, and the one command where being wrong about that
+			// puts a voltage on the rail.
+			"a voltage payload with the write flag clear",
+			proto.Frame{Cmd: proto.CmdVoltageMv, Payload: []byte{0x2e, 0xe0}},
+			"bypassing every range check",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := CheckRawFrame(tc.frame)
+			if !d.OK() {
+				t.Fatalf("refused outright (%q); these are confirmations, not refusals", d.Refused)
+			}
+			if !d.Confirm {
+				t.Errorf("%s went through with no confirmation", tc.frame.Cmd)
+			}
+			if !containsAny(d.Warnings, tc.wantWarn) {
+				t.Errorf("warnings %q do not name the reason (%q)", d.Warnings, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// The exception the payload-without-write rule is written around. `03 11 kk` is
+// the documented PDO chunk read (SPEC.md §6.1): a flag-clear frame that carries
+// a payload and is nonetheless a read, which SPEC.md §13.10 requires to pass
+// silently. Without this case the exclusion in CheckRawFrame looks like a
+// tidyable special case.
+func TestCheckRawFramePDOChunkReadPassesSilently(t *testing.T) {
+	d := CheckRawFrame(proto.Frame{Cmd: proto.CmdPDOLog, Payload: []byte{0}})
+	if !d.OK() || d.Confirm || len(d.Warnings) != 0 {
+		t.Errorf("`raw 03 11 00` is a documented read; got confirm=%v refused=%q warnings=%q",
+			d.Confirm, d.Refused, d.Warnings)
 	}
 }
 

@@ -251,6 +251,39 @@ func (c *Config) restrictToActive() {
 	}
 }
 
+// adjustDeviceIDsHostOrder re-decodes VendorID and ProductID in host byte order,
+// for a blob that came from a usbfs node rather than from sysfs.
+//
+// usbfs does not serve the device descriptor raw. usbdev_read
+// (drivers/usb/core/devio.c) copies dev->descriptor into a temporary and runs
+// le16_to_cpus() over bcdUSB, idVendor, idProduct and bcdDevice before handing it
+// to userspace, so those four fields leave the node in *host* order while
+// everything after the 18-byte device descriptor -- the configuration trees,
+// copied straight out of dev->rawdescriptors -- stays little-endian. sysfs's
+// "descriptors" attribute applies no such conversion, which is why the two
+// sources need different decodes and why ParseDescriptors keeps the wire order
+// for both.
+//
+// On the little-endian architectures this is built for (SPEC.md §12: amd64 and
+// arm64) the two orders coincide and this rewrites the fields with the values
+// they already held. It exists so that a big-endian build fails nowhere rather
+// than in Device.Descriptors' device-replacement guard, which compares these
+// against the vendor ID sysfs reported and would otherwise reject every VFLEX as
+// a different device.
+//
+// The guards mirror ParseDescriptors' own, so the fields are rewritten in
+// precisely the cases the parse decoded them and are left alone otherwise.
+func (c *Config) adjustDeviceIDsHostOrder(raw []byte) {
+	if len(raw) < 2 || raw[1] != descTypeDevice {
+		return
+	}
+	if length := int(raw[0]); length < 12 || length > len(raw) {
+		return
+	}
+	c.VendorID = binary.NativeEndian.Uint16(raw[8:10])
+	c.ProductID = binary.NativeEndian.Uint16(raw[10:12])
+}
+
 // ParseDescriptors decodes a raw usbfs descriptor blob: an 18-byte device
 // descriptor followed by the configuration descriptor trees.
 //
@@ -267,6 +300,13 @@ func (c *Config) restrictToActive() {
 // Config.Configurations comes back split even though the bytes are not.
 // Config.Active is left 0 -- the blob says which configurations exist, never
 // which one is in force.
+//
+// Every multi-byte field is decoded little-endian, i.e. in wire order: that is
+// what a device sends and what sysfs's "descriptors" attribute copies out
+// untouched. A blob read from a usbfs node is not quite that, because the kernel
+// byte-swaps four fields of the device descriptor on its way out; see
+// Config.adjustDeviceIDsHostOrder, which Device.Descriptors applies for exactly
+// that source.
 func ParseDescriptors(b []byte) (*Config, error) {
 	if len(b) < 2 {
 		return nil, fmt.Errorf("%w: %d bytes is too short for any descriptor", ErrBadDescriptor, len(b))

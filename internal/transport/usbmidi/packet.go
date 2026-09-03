@@ -80,8 +80,12 @@ func classify(status byte) (cin byte, length int, ok bool) {
 		}
 		return cin, 3, true
 	case status >= 0xF8:
-		// System realtime: single byte, CIN 0x5.
-		return 0x5, 1, true
+		// System realtime: single byte, CIN 0xF ("Single Byte", table 4-1).
+		// Not 0x5, which is "single-byte System Common" and belongs to 0xF6
+		// alone; the two are one byte long either way, so a receiver that
+		// dispatches on the length rather than the code cannot tell, and one
+		// that dispatches on the code would read a clock as system common.
+		return 0xF, 1, true
 	}
 	switch status {
 	case 0xF1, 0xF3: // MTC quarter frame, Song Select: 2-byte system common

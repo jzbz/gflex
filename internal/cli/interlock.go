@@ -81,6 +81,13 @@ const (
 	// LimitsMalformed means the device answered but the pair cannot bound
 	// anything: high does not exceed low.
 	LimitsMalformed
+	// LimitsNotAttempted means no read has been made: --dry-run opens no device
+	// at all, and `voltage set` judges the argument on its own before it opens
+	// one. Kept apart from LimitsUnread because the difference is the whole of
+	// what the user is told -- "could not be read" describes a failure, and
+	// reporting one that never happened misdescribes the output SPEC.md §13.8
+	// makes a safety property.
+	LimitsNotAttempted
 )
 
 // CheckVoltage applies interlocks 1, 2 and 9 of SPEC.md §13 to a voltage write.
@@ -120,12 +127,19 @@ func CheckVoltage(r VoltageRequest) Decision {
 	// owner chose for their own load, so a narrow one is the case that matters
 	// most, not a suspicious one. Anything less than a refusal here would mean
 	// a single dropped frame silently downgrades a 5 V ceiling to 48 V.
+	//
+	// Every `vlimit set` command printed below carries the mV suffix, and the
+	// placeholders keep it too. ParseVoltage reads a bare number as VOLTS and
+	// never guesses from magnitude (SPEC.md §11), so the obvious-looking
+	// "--low 3300 --high 48000" asks for 3300 V and is refused on the 16-bit
+	// wrap check -- a repair instruction that cannot be pasted, printed at the
+	// one moment the user has no guard rail left to work with.
 	switch r.Limits {
 	case LimitsValid:
 		if r.Mv < int(r.LimitLowMv) || r.Mv > int(r.LimitHighMv) {
 			d.Refused = fmt.Sprintf(
 				"%s is outside this unit's configured voltage limits [%d, %d] mV.\n"+
-					"  Widen them first with: gflex vlimit set --low <mV> --high <mV> --yes",
+					"  Widen them first with: gflex vlimit set --low <n>mV --high <n>mV --yes",
 				formatMvInt(r.Mv), r.LimitLowMv, r.LimitHighMv)
 			return d
 		}
@@ -134,14 +148,22 @@ func CheckVoltage(r VoltageRequest) Decision {
 			d.Refused = fmt.Sprintf(
 				"this unit reports an unusable voltage window (low=%d high=%d mV), so the limit\n"+
 					"  that protects your load cannot be applied. Repair it first with:\n"+
-					"    gflex vlimit set --low 3300 --high 48000 --yes\n"+
+					"    gflex vlimit set --low %dmV --high %dmV --yes\n"+
 					"  or, to write this voltage anyway against only the %d-%d mV hardware envelope:\n"+
 					"    add --ignore-device-limits",
-				r.LimitLowMv, r.LimitHighMv, proto.HardwareMinVoltageMv, proto.HardwareMaxVoltageMv)
+				r.LimitLowMv, r.LimitHighMv,
+				proto.HardwareMinVoltageMv, proto.HardwareMaxVoltageMv,
+				proto.HardwareMinVoltageMv, proto.HardwareMaxVoltageMv)
 			return d
 		}
 		d.warn("proceeding with an unusable device window (low=%d high=%d mV); only the documented %d-%d mV envelope was enforced",
 			r.LimitLowMv, r.LimitHighMv, proto.HardwareMinVoltageMv, proto.HardwareMaxVoltageMv)
+	case LimitsNotAttempted:
+		// Nothing failed here and nothing is being overridden: no device was
+		// opened, so there is no window to apply. The value is still judged
+		// against the envelope above, and the confirmation below still applies.
+		d.warn("the user voltage limits were not read (--dry-run opens no device); only the documented %d-%d mV envelope was applied",
+			proto.HardwareMinVoltageMv, proto.HardwareMaxVoltageMv)
 	default: // LimitsUnread
 		if !r.IgnoreDeviceLimits {
 			d.Refused = fmt.Sprintf(
@@ -312,7 +334,12 @@ func CheckAuthLock(level int) Decision {
 // A wrong offset or scale makes every subsequent voltage reading silently
 // wrong, which defeats interlock 1 by corrupting the evidence it relies on. The
 // previous values are echoed back with a ready-made restore command.
-func CheckCalibrate(offset, scale, prevOffset, prevScale int32, prevKnown bool) Decision {
+//
+// writingOffset and writingScale say which of the two terms the command will
+// actually write: `calibrate adc --offset 5` keeps the scale it read, so the
+// prompt has to describe the pair that results without claiming a write that
+// does not happen.
+func CheckCalibrate(offset, scale, prevOffset, prevScale int32, prevKnown, writingOffset, writingScale bool) Decision {
 	var d Decision
 	if prevKnown {
 		d.warn("previous calibration: offset=%d scale=%d\n"+
@@ -327,8 +354,18 @@ func CheckCalibrate(offset, scale, prevOffset, prevScale int32, prevKnown bool) 
 		"  range check on `voltage set`. The host has no calibration formula; the device computes\n" +
 		"  the calibrated millivolts itself (SPEC.md §6.5).")
 	d.Confirm = true
-	d.Prompt = fmt.Sprintf("Write ADC calibration offset=%d scale=%d?", offset, scale)
+	d.Prompt = fmt.Sprintf("Write ADC calibration offset=%s scale=%s?",
+		calibrateTerm(offset, writingOffset), calibrateTerm(scale, writingScale))
 	return d
+}
+
+// calibrateTerm renders one calibration term for the prompt, marking the one
+// that is being kept rather than written.
+func calibrateTerm(v int32, writing bool) string {
+	if writing {
+		return fmt.Sprintf("%d", v)
+	}
+	return fmt.Sprintf("%d (unchanged)", v)
 }
 
 // CheckFlash applies interlock 6 of SPEC.md §13 to the pre-flight state of a
@@ -355,8 +392,19 @@ func CheckFlash(pages int, version string, crcKnown, force bool) Decision {
 		label = "(unversioned)"
 	}
 	d.Confirm = true
-	d.Prompt = fmt.Sprintf("Flash firmware %s (%d pages)? The device's settings will be erased and "+
-		"restored afterwards.", label, pages)
+	// What runs afterwards is the SPEC.md §10.4 replay, and it writes the
+	// FACTORY defaults: authlock 0, tolerance 750, calibration 0/0, current
+	// 5000 mA, and the 3300-48000 mV window whenever the post-flash read-back
+	// does not survive session.VLimitPlausible. Nothing ever read this unit's
+	// own values, so "restored afterwards" was the wrong word in the one place
+	// the user can still say no -- and for the owner §13 most wants to protect,
+	// the one who set a sub-6 V ceiling for a 5 V pedal, answering yes replaces
+	// the strictest guard rail in the system with the widest window there is
+	// (§17 row 2). The full list of defaults belongs in the command's own help;
+	// the prompt says the part that changes what a careful user would do next.
+	d.Prompt = fmt.Sprintf("Flash firmware %s (%d pages)? The device's settings will be erased and then "+
+		"reset to the factory defaults, not to this unit's -- a narrowed voltage window has to be "+
+		"re-applied with `gflex vlimit set` afterwards.", label, pages)
 	return d
 }
 
@@ -405,6 +453,26 @@ func CheckRawFrame(f proto.Frame) Decision {
 			"the value you sent, one of CMD_CURRENT_LIMIT_MA with the value the device kept, and "+
 			"neither was stored (SPEC.md §14.4)")
 	}
+	// A frame that is neither a read nor a write by the definitions of SPEC.md
+	// §5.1: the write flag is clear, so it is not a write, and a read is always
+	// the bare 2-byte frame [0x02, code], so a payload makes it no read either.
+	// `04 12 2e e0` is precisely what `04 92 2e e0` becomes when the 0x80 is
+	// dropped, which is the likeliest typo anyone types here, and what the
+	// firmware does with the shape is unmeasured -- not "nothing", because it
+	// demonstrably parses a payload on at least one flag-clear frame: the PDO
+	// chunk read `03 11 kk` (SPEC.md §6.1). A length-keyed parser is therefore
+	// not ruled out, and §13.10's promise is about a plain documented READ.
+	//
+	// That same chunk read is why CMD_PDO_LOG is excluded rather than the rule
+	// being written more loosely: it is a documented read that carries a
+	// payload, and §13.10 requires it to pass silently. An unknown or
+	// undocumented code is excluded too, because it already has its own, more
+	// specific reason above and two overlapping ones say less than one.
+	if !f.Write && len(f.Payload) > 0 && f.Cmd != proto.CmdPDOLog &&
+		f.Cmd.Known() && !f.Cmd.Undocumented() {
+		reasons = append(reasons, "the write flag is clear but the frame carries a payload; a read is "+
+			"the bare 2-byte frame (SPEC.md §5.1) and what the firmware does with this shape is unmeasured")
+	}
 	// Some commands are disruptive with no write flag set, so the checks above
 	// miss them entirely. `raw 02 14` is the clearest case: a plain read frame,
 	// a documented command code, and it drops the device off the bus into the
@@ -418,9 +486,12 @@ func CheckRawFrame(f proto.Frame) Decision {
 		reasons = append(reasons, fmt.Sprintf(
 			"%s is a bootloader command; in application mode its effect is undefined", f.Cmd))
 	case proto.CmdVoltageMv:
-		if f.Write {
+		if f.Write || len(f.Payload) > 0 {
 			// Worth saying plainly: this is the one path to the rail that the
-			// interlocks of SPEC.md §13 do not police.
+			// interlocks of SPEC.md §13 do not police. A payload with the write
+			// flag clear says it too, and names the rail rather than only the
+			// odd shape: if the firmware keys on the length rather than the
+			// flag, `04 12 bb 80` is 48 V.
 			reasons = append(reasons, "this writes the output voltage directly, bypassing every "+
 				"range check in `gflex voltage set` -- the value is not compared against the "+
 				"unit's limit window or the hardware envelope")

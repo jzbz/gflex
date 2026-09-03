@@ -986,6 +986,7 @@ report the index.
 **Augmented (type 3),** `subtype = (pdo >> 28) & 3`:
 ```
 0 SPR_PPS:  maxV = 0.1*((pdo>>17)&0xFF)   minV = 0.1*((pdo>>8)&0xFF)   maxI = 0.05*(pdo&0x7F)
+            powerLimited = (pdo>>27)&1    // VENDOR-LIB does not decode it; USB-PD "PPS Power Limited"
 1 EPR_AVS:  maxV = 0.1*((pdo>>17)&0x1FF)  minV = 0.1*((pdo>>8)&0xFF)   pdpW = pdo&0xFF
 2 SPR_AVS:  maxI20V = 0.01*((pdo>>10)&0x3FF)   maxI15V = 0.01*(pdo&0x3FF)
 3        :  ignored
@@ -1021,6 +1022,7 @@ winning:
 | Fixed `eprCapable`, `peakCurrent` | bits 23 and 21:20 | same | Agreed, so both are decoded. |
 | Fixed flags, bits 24-29 | six named bits | not decoded | Neither. They disagree with USB-PD; §14.18. |
 | Battery, Variable PDOs | discarded | decoded and reported | **Here**, as with the shipped app (§17). |
+| SPR PPS bit 27 | not decoded | decoded as `powerLimited`, and the current bounded by an inferred PDP | **Here.** The power rules make a power-limited PPS range the norm: a 45 W source advertises 3.3-11 V at 5 A. Crediting it with 5 A at 11 V over-reports by 22% on an ordinary charger. A PPS APDO with `powerLimited` set does not hold `maxI` across its range — the current available at Vout is `min(maxI, PDP/Vout)`. The PDP travels in Source_Capabilities_Extended, which this blob does not contain (§9.3), so it is inferred from the fixed PDOs and disclosed as inferred wherever a verdict rests on it. |
 
 ### 9.5 Compatibility check (worth reimplementing offline)
 
@@ -1120,6 +1122,9 @@ Fetched *after* the device is already in bootloader mode, over a WebSocket:
 - Production: `wss://vflex-nestjs-prod-ylaqjkd4na-uc.a.run.app/bootloader`
   (derived from the REST API URL; the `wss://api.vflex.app/bootloader` constant is a fallback)
 - Client sends the **plain serial-number string** on open; the server replies with one JSON blob.
+  That is now enforced: a reply whose first non-whitespace byte is neither `{` nor `[` is refused rather
+  than read as a raw `.bin` (§10.2), which would otherwise turn a plain-text answer into a one-page image
+  of the error text.
 - Schema, as **inferred** from the client bundle: `{ app_bin | app_bin_data | firmware: <array of
   pages>, app_version: string, crc: <u8> }`
 - Schema, as **measured** against the production endpoint on 2026-08-21 for serial `58b4f621`
@@ -1138,7 +1143,8 @@ Fetched *after* the device is already in bootloader mode, over a WebSocket:
   `app_version`. The implementation read a non-`[`, non-`"` first element as a flat array of byte
   values, so `--fetch` failed against the real service with *"cannot unmarshal object into Go value
   of type json.Number"* -- meaning that path had never worked. It now accepts this shape, orders
-  pages by `pg_id` and refuses a chunk map that is short, gappy or duplicated, because a wrongly
+  pages by `pg_id`, refuses a payload that states `pg_id` on some pages but not others, and refuses a
+  chunk map that is short, gappy or duplicated, because a wrongly
   assembled image can flash and even verify cleanly: the device computes the CRC over whatever it
   was given.
 - 15000 ms timeout. **No HTTP fallback and no local `.bin` path exist in the client.**
@@ -1222,6 +1228,10 @@ gflex firmware  version
                                          pages of n bytes; only a raw .bin has no
                                          page split of its own (§10.2)
 gflex raw <hex…> [--no-ack] [--any-length]   send a frame verbatim, print the response
+                                             (a frame past the 64-byte receive ceiling of §3.3 is
+                                              refused before any device is opened; --no-ack sends
+                                              it anyway, fire-and-forget, with a warning that the
+                                              device's receive machine will drop it)
 gflex monitor [--for <d>]                decode and print live inbound frames
 gflex install-udev [--print]             write the rule, reload, report
 gflex version
@@ -1237,6 +1247,13 @@ asked for no pacing at all; and near-zero pacing is the one setting §14.15 meas
 dropped 2.5% and 3.3% of responses on the two units tested, while 100 µs was no faster than the 1 ms
 default end to end. The error says that rather than naming a faster value to try.
 
+**`--port` overrides identification, not file type.** A value beginning with `/` is a device node
+path and must name a **character device**. The flag is the way to say "yes, that one, I mean it"
+past the vendor ID, the name substring and the sole-port fallback (§3.4) -- but not past the kind
+of file: without the check a stale `GFLEX_PORT` or a mistyped path was opened `O_RDWR` and the
+first frame written into whatever it named. A path that does not exist is still left to the
+transport, so the missing-node and permission errors are unchanged.
+
 **There is no global `--force`.** An earlier draft of this section listed one alongside `--yes`,
 and it was dropped deliberately: `--force` already means something specific and narrow on
 `firmware flash` — *this image carries no CRC, flash it unverified* — and a persistent flag of the
@@ -1246,7 +1263,9 @@ interactive answer instead; the one place that needs a second, differently-named
 `--ignore-device-limits`, which nobody passes out of habit.
 
 Output: human-readable by default; `--json` emits a stable flat object using the §8 field names in
-**native wire units** (millivolts, milliamps). Never convert units in the data path. Exit codes are
+**native wire units** (millivolts, milliamps), plus `read_back`: a boolean the setting commands emit
+beside a written value, true when the value shown is the device's own read-back and false when it is
+only what was written. Never convert units in the data path. Exit codes are
 distinct per failure class: 0 success, 1 generic failure, 2 usage, 3 no device, 4 EBUSY, 5 timeout,
 6 permission denied, 7 refused-by-interlock. There is deliberately no "ACK mismatch" code — a
 mismatched response leaves the wait pending (§5.2), so it surfaces as a timeout and nothing else.
@@ -1323,7 +1342,8 @@ a device.
   entries pin what it must *drop*.
 - **Fake device** — `fake.Device` speaks the real wire protocol over an in-memory pipe, decoding the
   MIDI stream with a **deliberately independent** implementation of the §3.3 receive state machine,
-  so a bug in the encoder cannot hide behind a matching bug in the decoder. Round-trip every typed
+  so a bug in the encoder cannot hide behind a matching bug in the decoder; `fake.TestCodecsAgreeOnEveryByte`
+  feeds each implementation's output to the other for all 256 byte values, in both directions. Round-trip every typed
   accessor.
 - **RX state machine** must have explicit tests for: mid-frame SOF resetting the buffer; >64 bytes
   truncating without aborting; `declaredLen` of 0, 1, >64, or > buffered, all dropped; a `Read()`
@@ -1398,7 +1418,11 @@ one interlock that needs a second key uses a self-describing name rather than a 
    LED means exactly that.
 10. **`gflex raw`** — the escape hatch is guarded too, which nothing above anticipated. A read of a
     documented command is harmless and passes silently; a write frame, an undocumented command code
-    (§14.5), a code outside the table, or the scratchpad flag (§5.1) each names itself and confirms.
+    (§14.5), a code outside the table, the scratchpad flag (§5.1), or a frame that is neither a read nor a
+    write -- the write flag clear and a payload present, which §5.1's definition of a read excludes
+    (`04 12 2E E0`, the 0x80-less typo of a voltage write) -- each names itself and confirms.
+    `CMD_PDO_LOG`'s chunk read `03 11 kk` (§6.1) is the one flag-clear frame that carries a payload and is
+    still a documented read, so it passes silently.
     Three cases warn on their own: `CMD_JUMP_APP_TO_BOOTLOADER`, which is a plain *read* frame that
     drops the device off the bus where no other command can reach it; a bootloader command sent in
     application mode; and a raw write of `CMD_VOLTAGE_MV`, which is the one path to the rail that
@@ -1760,6 +1784,13 @@ mechanism and there is nothing a test could hold still.
 | 8, 6.2 | `--json` field `led_disable_during_operation`, u8, inverted | `led_always_on`, bool, already un-inverted | §6.2 warns that the wire name gets read backwards; a JSON key meaning the opposite of what it says is that trap in machine-readable form. A consumer reading the vendor's name and honouring it would invert the setting. |
 | 3.4 | Fall back to the only MIDI port on the system, whatever it is | Fallback refused when discovery has positively identified the port as some **other** vendor's | Discovery walks sysfs for every port, so a non-zero vendor ID that is not Tundra Labs' is knowledge, not ignorance. The fallback exists for "the tool cannot tell what this is", which is not the same as "the tool can tell, and it is a synthesizer" — and taking it would start writing protocol frames at that synthesizer. `--port` still says "yes, that one, I mean it". |
 | 10.3 | `--fetch` over whatever URL it is given; the vendor client has no scheme rule | `ws://` and `http://` refused; TLS required, or the explicit `ws+insecure://` downgrade | The image and the CRC it is checked against arrive in the same document, so a cleartext fetch authenticates neither. The downgrade is spelled out in full for the same reason as `--ignore-device-limits` (§11): a second key nobody types out of habit, left in the shell history of the run it applied to. |
+| 5.2, 7 | A write that goes unanswered is reported as a failed command | Marked `session.ErrUnacknowledged` when the frame was fully transmitted and the wait then timed out or was cancelled; the write commands say so and `voltage set` follows with one read-back | There is no NACK, so a lost echo and a lost command are the same error, and the device acts on any complete frame it receives. "The write failed" can therefore mean a rail live at the new value — the one thing §6.5's read-back rule exists to prevent. A failed *send* is excluded and still returned directly: there the frame was truncated mid-message and demonstrably did not land, so the same warning would be a false alarm on the one message that has to stay trustworthy. |
+| 5.2 | Send failures carry no classification | `PermanentErr` also treats `ENODEV`, `ENXIO`, `ESHUTDOWN` and `os.ErrClosed` from a failed send as permanent | An unplug landing between commands fails the next *write*, not a wait, so none of the receive-side sentinels appear. Without this `info --all` returns a report full of nil fields and exit 0, and the PDO chunk retry and the scan's serial re-read spend their whole budgets on a link that is gone. A usbfs transfer `ETIMEDOUT` is deliberately not in the set: that is a device still on the bus declining to answer. |
+| 10.4 | An unreadable vlimit read-back counts as invalid, so the defaults are rewritten | Retried three times 300 ms apart; a window that still cannot be read is left exactly as the flash left it, and reported as a step that did not take | The protocol has no NACK, so a dropped frame is routine (§5.2), and rewriting on one widens a 5 V ceiling to 48 V — the fallback this table's first row already refuses for `voltage set`. A window an erase really did wipe cannot bound anything, so the next `voltage set` refuses it (§13.1) rather than falling back to the envelope. |
+| 9.4 | SPR PPS bit 27 ("PPS Power Limited") ignored; the APDO's Maximum Current is credited at every voltage | Bit 27 decoded; a power-limited range is bounded by the source's SPR power budget, inferred from its fixed PDOs, and every verdict resting on it discloses that the bound is inferred rather than scanned | A 45 W charger's 3.3-11 V / 5 A range supplies 4.09 A at 11 V. The PDP itself is in Source_Capabilities_Extended, which the scan never captures (§9.3), so the inference is disclosed the way the assumed SPR AVS range is — and declined outright where only the mandatory 5 V object exists to infer from. |
+| 9.4 | Derived currents rounded to nearest, like decoded ones | Currents obtained by division (EPR AVS PDP/V, a power-limited PPS budget/V) are floored to the 10 mA wire step | Rounding a quotient to nearest moves it *up* by up to 5 mA, and the figure is what the verdict compares the request against: 140 W at 36 V is 3.8889 A and was answered "yes" to a request for 3.89 A. |
+| 9.5 | An object is considered only where nothing in the requested voltage's own range class covers it | Any object whose decoded range covers the request is considered even when a weaker one already does, and the verdict upgrades where the weaker one is short | The rule was half applied: a 140 W charger advertising fixed 15 V 3 A beside an EPR AVS 15.0–28.0 V range answered "no, 3.00 A" at 15 V and "yes, 5.00 A" at 18 V from one and the same scan. |
+| 9.5 | An SPR-range refusal is explained purely in terms of fixed/PPS/SPR AVS objects | A refusal at 15 V or above also carries the recorded EPR cable failure, as the EPR-range refusal already did | An EPR AVS range starts at 15 V and is exactly what a cable that could not enter EPR would have hidden. Gated at 15 V: below it no EPR AVS object could have covered the request, so the fault explains nothing. |
 
 ### Resolved since this document was written
 

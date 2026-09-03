@@ -22,13 +22,23 @@ var ErrReaderStuck = errors.New("framer: the reader goroutine did not exit")
 // most 64 bytes, i.e. 198 MIDI bytes, so this comfortably holds several.
 const readBufSize = 512
 
-// idleBackoff is how long readLoop waits after a transport reports that no
-// bytes are available, so that a transport whose "nothing yet" is instant
-// cannot spin the CPU. Only usbmidi reaches it, and only for a zero-length or
-// padding-only IN transfer; its ordinary quiet case is a 100 ms transfer
-// timeout. On the default rawmidi transport the branch is unreachable
-// altogether: the node is opened O_NONBLOCK so the read parks in the netpoller,
-// and a zero-byte read from an os.File surfaces as io.EOF, never as (0, nil).
+// idleBackoff is the minimum time readLoop lets pass between two ReadMIDI calls
+// that report no bytes, so that a transport whose "nothing yet" is instant
+// cannot spin the CPU. Only usbmidi reaches it. On the default rawmidi transport
+// the branch is unreachable altogether: the node is opened O_NONBLOCK so the
+// read parks in the netpoller, and a zero-byte read from an os.File surfaces as
+// io.EOF, never as (0, nil).
+//
+// It is a floor on the interval, not a delay added to every quiet read, and the
+// distinction is the whole point. usbmidi reports an IN-transfer timeout as
+// (0, nil) rather than as an error, because an IN endpoint on a half-duplex
+// request/response device is idle almost all the time -- so the ordinary quiet
+// case arrives here having *already* blocked for the transfer timeout, which is
+// two orders of magnitude longer than this. Sleeping again on top of it would
+// delay the next poll for no benefit: the CPU was not spinning, it was parked in
+// the kernel. Only the instant cases -- a zero-length IN packet, or a transfer
+// carrying nothing but padding -- need holding back, so readLoop waits out the
+// remainder of the interval and nothing more.
 //
 // It is not free when it does fire, and it is no longer small next to the
 // pacing. The device does not pace what it sends: SPEC.md §14 Q15's timings put
@@ -235,6 +245,7 @@ func (f *Framer) readLoop() {
 
 	buf := make([]byte, readBufSize)
 	for {
+		start := time.Now()
 		n, err := f.t.ReadMIDI(buf)
 		if n > 0 {
 			// A read can end mid-message; the decoder keeps the state.
@@ -262,15 +273,25 @@ func (f *Framer) readLoop() {
 			// A transport may legitimately return (0, nil) to mean "nothing
 			// available right now" -- usbmidi does, for a zero-length IN packet
 			// or a transfer carrying only padding, both of which complete
-			// instantly. Re-entering ReadMIDI immediately would pin a core
-			// issuing ioctls for as long as the device stays quiet. The wait
-			// can delay a reply by up to idleBackoff -- the device does not
-			// pace what it sends (SPEC.md §14 Q15) -- but only once per
-			// arrival edge; see idleBackoff for why that is cheap.
-			select {
-			case <-f.done:
-				return
-			case <-time.After(idleBackoff):
+			// instantly, and also for an IN-transfer timeout, which does not.
+			// Re-entering ReadMIDI immediately after one of the instant cases
+			// would pin a core issuing ioctls for as long as the device stays
+			// quiet, so the poll interval is floored at idleBackoff -- but the
+			// call has already served that floor itself whenever it blocked, so
+			// only the remainder is waited out. A timed-out transfer therefore
+			// costs nothing here, and the next poll goes out at once.
+			//
+			// The device does not pace what it sends (SPEC.md §14 Q15), so a
+			// reply can be waiting the moment a quiet read returns; delaying
+			// only the instant cases is what keeps that from costing latency.
+			if left := idleBackoff - time.Since(start); left > 0 {
+				timer := time.NewTimer(left)
+				select {
+				case <-f.done:
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 			}
 			continue
 		}

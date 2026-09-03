@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strconv"
 	"time"
 	"unsafe"
 )
@@ -61,14 +62,32 @@ func (d *Device) Configuration(ctx context.Context) (uint8, error) {
 
 // sysfsConfiguration reads bConfigurationValue from the device's sysfs
 // directory. The attribute is world-readable and exists for every USB device,
-// so the only reasons this fails are a DeviceRef built without a SysPath and a
-// device that was unplugged between enumeration and now.
+// so the only reasons the file cannot be read are a DeviceRef built without a
+// SysPath and a device that was unplugged between enumeration and now.
+//
+// Existing and being populated are two different things, and the difference is
+// the whole unconfigured case. bConfigurationValue_show is generated from
+// usb_actconfig_show (drivers/usb/core/sysfs.c), which emits nothing at all when
+// udev->actconfig is NULL, so a device the kernel never configured renders as a
+// zero-byte file rather than as "0" -- and strconv would then reject it, sending
+// the one device EnsureConfigured exists for (SPEC.md §10.1 phase 2) down the
+// GET_CONFIGURATION fallback that a minimal bootloader is apt to stall. An empty
+// read is therefore a definite 0, and only an unreadable or unparseable
+// attribute is "cannot tell". A literal "0" is still accepted: it costs nothing
+// and nothing guarantees every renderer of this attribute stays silent.
 func (d *Device) sysfsConfiguration() (uint8, bool) {
 	if d.ref.SysPath == "" {
 		return 0, false
 	}
-	v, ok := readIntAttr(d.ref.SysPath, "bConfigurationValue")
-	if !ok || v < 0 || v > 255 {
+	s, ok := readAttr(d.ref.SysPath, "bConfigurationValue")
+	if !ok {
+		return 0, false
+	}
+	if s == "" {
+		return 0, true
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 || v > 255 {
 		return 0, false
 	}
 	return uint8(v), true

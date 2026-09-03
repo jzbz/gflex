@@ -15,7 +15,15 @@ import (
 // pdoChunks is the number of 8-byte chunks the vendor client requests to cover
 // the 90-byte log (SPEC.md §9.1). Twelve chunks yield 96 bytes; the first 90
 // are the log.
-const pdoChunks = 12
+//
+// Defined in terms of the download rather than restated as 12, because this
+// name drives the --dry-run listing and the progress denominator while
+// session.FullPDOLog drives what the device is actually asked. Interlock 8 of
+// SPEC.md §13 requires the listing to be the exact frames the command sends, and
+// two independent 12s cannot hold that: `info` had precisely this drift, which
+// is what TestInfoDryRunMatchesWhatInfoSends exists to prevent. Here the
+// equality is held by construction instead.
+const pdoChunks = session.PDOChunkCount
 
 // requirePDOFirmware applies the hard gate SPEC.md §9 puts on the capture log:
 // it exists only on firmware 5.0.0 and newer, and the vendor app refuses
@@ -358,6 +366,25 @@ func pdoCurrent(p pdo.PDO) string {
 		// what the source can deliver.
 		return fmt.Sprintf("%s A @15V / %s A @20V%s",
 			trimFloat(p.MaxCurrent15VA, 2), trimFloat(p.MaxCurrent20VA, 2), pdoDeclaredNote(p))
+	case pdo.KindPPS:
+		// A PPS APDO that sets the Power Limited bit cannot hold its Maximum
+		// Current across its range: at Vout the source supplies
+		// min(maxI, PDP/Vout), which PDO.CurrentAt applies and a verdict
+		// therefore reports. The table would otherwise show the advertised
+		// figure unqualified and disagree with the verdict beneath it -- and it
+		// is the advertised figure that is optimistic, so the disagreement
+		// would read the wrong way round. The budget is inferred from the
+		// source's fixed PDOs rather than scanned (SPEC.md §9.4), so the note
+		// says which case it is.
+		cur := fmt.Sprintf("%s A%s", trimFloat(p.MaxCurrentA, 2), pdoDeclaredNote(p))
+		switch {
+		case !p.PPSPowerLimited:
+			return cur
+		case p.PPSBudgetW > 0:
+			return fmt.Sprintf("%s [power limited; source budget ~%d W]", cur, p.PPSBudgetW)
+		default:
+			return cur + " [power limited; source budget unknown]"
+		}
 	case pdo.KindUnknown:
 		return "-"
 	default:

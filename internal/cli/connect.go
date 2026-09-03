@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,14 +52,28 @@ func (c *conn) Close() error {
 		return nil
 	}
 	err := c.Session.Close()
-	if err != nil && c.stderr != nil && errors.Is(err, usbfs.ErrDriverNotRebound) {
-		fmt.Fprintf(c.stderr,
-			"warning: the kernel driver this process detached to claim the device did not rebind.\n"+
-				"  The ALSA MIDI port is gone until the device is unplugged and plugged back in, so\n"+
-				"  commands without --transport usb will not find it (SPEC.md §4.2).\n"+
-				"  %v\n", err)
-	}
+	warnDriverNotRebound(c.stderr, err)
 	return err
+}
+
+// warnDriverNotRebound prints the rebind warning for a close error that carries
+// usbfs.ErrDriverNotRebound, and says nothing for anything else.
+//
+// It is a free function rather than part of conn.Close because `monitor` does
+// not build a conn: it drives the framer directly and closes it with the
+// transport underneath, so on --transport usb it could detach snd-usb-audio,
+// fail to get it back and say nothing at all -- the one outcome conn.Close
+// exists to report. Two call sites, one wording: a warning about a device the
+// user now has to unplug is not a sentence to keep two copies of.
+func warnDriverNotRebound(w io.Writer, err error) {
+	if err == nil || w == nil || !errors.Is(err, usbfs.ErrDriverNotRebound) {
+		return
+	}
+	fmt.Fprintf(w,
+		"warning: the kernel driver this process detached to claim the device did not rebind.\n"+
+			"  The ALSA MIDI port is gone until the device is unplugged and plugged back in, so\n"+
+			"  commands without --transport usb will not find it (SPEC.md §4.2).\n"+
+			"  %v\n", err)
 }
 
 // connect resolves the transport, builds a session and returns it ready to use.
@@ -116,6 +131,11 @@ func (a *App) openTransport(ctx context.Context) (proto.Transport, string, error
 	// timeouts, the tracer, the interlocks the commands run first -- is the
 	// real thing under test.
 	if a.testTransport != nil {
+		// The seam stands in for the ordinary case: a rawmidi port identified
+		// by the vendor ID. Recording that here rather than in each test keeps
+		// midiPresenceMeaningful answering as it does in production, and a test
+		// that wants one of §3.4's weaker tiers clears the field itself.
+		a.midiPortVIDConfirmed = a.Transport != transportUSB
 		return a.testTransport(ctx)
 	}
 	switch a.Transport {
@@ -134,19 +154,123 @@ func (a *App) openTransport(ctx context.Context) (proto.Transport, string, error
 // case-insensitive "vflex" substring match (SPEC.md §3.4).
 func (a *App) openRawMIDI(ctx context.Context) (proto.Transport, string, error) {
 	if strings.HasPrefix(a.Port, "/") {
-		t, err := rawmidi.Open(a.Port)
+		// --port says "yes, that one, I mean it" about IDENTIFICATION -- it
+		// overrides the vendor ID, the name match and the sole-port fallback
+		// alike (SPEC.md §3.4). It does not say the path is a device node, and
+		// nothing else asks: rawmidi.Open is a plain O_RDWR open, so a regular
+		// file named by mistake -- a stale GFLEX_PORT, a shell completion that
+		// landed beside the node -- is opened and then WRITTEN to. The framer's
+		// first SendFrame stamps MIDI messages over the start of the file and
+		// the reader's EOF tears the session down a moment later, with nothing
+		// on stderr saying the file was modified. Every other path into this
+		// package refuses to write frames at something it cannot identify or
+		// warns loudly first; this is that guard for the one path that skips
+		// discovery entirely.
+		//
+		// Only a positive answer refuses. A path that does not exist falls
+		// through untouched, so rawmidi.Open keeps classifying ENOENT and EACCES
+		// the way it does today.
+		if fi, serr := os.Stat(a.Port); serr == nil && fi.Mode()&os.ModeCharDevice == 0 {
+			return nil, "", codedf(ExitUsage,
+				"--port %s is not a character device; expected an ALSA rawmidi node such as "+
+					"/dev/snd/midiC1D0 (see gflex devices)", a.Port)
+		}
+		t, err := openWaitingForACL(ctx, func() (proto.Transport, error) {
+			p, oerr := rawmidi.Open(a.Port)
+			if oerr != nil {
+				return nil, oerr
+			}
+			return p, nil
+		})
 		if err != nil {
 			return nil, "", a.transportError(ctx, fmt.Errorf("opening %s: %w", a.Port, err))
 		}
-		return t, a.Port, nil
+		// --port skips discovery, so nothing has yet said what this node is.
+		// Ask afterwards, best effort: it is the difference between "port
+		// /dev/snd/midiC1D0" and a line naming the card and vendor, and it is
+		// also what tells midiPresenceMeaningful whether rawmidi.Discover will
+		// recognise this unit again (SPEC.md §3.4). A failure here changes
+		// nothing -- the port is already open and the user asserted it.
+		desc := a.Port
+		if ports, derr := rawmidi.Discover(); derr == nil {
+			for _, p := range ports {
+				if p.Path == a.Port {
+					a.midiPortVIDConfirmed = p.VendorID == proto.VendorID
+					desc = describePort(p)
+					break
+				}
+			}
+		}
+		return t, desc, nil
 	}
-	t, info, err := rawmidi.OpenAuto(a.Port)
+	var info rawmidi.PortInfo
+	t, err := openWaitingForACL(ctx, func() (proto.Transport, error) {
+		p, i, oerr := rawmidi.OpenAuto(a.Port)
+		info = i
+		if oerr != nil {
+			return nil, oerr
+		}
+		return p, nil
+	})
 	if err != nil {
 		return nil, "", a.transportError(ctx, err)
 	}
 	a.warnSolePortFallback(info)
 	a.warnNameOnlyMatch(info)
+	// Only the vendor ID carries over to rawmidi.Discover; the name match and
+	// the sole-port fallback are tiers of this selection alone. See
+	// midiPresenceMeaningful.
+	a.midiPortVIDConfirmed = info.VendorID == proto.VendorID
 	return t, describePort(info), nil
+}
+
+// The window openWaitingForACL waits out, and how often it looks.
+const (
+	rawmidiACLGrace = time.Second
+	rawmidiACLPoll  = 100 * time.Millisecond
+)
+
+// openWaitingForACL runs open, retrying a permission failure for a short
+// bounded grace.
+//
+// devtmpfs creates /dev/snd/midiC*D* when the device registers; systemd-udevd
+// applies the uaccess ACL that makes it readable by the seat user some
+// milliseconds later. On a systemd host that ACL is the whole of the access
+// (the shipped rule leaves its SUBSYSTEM=="sound" line commented out, SPEC.md
+// §4.4), so anything that opens the node the instant it appears races it.
+// `scan --no-prompt` does exactly that: it polls presence every 250 ms and
+// reconnects on the first positive with no human delay in between, and so does
+// the reconnect after a firmware flash. Losing the race costs a capture whose
+// log has already been erased -- another walk to the charger (SPEC.md §9.2) --
+// and reports it as EACCES, whose hint sends the user to install a udev rule
+// they already have.
+//
+// Only EACCES/EPERM is retried, and deliberately not ENOENT: outside the replug
+// window a missing node is the ordinary no-device case, by far the commonest
+// failure this tool has, and making every one of those wait a second to fix the
+// rarest is the wrong trade. Once the grace expires the error is returned
+// unchanged, so transportError classifies it exactly as before.
+func openWaitingForACL(ctx context.Context, open func() (proto.Transport, error)) (proto.Transport, error) {
+	deadline := time.Now().Add(rawmidiACLGrace)
+	for {
+		t, err := open()
+		if err == nil || !isPermissionDenied(err) || !time.Now().Before(deadline) {
+			return t, err
+		}
+		select {
+		case <-ctx.Done():
+			// The open error, not ctx.Err(): the caller classifies what it is
+			// given, and "permission denied" is what actually happened.
+			return nil, err
+		case <-time.After(rawmidiACLPoll):
+		}
+	}
+}
+
+// isPermissionDenied reports whether err is the kernel refusing an open for lack
+// of permission, in any of the three shapes the layers below produce it.
+func isPermissionDenied(err error) bool {
+	return errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
 }
 
 // warnNameOnlyMatch tells the user when the port was identified as a VFLEX by
@@ -303,9 +427,19 @@ func matchesUSBPort(ref usbfs.DeviceRef, port string) bool {
 // guidance that actually resolves it.
 func (a *App) transportError(ctx context.Context, err error) error {
 	switch {
+	case errors.Is(err, syscall.EBUSY) && a.Transport == transportUSB:
+		// EBUSY means something different on each transport, and the generic
+		// ExitBusy guidance is written for the other one: it explains ALSA's
+		// per-direction exclusivity, points at /proc/asound/seq/clients, and
+		// ends by recommending --transport usb -- which is the transport this
+		// run is already on. Here the errno comes from USBDEVFS_DISCONNECT_CLAIM
+		// with another usbfs holder in the way (a second `gflex --transport usb`,
+		// or a WebUSB tab), and the usbfs error already carries its own
+		// remediation, so the hint is suppressed rather than replaced.
+		return codedSelfExplanatory(ExitBusy, "the USB interface is already claimed by another process: %w", err)
 	case errors.Is(err, syscall.EBUSY):
 		return coded(ExitBusy, fmt.Errorf("the device node is already open: %w", err))
-	case errors.Is(err, fs.ErrPermission), errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+	case isPermissionDenied(err):
 		return coded(ExitPermission, err)
 	}
 	return codedf(ExitNoDevice, "%v\n%s", err, a.searchReport(ctx))

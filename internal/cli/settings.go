@@ -27,6 +27,71 @@ func (a *App) applyDryRun(f Formatter, d Decision) error {
 	return nil
 }
 
+// warnUnacknowledged prints the advisory a transmitted-but-unanswered write
+// needs, when err is one. what names the frame; readBack is the command that
+// settles the question.
+//
+// session.ErrUnacknowledged means the whole frame left the host -- the
+// end-of-frame marker included -- and nothing came back. This protocol has no
+// NACK (SPEC.md §5.2), so a complete frame is acted on whether or not the host
+// is still listening for the echo: the device may be holding the new value
+// right now, and what it holds is non-volatile, so nothing takes it back.
+// Reporting only "setting output voltage: ..." tells the user the old value
+// still stands and invites them to wire up accordingly, which is the mistake
+// ErrReadBack exists to prevent, one round trip earlier and with less known.
+//
+// It goes out through Diag, at the point of failure, rather than being folded
+// into the returned error, because the error text does not always reach the
+// user: Formatter.Flush never runs on a failing command, and Execute prints
+// nothing but "gflex: interrupted" for anything chained to context.Canceled
+// (root.go) -- which is precisely the Ctrl-C-during-the-write case this is for.
+//
+// A write whose SEND failed gets nothing. The sentinel is deliberately not
+// attached there: the frame stopped at the message that could not be written,
+// so it is truncated and the device's receive state machine drops it (SPEC.md
+// §3.3). Warning that the rail may have moved would be a false alarm on the one
+// message that has to stay trustworthy.
+//
+// Called from the four writes a safety interlock depends on: the rail itself,
+// the window interlock 1 checks it against, the calibration that window's
+// evidence comes from, and the auth lock, whose levels may not be reversible
+// (SPEC.md §13, §6.3). `current set` and `tolerance set` write non-volatile
+// memory too, but neither value can move a rail, and each is either read back
+// or labelled as unverified where that matters.
+func warnUnacknowledged(f Formatter, err error, what, readBack string) {
+	if !errors.Is(err, session.ErrUnacknowledged) {
+		return
+	}
+	f.Diag("warning: the %s frame was transmitted in full and went unanswered, so the device may "+
+		"have applied it; what it holds is non-volatile and nothing takes it back. Check with `%s` "+
+		"before relying on the previous value", what, readBack)
+}
+
+// calibrateSuffix labels a calibration term as written or as kept: `calibrate
+// adc --offset 5` leaves the scale exactly where it was, and printing it with
+// the same "(written)" annotation as the offset would claim a write that never
+// happened (SPEC.md §17).
+func calibrateSuffix(written bool) string {
+	if written {
+		return "  (written)"
+	}
+	return "  (unchanged)"
+}
+
+// emitReadBack records whether the value printed beside it is the device's
+// answer or only what was asked for.
+//
+// JSON-only by construction: an entry with neither a label nor a display string
+// is skipped by the human formatter (output.go), which already says this in
+// words -- "(written, not read back)". The machine-readable half was missing
+// entirely, so `voltage set --json` emitted the same voltage_mv field for a
+// verified read-back and for a write whose read-back never came, and a script
+// had no way to tell them apart. Emitted on the confirmed paths too: a field
+// that appears only on failure is one nothing thinks to look for.
+func emitReadBack(f Formatter, verified bool) {
+	f.KV("read_back", "", verified, "")
+}
+
 // ---------------------------------------------------------------------------
 // voltage
 // ---------------------------------------------------------------------------
@@ -80,18 +145,44 @@ func newVoltageCommand(app *App) *cobra.Command {
 					return err
 				}
 				if app.DryRun {
-					// No device is opened, so the window genuinely cannot be
-					// read. Judge the value against the hardware envelope and
-					// the 16-bit wrap check alone rather than refusing for a
-					// limit read that was never going to happen.
-					if err := app.applyDryRun(f, CheckVoltage(VoltageRequest{Mv: mv, IgnoreDeviceLimits: true})); err != nil {
+					// No device is opened, so the window is not read at all.
+					// Judge the value against the hardware envelope and the
+					// 16-bit wrap check alone rather than refusing for a limit
+					// read that was never going to happen -- and say that, not
+					// "could not be read", which describes a failure that did
+					// not occur (LimitsNotAttempted).
+					if err := app.applyDryRun(f, CheckVoltage(VoltageRequest{Mv: mv, Limits: LimitsNotAttempted})); err != nil {
 						return err
 					}
 					frame, err := proto.Write(proto.CmdVoltageMv, proto.EncodeU16(uint16(mv)))
 					if err != nil {
 						return err
 					}
-					return app.dryRun(f, frame)
+					// The whole exchange, not just the dangerous frame:
+					// interlock 8 (SPEC.md §13.8) promises the frames a command
+					// would send, and this one reads the window first (interlock
+					// 1) and reads the voltage back afterwards. Both are
+					// constants, so nothing stands in the way of listing them.
+					//
+					// One approximation, the same one `info` documents: the
+					// read-back carries session.VoltageMv's ready-retry, so a
+					// unit answering 0 mV is asked more than once. The listing
+					// shows the healthy case.
+					return app.dryRun(f,
+						proto.Read(proto.CmdUserVLimit),
+						frame,
+						proto.Read(proto.CmdVoltageMv))
+				}
+
+				// What the argument alone already settles is settled before a
+				// device is opened: 60 V cannot become acceptable whatever
+				// window the unit reports, and making someone find a device
+				// first only to be told the number was never in range is a
+				// worse answer as well as a slower one. Refusals only -- the
+				// warnings belong to the full check below, which knows the
+				// window, and printing them twice would be its own defect.
+				if d := CheckVoltage(VoltageRequest{Mv: mv, Limits: LimitsNotAttempted}); !d.OK() {
+					return refused(d.Refused)
 				}
 
 				c, err := app.connect(ctx, f)
@@ -127,12 +218,15 @@ func newVoltageCommand(app *App) *cobra.Command {
 					f.Diag("warning: %v", err)
 					f.KV("voltage_mv", "output voltage", uint16(mv),
 						formatMv(uint16(mv))+"  (written and acknowledged, not read back)")
+					emitReadBack(f, false)
 					return nil
 				}
 				if err != nil {
+					warnUnacknowledged(f, err, "output voltage write", "gflex voltage get")
 					return fmt.Errorf("setting output voltage: %w", err)
 				}
 				f.KV("voltage_mv", "output voltage", readback, formatMv(readback))
+				emitReadBack(f, true)
 				if int(readback) != mv {
 					f.Diag("warning: read back %d mV after writing %d mV", readback, mv)
 				}
@@ -202,7 +296,9 @@ func newCurrentCommand(app *App) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					return app.dryRun(f, frame)
+					// The read-back is part of what this command sends
+					// (SPEC.md §6.5, §13.8), and it is a constant.
+					return app.dryRun(f, frame, proto.Read(proto.CmdCurrentLimitMa))
 				}
 				if err := app.apply(ctx, f, d); err != nil {
 					return err
@@ -219,9 +315,18 @@ func newCurrentCommand(app *App) *cobra.Command {
 				if err != nil {
 					f.Diag("warning: could not read back the current limit: %v", err)
 					f.KV("current_limit_ma", "current limit", uint16(ma), formatMa(uint16(ma))+"  (written, not read back)")
+					emitReadBack(f, false)
 					return nil
 				}
 				f.KV("current_limit_ma", "current limit", readback, formatMa(readback))
+				emitReadBack(f, true)
+				// The read-back is only worth its round trip if something
+				// compares it. A dropped write is reported by nothing -- there
+				// is no NACK (SPEC.md §5.2) -- so without this the command
+				// prints whatever the device kept and exits 0.
+				if int(readback) != ma {
+					f.Diag("warning: read back %d mA after writing %d mA", readback, ma)
+				}
 				return nil
 			})
 		},
@@ -258,7 +363,7 @@ func newVLimitCommand(app *App) *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("reading user voltage limits: %w", err)
 				}
-				emitVLimit(f, low, high)
+				emitVLimit(f, low, high, "")
 				return nil
 			})
 		},
@@ -307,7 +412,27 @@ func newVLimitCommand(app *App) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					return app.dryRun(f, frame)
+					// The same read either side of the write: interlock 3 needs
+					// the current pair to tell widening from narrowing, and the
+					// write is verified by reading it back (SPEC.md §6.5,
+					// §13.8). Both are constants, so both are listed.
+					return app.dryRun(f,
+						proto.Read(proto.CmdUserVLimit),
+						frame,
+						proto.Read(proto.CmdUserVLimit))
+				}
+
+				// The same argument-only pre-check `voltage set` makes: an
+				// inverted pair, one outside the hardware envelope, or one too
+				// wide for the 16-bit field is refused whatever the device
+				// currently holds. Only when both flags were given -- with one
+				// omitted its half is still zero here, and the envelope arms
+				// would refuse a request that is perfectly good once the
+				// device fills it in.
+				if haveLow && haveHigh {
+					if d := CheckVLimit(VLimitRequest{NewLowMv: newLow, NewHighMv: newHigh}); !d.OK() {
+						return refused(d.Refused)
+					}
 				}
 
 				c, err := app.connect(ctx, f)
@@ -336,15 +461,36 @@ func newVLimitCommand(app *App) *cobra.Command {
 					return err
 				}
 				if err := c.Session.SetVLimit(ctx, uint16(req.NewLowMv), uint16(req.NewHighMv)); err != nil {
+					// The window is the guard rail interlock 1 checks every later
+					// `voltage set` against, so an unanswered write leaves the
+					// user believing in a ceiling that may or may not exist.
+					warnUnacknowledged(f, err, "voltage limit write", "gflex vlimit get")
 					return fmt.Errorf("setting user voltage limits: %w", err)
 				}
 				low, high, rerr := c.Session.VLimit(ctx)
 				if rerr != nil {
 					f.Diag("warning: could not read back the voltage limits: %v", rerr)
-					emitVLimit(f, uint16(req.NewLowMv), uint16(req.NewHighMv))
+					// Annotated exactly as `voltage set` and `current set`
+					// annotate theirs: this pair is the request, not the
+					// device's answer, and a value that was not read back is
+					// never presented as a confirmation (SPEC.md §17).
+					emitVLimit(f, uint16(req.NewLowMv), uint16(req.NewHighMv), "  (written, not read back)")
+					emitReadBack(f, false)
 					return nil
 				}
-				emitVLimit(f, low, high)
+				// And when it was read back, compare it. This window is the
+				// guard rail interlock 1 checks every later `voltage set`
+				// against, so a write that did not take is a lost guard rail
+				// rather than a cosmetic mismatch -- and with no NACK in the
+				// protocol (SPEC.md §5.2) the read-back is the only thing that
+				// can notice. A warning and not a failure: nothing measured says
+				// the firmware never clamps or rounds a window it is given.
+				if low != uint16(req.NewLowMv) || high != uint16(req.NewHighMv) {
+					f.Diag("warning: read back [%d, %d] mV after writing [%d, %d] mV",
+						low, high, req.NewLowMv, req.NewHighMv)
+				}
+				emitVLimit(f, low, high, "")
+				emitReadBack(f, true)
 				return nil
 			})
 		},
@@ -355,8 +501,10 @@ func newVLimitCommand(app *App) *cobra.Command {
 	return cmd
 }
 
-func emitVLimit(f Formatter, low, high uint16) {
-	f.KV("vlimit_low_mv", "voltage limits", low, vlimitDisplay(low, high))
+// emitVLimit renders a window. suffix annotates a pair that was written but not
+// read back, and is empty for one the device reported.
+func emitVLimit(f Formatter, low, high uint16, suffix string) {
+	f.KV("vlimit_low_mv", "voltage limits", low, vlimitDisplay(low, high)+suffix)
 	f.KV("vlimit_high_mv", "", high, "")
 }
 
@@ -490,13 +638,30 @@ func newToleranceCommand(app *App) *cobra.Command {
 					if err := c.Session.SetVToleranceNominalMv(ctx, uint16(nominal)); err != nil {
 						return fmt.Errorf("setting nominal tolerance: %w", err)
 					}
-					f.KV("vtolerance_nominal_mv", "tolerance (nominal)", uint16(nominal), fmt.Sprintf("%d mV", nominal))
+					// "(written)", as `led set` and `authlock set` are: this
+					// command spends no round trip reading the value back, so
+					// the line below is the request and not the device's answer
+					// (SPEC.md §17).
+					f.KV("vtolerance_nominal_mv", "tolerance (nominal)", uint16(nominal),
+						fmt.Sprintf("%d mV  (written)", nominal))
 				}
 				if haveSag {
 					if err := c.Session.SetVToleranceSagPerMa(ctx, uint16(sag)); err != nil {
+						if haveNominal {
+							// Two writes and no transaction between them: the
+							// nominal term is already in non-volatile memory.
+							// Said on stderr as well as in the error, because
+							// Formatter.Flush never runs on a failing command
+							// and Execute drops the text altogether when the
+							// failure is a cancelled context (root.go).
+							f.Diag("warning: the nominal tolerance was already written as %d mV", nominal)
+							return fmt.Errorf("setting sag tolerance (nominal was already written as %d mV): %w",
+								nominal, err)
+						}
 						return fmt.Errorf("setting sag tolerance: %w", err)
 					}
-					f.KV("vtolerance_sag_per_ma", "tolerance (sag)", uint16(sag), fmt.Sprintf("%d  (raw; units unknown)", sag))
+					f.KV("vtolerance_sag_per_ma", "tolerance (sag)", uint16(sag),
+						fmt.Sprintf("%d  (raw; units unknown; written)", sag))
 				}
 				return nil
 			})
@@ -598,7 +763,7 @@ func newCalibrateCommand(app *App) *cobra.Command {
 						return codedf(ExitUsage,
 							"--dry-run needs both --offset and --scale: the missing one would have to be read from the device")
 					}
-					if err := app.applyDryRun(f, CheckCalibrate(offset, scale, 0, 0, false)); err != nil {
+					if err := app.applyDryRun(f, CheckCalibrate(offset, scale, 0, 0, false, true, true)); err != nil {
 						return err
 					}
 					offFrame, err := proto.Write(proto.CmdVMeasureADCOffset, proto.EncodeI32(offset))
@@ -609,7 +774,14 @@ func newCalibrateCommand(app *App) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					return app.dryRun(f, offFrame, scaleFrame)
+					// The two reads come first on the live path: interlock 5
+					// prints the previous pair and the command that restores it
+					// (SPEC.md §13.5), so they are frames this command sends
+					// (§13.8).
+					return app.dryRun(f,
+						proto.Read(proto.CmdVMeasureADCOffset),
+						proto.Read(proto.CmdVMeasureADCScale),
+						offFrame, scaleFrame)
 				}
 
 				c, err := app.connect(ctx, f)
@@ -618,33 +790,87 @@ func newCalibrateCommand(app *App) *cobra.Command {
 				}
 				defer c.Close()
 
+				// Both reads exist for two consumers: filling in an omitted flag,
+				// and the previous-pair warning with its restore command that
+				// interlock 5 owes the user (SPEC.md §13.5). The scale read is
+				// therefore gated on being of use to either -- on need, not on
+				// the offset read's success, because with --scale omitted its
+				// value is wanted whatever the offset read did. Issuing it
+				// regardless spends a round trip, and a second full --timeout on
+				// a unit that has stopped answering, for a value with no reader.
 				prevOffset, oerr := c.Session.ADCOffset(ctx)
-				prevScale, serr := c.Session.ADCScale(ctx)
-				prevKnown := oerr == nil && serr == nil
-				if !prevKnown {
-					if !haveOffset || !haveScale {
-						return fmt.Errorf("reading the current calibration (needed to fill in the omitted flag): %w",
-							firstErr(oerr, serr))
-					}
-				} else {
-					if !haveOffset {
-						offset = prevOffset
-					}
-					if !haveScale {
-						scale = prevScale
-					}
+				var prevScale int32
+				var serr error
+				if oerr == nil || !haveScale {
+					prevScale, serr = c.Session.ADCScale(ctx)
 				}
-				if err := app.apply(ctx, f, CheckCalibrate(offset, scale, prevOffset, prevScale, prevKnown)); err != nil {
+				prevKnown := oerr == nil && serr == nil
+				// Each omitted flag is filled from its OWN read. Failing because
+				// the other term could not be read refused a `--offset 0` whose
+				// scale had arrived perfectly well, and the value it needed was
+				// already in hand.
+				if !haveOffset {
+					if oerr != nil {
+						return fmt.Errorf("reading the current ADC offset (needed to fill in --offset): %w", oerr)
+					}
+					offset = prevOffset
+				}
+				if !haveScale {
+					if serr != nil {
+						return fmt.Errorf("reading the current ADC scale (needed to fill in --scale): %w", serr)
+					}
+					scale = prevScale
+				}
+				if err := app.apply(ctx, f, CheckCalibrate(offset, scale, prevOffset, prevScale,
+					prevKnown, haveOffset, haveScale)); err != nil {
 					return err
 				}
-				if err := c.Session.SetADCOffset(ctx, offset); err != nil {
-					return fmt.Errorf("setting ADC offset: %w", err)
+				// Only the terms the user actually gave are written. The other
+				// one was just read from the device and is being handed back
+				// unchanged, so the write is a round trip and a non-volatile
+				// write that cannot change anything -- and if that read were
+				// ever wrong, rewriting it would make the wrong value permanent.
+				// Both terms are still printed, and still appear in the restore
+				// command, so nothing disappears from --json.
+				if haveOffset {
+					if err := c.Session.SetADCOffset(ctx, offset); err != nil {
+						warnUnacknowledged(f, err, "ADC offset write", "gflex calibrate get")
+						return fmt.Errorf("setting ADC offset: %w", err)
+					}
 				}
-				if err := c.Session.SetADCScale(ctx, scale); err != nil {
-					return fmt.Errorf("setting ADC scale (offset was already written as %d): %w", offset, err)
+				if haveScale {
+					if err := c.Session.SetADCScale(ctx, scale); err != nil {
+						warnUnacknowledged(f, err, "ADC scale write", "gflex calibrate get")
+						if haveOffset {
+							// Two writes and no transaction between them: the
+							// offset is already committed, and half a
+							// calibration makes every later voltage reading
+							// silently wrong, which is what interlock 1 relies
+							// on (SPEC.md §13.5). The same sentence is in the
+							// error, but it is said here too because the error
+							// text does not always reach the user:
+							// Formatter.Flush never runs on a failing command,
+							// and Execute prints nothing but "gflex:
+							// interrupted" for a cancelled context (root.go) --
+							// which reads as "nothing happened". firmware.go's
+							// postFlashFailure routes its must-see text through
+							// Diag for exactly these two reasons.
+							f.Diag("warning: the ADC offset was already written as %d; "+
+								"the scale write was not confirmed", offset)
+							return fmt.Errorf("setting ADC scale (offset was already written as %d): %w",
+								offset, err)
+						}
+						return fmt.Errorf("setting ADC scale: %w", err)
+					}
 				}
-				f.KV("vmeasure_adc_offset", "adc offset", offset, strconv.FormatInt(int64(offset), 10))
-				f.KV("vmeasure_adc_scale", "adc scale", scale, strconv.FormatInt(int64(scale), 10))
+				// "(written)", as `led set` and `authlock set` are: neither term
+				// is read back, so these are the values sent (SPEC.md §17). The
+				// term that was kept rather than written is labelled as such --
+				// it is the device's own answer, one round trip old.
+				f.KV("vmeasure_adc_offset", "adc offset", offset,
+					strconv.FormatInt(int64(offset), 10)+calibrateSuffix(haveOffset))
+				f.KV("vmeasure_adc_scale", "adc scale", scale,
+					strconv.FormatInt(int64(scale), 10)+calibrateSuffix(haveScale))
 				return nil
 			})
 		},
@@ -691,15 +917,6 @@ func newCalibrateCommand(app *App) *cobra.Command {
 		},
 	})
 	return cmd
-}
-
-func firstErr(errs ...error) error {
-	for _, e := range errs {
-		if e != nil {
-			return e
-		}
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +1164,11 @@ func newAuthLockCommand(app *App) *cobra.Command {
 				}
 				defer c.Close()
 				if err := c.Session.SetAuthLock(ctx, uint8(level)); err != nil {
+					// Worth the line here more than anywhere: what a non-zero
+					// level gates, and how to leave one, is unknown (SPEC.md
+					// §6.3, §14.8), so "it failed" must not be read as "the level
+					// is still 0".
+					warnUnacknowledged(f, err, "auth lock write", "gflex authlock get")
 					return fmt.Errorf("setting the auth lock: %w", err)
 				}
 				f.KV("authlock_level", "auth lock level", uint8(level), fmt.Sprintf("%d  (written)", level))

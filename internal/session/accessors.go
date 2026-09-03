@@ -230,6 +230,13 @@ func (s *Session) readVoltageOnce(ctx context.Context) (uint16, error) {
 // the not-ready retry of VoltageMv. The returned value is what the device
 // reports, which is what should be shown to the user.
 //
+// Two error paths still carry a truth the caller must pass on rather than
+// collapse into "it failed": ErrReadBack, where the write was acknowledged and
+// only the confirming read failed, and ErrUnacknowledged, where the write was
+// transmitted and never answered. On the second, a single follow-up read is
+// attempted, and if it succeeds the returned value is what the device reported
+// -- so an error from this function can still come with a reading beside it.
+//
 // No range checking happens here. The vendor app applies none at all, and the
 // safety interlocks of SPEC.md §13 (clamp to the user vlimit window and to the
 // 3300-48000 mV hardware envelope, confirm above 5 V, warn above 20 V) belong
@@ -239,6 +246,30 @@ func (s *Session) readVoltageOnce(ctx context.Context) (uint16, error) {
 // global --force flag -- SPEC.md §11, §13's preamble.)
 func (s *Session) SetVoltageMv(ctx context.Context, mv uint16) (uint16, error) {
 	if _, err := s.Do(ctx, proto.CmdVoltageMv, proto.EncodeU16(mv), true); err != nil {
+		// A write that went unanswered is not a write that did not happen. The
+		// frame was transmitted in full and there is no NACK, so the device may
+		// be sitting at mv right now (ErrUnacknowledged). Returning "write
+		// voltage failed" and stopping is how the user ends up connecting a 5 V
+		// pedal to a rail that is live at 12 V -- the same thing ErrReadBack
+		// exists to prevent, one round trip earlier. So ask the device what it
+		// holds; on the one command that can destroy a load, a round trip is
+		// cheap for the answer (SPEC.md §6.5, §13).
+		//
+		// readVoltageOnce, not VoltageMv: the not-ready retry would spend the
+		// whole ReadyTimeout budget here, and a unit that just failed to answer
+		// a write is not the freshly-plugged unit that budget exists for. On
+		// the shipped defaults that is the difference between one more command
+		// timeout and ten more seconds of silence before the user hears
+		// anything at all.
+		//
+		// Only on a timeout, and only when the frame was actually transmitted.
+		// A cancelled context cannot issue the read at all, and a send failure
+		// left nothing on the wire to ask about.
+		if errors.Is(err, ErrUnacknowledged) && errors.Is(err, ErrTimeout) {
+			if got, rerr := s.readVoltageOnce(ctx); rerr == nil {
+				return got, fmt.Errorf("write voltage %d mV: %w; the device now reports %d mV", mv, err, got)
+			}
+		}
 		return 0, fmt.Errorf("write voltage %d mV: %w", mv, err)
 	}
 	got, err := s.VoltageMv(ctx)

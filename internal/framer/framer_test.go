@@ -353,6 +353,76 @@ func TestDecoderOverlongFrameWithOverlongDeclaredLengthIsDropped(t *testing.T) {
 	}
 }
 
+func TestDecoderOverlongFrameReportsTheOverflowOncePerFrame(t *testing.T) {
+	// The excess past the 64-byte cap is len(frame)-64 and unbounded, and the
+	// drop hook is the only account of malformed device output there is
+	// (SPEC.md §3.3). One notice per frame carrying the count, and it must
+	// arrive before the notice that carries the accumulator rather than
+	// crowding it out of a consumer's queue.
+	body := make([]byte, 70)
+	body[0] = 70 // a declared length the truncated accumulator cannot satisfy
+	for i := 1; i < len(body); i++ {
+		body[i] = byte(i)
+	}
+	var s []byte
+	s = append(s, StatusFrameStart, 0, 0)
+	for _, b := range body {
+		s = append(s, StatusFrameData, (b>>4)&0x0F, b&0x0F)
+	}
+	s = append(s, StatusFrameEnd, 0, 0)
+
+	var reasons []string
+	d := NewDecoder()
+	d.SetDropHook(func(reason string, buffered []byte) {
+		reasons = append(reasons, reason)
+	})
+	d.Feed(s)
+	if len(reasons) != 2 {
+		t.Fatalf("drop hook called %d times, want 2: %v", len(reasons), reasons)
+	}
+	if !strings.Contains(reasons[0], "6 excess") {
+		t.Errorf("reason %q does not report the 6 bytes past the cap", reasons[0])
+	}
+	if !strings.Contains(reasons[1], "declared frame length 70") {
+		t.Errorf("reason %q is not the declared-length notice", reasons[1])
+	}
+
+	// The counter is armed for the next frame, not carried into it.
+	reasons = nil
+	mustOneFrame(t, d.Feed(EncodeMIDI([]byte{0x02, 0x08})), []byte{0x02, 0x08})
+	if len(reasons) != 0 {
+		t.Fatalf("drop hook fired for a well-formed frame: %v", reasons)
+	}
+}
+
+func TestDecoderOverflowIsReportedWhenAStartMarkerCutsTheFrameShort(t *testing.T) {
+	// An over-long frame that never reaches an end-of-frame marker still has
+	// its overflow reported, at the marker that resyncs, and before the drop
+	// that discards the partial frame.
+	var s []byte
+	s = append(s, StatusFrameStart, 0, 0)
+	for i := 0; i < 70; i++ {
+		s = append(s, StatusFrameData, 0x00, 0x01)
+	}
+	s = append(s, StatusFrameStart, 0, 0)
+
+	var reasons []string
+	d := NewDecoder()
+	d.SetDropHook(func(reason string, buffered []byte) {
+		reasons = append(reasons, reason)
+	})
+	d.Feed(s)
+	if len(reasons) != 2 {
+		t.Fatalf("drop hook called %d times, want 2: %v", len(reasons), reasons)
+	}
+	if !strings.Contains(reasons[0], "6 excess") {
+		t.Errorf("reason %q does not report the 6 bytes past the cap", reasons[0])
+	}
+	if !strings.Contains(reasons[1], "start-of-frame marker arrived mid-frame") {
+		t.Errorf("reason %q is not the resync notice", reasons[1])
+	}
+}
+
 func TestDecoderDeclaredLengthAboveMaxIsRejected(t *testing.T) {
 	// No MIDI stream can produce this state: the accumulator cap keeps
 	// len(acc) <= MaxFrameLen, so the "declared length fits what we buffered"
@@ -952,6 +1022,65 @@ func TestReadLoopDoesNotSpinOnIdle(t *testing.T) {
 		t.Error("ReadMIDI was never called; the read loop is not running")
 	}
 	t.Logf("ReadMIDI calls in 100ms: %d", n)
+}
+
+// blockingIdleTransport models usbmidi's ordinary quiet case: an IN transfer
+// that blocks for its whole timeout and is then reported as (0, nil) rather
+// than as an error, because an idle IN endpoint times out constantly and
+// surfacing that as an error would fill the error channel with noise.
+type blockingIdleTransport struct {
+	block  time.Duration
+	calls  atomic.Int64
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingIdleTransport(block time.Duration) *blockingIdleTransport {
+	return &blockingIdleTransport{block: block, closed: make(chan struct{})}
+}
+
+func (t *blockingIdleTransport) WriteMIDI([]byte) error { return nil }
+func (t *blockingIdleTransport) ReadMIDI(p []byte) (int, error) {
+	select {
+	case <-t.closed:
+		return 0, io.EOF
+	case <-time.After(t.block):
+	}
+	t.calls.Add(1)
+	return 0, nil
+}
+func (t *blockingIdleTransport) Name() string { return "blocking-idle" }
+func (t *blockingIdleTransport) Close() error {
+	t.once.Do(func() { close(t.closed) })
+	return nil
+}
+
+// TestReadLoopDoesNotBackOffAfterABlockingRead pins the other half of the
+// idleBackoff rule. The floor exists to stop an instant "nothing yet" from
+// spinning a core; a read that already blocked has served it, and sleeping
+// again on top would delay the next poll for no benefit -- the CPU was parked
+// in the kernel, not spinning. usbmidi reaches this branch on every IN-transfer
+// timeout, so the wasted wait would be paid for the whole time a device is
+// quiet, and the device does not pace what it sends (SPEC.md §14 Q15).
+func TestReadLoopDoesNotBackOffAfterABlockingRead(t *testing.T) {
+	const block = 4 * idleBackoff
+	tr := newBlockingIdleTransport(block)
+	f := New(tr, 0)
+	f.Start()
+	const window = 20 * block
+	time.Sleep(window)
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	n := tr.calls.Load()
+	// Each read costs `block` and nothing more, so the window admits about 20.
+	// Were idleBackoff added on top of every blocking read the interval would
+	// be block+idleBackoff and at most 16 would fit; the bound below sits
+	// between the two so it fails on the regression without being flaky.
+	if n < 18 {
+		t.Errorf("ReadMIDI called %d times in %v; a blocking read is still paying idleBackoff on top", n, window)
+	}
+	t.Logf("ReadMIDI calls in %v with a %v blocking read: %d", window, block, n)
 }
 
 // ---------------------------------------------------------------------------

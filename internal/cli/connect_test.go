@@ -2,10 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/session"
@@ -289,5 +296,139 @@ func TestConnCloseIsSilentForOrdinaryErrors(t *testing.T) {
 	_ = c.Close()
 	if got := buf.String(); got != "" {
 		t.Errorf("expected silence for an ordinary close error, got:\n%s", got)
+	}
+}
+
+// TestPortPathThatIsNotADeviceNodeIsRefused is the regression test for what
+// --port does not mean.
+//
+// It overrides IDENTIFICATION -- the vendor ID, the name match, the sole-port
+// fallback (SPEC.md §3.4) -- and nothing else asked whether the path was a
+// device node at all. rawmidi.Open is a plain O_RDWR open, so a stale
+// GFLEX_PORT or a shell completion that landed beside the node opened a regular
+// file and the framer's first frame went into it, overwriting the beginning of
+// somebody's file with 80 00 00 90 ... and then failing with EOF.
+//
+// The file is the assertion: it has to come back byte for byte.
+func TestPortPathThatIsNotADeviceNodeIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notes.txt")
+	const content = "a file of somebody's, and not a MIDI port at all.\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{Port: path, stdout: io.Discard, stderr: io.Discard}
+	tr, _, err := app.openRawMIDI(context.Background())
+	if err == nil {
+		_ = tr.Close()
+		t.Fatal("openRawMIDI opened a regular file named by --port")
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	for _, want := range []string{path, "character device", "/dev/snd/"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
+	}
+	after, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(after) != content {
+		t.Errorf("the file was written to:\n%q", after)
+	}
+}
+
+// A path that does not exist must still fall through to the transport, so the
+// open error keeps classifying itself -- ENOENT is a missing device, not a
+// malformed command line.
+func TestPortPathThatDoesNotExistIsLeftToTheTransport(t *testing.T) {
+	app := &App{Port: filepath.Join(t.TempDir(), "midiC9D9"), stdout: io.Discard, stderr: io.Discard}
+	_, _, err := app.openRawMIDI(context.Background())
+	if err == nil {
+		t.Fatal("openRawMIDI succeeded on a path that does not exist")
+	}
+	if code := ExitCode(err); code == ExitUsage {
+		t.Errorf("a missing node was reported as a command-line error: %v", err)
+	}
+}
+
+// EBUSY means something different on each transport, and the generic ExitBusy
+// guidance is written for only one of them: it explains ALSA's per-direction
+// exclusivity, points at /proc/asound/seq/clients, and ends by recommending
+// --transport usb. Under --transport usb the errno comes from
+// USBDEVFS_DISCONNECT_CLAIM with another usbfs process in the way, and that
+// advice recommends the transport the run is already on.
+func TestABusyUSBInterfaceDoesNotGetTheALSAAdvice(t *testing.T) {
+	busy := fmt.Errorf("claiming interface 1: %w", syscall.EBUSY)
+
+	usb := (&App{Transport: transportUSB}).transportError(context.Background(), busy)
+	if code := ExitCode(usb); code != ExitBusy {
+		t.Errorf("ExitCode = %d, want ExitBusy (%d): %v", code, ExitBusy, usb)
+	}
+	if !suppressHint(usb) {
+		t.Errorf("the ALSA hint is still printed for a usbfs claim:\n%v", usb)
+	}
+	if !strings.Contains(usb.Error(), "USB interface") {
+		t.Errorf("the message does not say what is held:\n%v", usb)
+	}
+
+	// The rawmidi side keeps the hint, because that is where the advice applies.
+	alsa := (&App{Transport: transportRawMIDI}).transportError(context.Background(), busy)
+	if code := ExitCode(alsa); code != ExitBusy {
+		t.Errorf("ExitCode = %d, want ExitBusy (%d): %v", code, ExitBusy, alsa)
+	}
+	if suppressHint(alsa) {
+		t.Errorf("the rawmidi busy case lost its guidance:\n%v", alsa)
+	}
+}
+
+// TestOpenWaitsOutTheUdevACL covers the window between a node appearing and
+// being usable.
+//
+// devtmpfs creates /dev/snd/midiC*D* when the device registers and udev applies
+// the uaccess ACL a moment later, so anything that opens on the first sight of
+// the node races it -- `scan --no-prompt` polls presence every 250 ms and
+// reconnects immediately, with the capture log already erased (SPEC.md §9.2).
+func TestOpenWaitsOutTheUdevACL(t *testing.T) {
+	denied := &fs.PathError{Op: "open", Path: "/dev/snd/midiC1D0", Err: syscall.EACCES}
+	calls := 0
+	tr, err := openWaitingForACL(context.Background(), func() (proto.Transport, error) {
+		calls++
+		if calls < 3 {
+			return nil, denied
+		}
+		return closeErrTransport{}, nil
+	})
+	if err != nil {
+		t.Fatalf("openWaitingForACL gave up on a permission denial that cleared: %v", err)
+	}
+	if tr == nil {
+		t.Fatal("openWaitingForACL returned no transport and no error")
+	}
+	if calls != 3 {
+		t.Errorf("open was called %d times, want 3", calls)
+	}
+}
+
+// The other half, and the reason the retry is not general: a missing node is
+// the ordinary no-device case, by far the commonest failure this tool has, and
+// making every one of those wait out the grace would be the wrong trade.
+func TestOpenDoesNotWaitOutAMissingNode(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	_, err := openWaitingForACL(context.Background(), func() (proto.Transport, error) {
+		calls++
+		return nil, &fs.PathError{Op: "open", Path: "/dev/snd/midiC1D0", Err: syscall.ENOENT}
+	})
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("openWaitingForACL returned %v, want the ENOENT unchanged", err)
+	}
+	if calls != 1 {
+		t.Errorf("a missing node was retried (%d opens); every no-device run would pay the grace", calls)
+	}
+	if elapsed := time.Since(start); elapsed > rawmidiACLGrace {
+		t.Errorf("a missing node took %s to report", elapsed)
 	}
 }

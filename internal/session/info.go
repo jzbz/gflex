@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/jzbz/gflex/internal/ctxwait"
 	"github.com/jzbz/gflex/internal/proto"
 )
 
@@ -191,10 +193,46 @@ func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceIn
 	return info, nil
 }
 
+// How hard the §10.4 replay tries to read the existing vlimit window before it
+// concludes it cannot be read.
+//
+// Every other read in this package is asked once, because a caller can simply
+// ask again. This one cannot: what it decides is whether the user's window
+// survives the flash or is replaced by the 3300/48000 default, and the protocol
+// has no NACK, so a single frame dropped in either direction (SPEC.md §5.2)
+// looks exactly like a device that has nothing to report. Three attempts 300 ms
+// apart is the vendor's own inner read-retry shape (SPEC.md §7), and it is paid
+// only by a unit that is already failing to answer after a flash.
+const (
+	postUpdateVLimitAttempts   = 3
+	postUpdateVLimitRetryDelay = 300 * time.Millisecond
+)
+
+// readVLimitRetrying reads the user vlimit window, retrying a read that fails
+// for a reason waiting can cure. A permanent failure -- the transport dead, the
+// session closed, the context ended -- returns at once: the Session has no
+// reconnect path, so the remaining attempts would fail identically.
+func (s *Session) readVLimitRetrying(ctx context.Context, log func(string)) (low, high uint16, err error) {
+	for attempt := 1; ; attempt++ {
+		low, high, err = s.VLimit(ctx)
+		if err == nil || attempt >= postUpdateVLimitAttempts || PermanentErr(err) {
+			return low, high, err
+		}
+		// Not the "<step> failed: <err>" shape: an attempt that will be made
+		// again is progress being narrated, not a setting left unrestored.
+		log(fmt.Sprintf("read vlimit attempt %d of %d did not answer, retrying: %v", attempt, postUpdateVLimitAttempts, err))
+		if werr := ctxwait.Sleep(ctx, postUpdateVLimitRetryDelay); werr != nil {
+			return 0, 0, err
+		}
+	}
+}
+
 // PostUpdateInit replays the settings a firmware flash erases (SPEC.md §10.4).
 //
 // It is equivalent to PostUpdateInitForce(ctx, false, log): the vlimit pair is
-// rewritten only when the value read back is implausible or could not be read.
+// rewritten only when the value read back is implausible. A window that could
+// not be read at all is left as the flash left it, and reported; see the read
+// step there for why the two are not the same thing.
 func (s *Session) PostUpdateInit(ctx context.Context, log func(string)) error {
 	return s.PostUpdateInitForce(ctx, false, log)
 }
@@ -231,13 +269,49 @@ func (s *Session) PostUpdateInitForce(ctx context.Context, forceVLimit bool, log
 	// 1. Read the existing window first, so we can tell whether the flash left
 	//    it in a usable state.
 	rewriteVLimit := forceVLimit
-	low, high, err := s.VLimit(ctx)
+	low, high, err := s.readVLimitRetrying(ctx, log)
 	switch {
 	case err != nil:
-		log(fmt.Sprintf("read vlimit failed, will rewrite defaults: %v", err))
-		rewriteVLimit = true
+		// Unreadable is not the same as erased, and the vendor's own sequence
+		// conflates them: SPEC.md §10.4 rewrites the defaults "only if the
+		// read-back was invalid", counting a read that went unanswered as
+		// invalid. That is the reasoning SPEC.md §17's first row already
+		// refuses for `voltage set` -- the protocol has no NACK, so a dropped
+		// frame is routine (§5.2), and acting on one here would replace a 5 V
+		// ceiling with the 48 V default, which is the direction that ends with
+		// 20 V in a 5 V pedal. After the retries above, the honest answer is
+		// that the window could not be checked, so it is left exactly as the
+		// flash left it.
+		//
+		// That is safe in the case this gives up on: a window an erase really
+		// did wipe cannot bound anything, so the next `voltage set` refuses it
+		// outright rather than falling back to the envelope (§13.1, §17 row 1).
+		// The wording is the "<step> failed: <err>" shape the flashing caller
+		// counts as a step that did not take, so the user is told to check the
+		// window by hand instead of being left to assume it was restored.
+		log(fmt.Sprintf("read vlimit failed: %v", err))
 	case !VLimitPlausible(low, high):
-		log(fmt.Sprintf("vlimit read back implausible (low=%d high=%d), rewriting defaults", low, high))
+		// Two different states arrive here and only one of them is an erased
+		// window. VLimitPlausible is the vendor's erased-window test and
+		// nothing else (SPEC.md §17, row 2); its 6000 mV floor rejects every
+		// ceiling under 6 V, including [3300, 5000] -- what someone protecting
+		// a 5 V pedal sets, and the strictest guard rail in the system. A pair
+		// like that did not come out of an erase: it still bounds a request, so
+		// it survived the flash and is about to be replaced by the widest
+		// window there is.
+		//
+		// The rewrite still happens -- it is what §10.4 prescribes, and this
+		// sequence restores every other setting to its default the same way --
+		// but it must not be narrated as if the user's own window had been put
+		// back. Widening a guard rail is the one change SPEC.md §13.3 makes
+		// `vlimit set` confirm, so the least this can do is say plainly that it
+		// happened and print the line that undoes it.
+		if high > low {
+			log(fmt.Sprintf("vlimit low=%d high=%d survived the flash but does not pass the vendor's erased-window test; WIDENING it to %d/%d -- put your own window back with: gflex vlimit set --low %dmV --high %dmV",
+				low, high, proto.DefaultVLimitLowMv, proto.DefaultVLimitHighMv, low, high))
+		} else {
+			log(fmt.Sprintf("vlimit read back implausible (low=%d high=%d), rewriting defaults", low, high))
+		}
 		rewriteVLimit = true
 	default:
 		log(fmt.Sprintf("vlimit low=%d high=%d", low, high))

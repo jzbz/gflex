@@ -37,6 +37,11 @@ type Match struct {
 	// Unexported: plumbing, not output.
 	chosen          PDO
 	chosenDeclaredA float64
+	// quotedSPRAVS records that an SPR AVS object was picked at some point, even
+	// if a later upgrade moved the verdict off it. The message that object left
+	// behind still quotes the assumed 9-20 V range, and the disclosure follows
+	// the note rather than the object.
+	quotedSPRAVS bool
 }
 
 // Modes reported by Evaluate. The "upgrade_" modes mean a higher-current
@@ -77,6 +82,18 @@ const (
 	// rather than what the capability advertises; DeclaredMaxCurrentA holds the
 	// advertised figure.
 	CaveatCableCurrentBound = "current_bounded_by_cable"
+
+	// CaveatPPSPowerLimited means the verdict rests on a PPS APDO that sets the
+	// USB-PD Power Limited bit (SPEC.md §9.4 does not list it; see
+	// decodeAugmented): the source does not hold that APDO's Maximum Current
+	// across its whole range, and what it can supply at the requested voltage is
+	// bounded by a power budget this scan cannot read. Where the fixed PDOs
+	// support an inference the bound is applied and the figure reported is the
+	// smaller one; where they do not, the advertised figure stands and may be
+	// optimistic. Either way part of the answer comes from a specification
+	// rather than from the capture, which is the disclosure
+	// CaveatSPRAVSAssumedRange makes for the SPR AVS range.
+	CaveatPPSPowerLimited = "pps_power_limited"
 )
 
 // cmpEps absorbs floating-point noise in voltage and current comparisons. All
@@ -316,6 +333,30 @@ func (l *Log) evaluateSPR(v, i float64) Match {
 		l.appendSPRFailure(&m, v)
 	}
 
+	// The same look at the EPR side, for the case where an SPR object did cover
+	// v but cannot supply the request. SPEC.md §17 (row 9.5) states the rule as
+	// "any object whose decoded range covers the request is considered", and the
+	// default arm above was applying it only where nothing else covered v at
+	// all: a 140 W charger advertising fixed 15 V 3 A alongside an EPR AVS
+	// 15.0-28.0 V range answered "no, 3.00 A" at 15 V and "yes, 5.00 A" at 18 V
+	// from one and the same scan, because 18 V happened to have no fixed object.
+	// Applied once, after the switch, because all three arms could pick the
+	// weaker object; the condition is the EPR branch's own (evaluateEPR above) —
+	// upgrade only when what was picked is short of the request AND the
+	// adjustable object genuinely offers more — so a plain SPR object still wins
+	// whenever it can do the job, and no verdict acquires an EPR cable
+	// requirement it did not need.
+	if m.Mode != ModeNone && m.chosen.Kind != KindEPRAVS && m.MaxCurrentA+cmpEps < i {
+		if eavs, ok := l.eprAVSCovering(v); ok {
+			if a := eavs.CurrentAt(v); a > m.MaxCurrentA+cmpEps {
+				m.pick(ModeUpgradeEPRAVSMoreCurrent, eavs, v)
+				m.Messages = append(m.Messages,
+					fmt.Sprintf("no SPR capability supplies the requested %s at %s; the EPR AVS range %s (%d W) supplies %s",
+						formatA(i), formatV(v), formatRange(eavs.MinVoltageV, eavs.MaxVoltageV), eavs.PDPWatts, formatA(a)))
+			}
+		}
+	}
+
 	l.finish(&m, v, i)
 	return m
 }
@@ -354,7 +395,28 @@ func (l *Log) appendSPRFailure(m *Match, v float64) {
 	} else {
 		m.Messages = append(m.Messages, "the source offers no SPR AVS range")
 	}
+
+	// A refusal from 15 V up is precisely the refusal a cable fault can cause:
+	// an EPR AVS range routinely starts at 15 V and covers the SPR band from
+	// there (SPEC.md §17, row 9.5), and a scan that could not enter Extended
+	// Power Range may simply never have seen it. Its EPR counterpart says this
+	// on both of its branches (appendEPRFailure); finish cannot, because a
+	// refusal never reaches the block that would.
+	//
+	// Gated on the voltage, and not merely on the flag: below 15 V no EPR AVS
+	// object could have covered the request whatever the cable did, so citing it
+	// there would invent a diagnosis the log does not support.
+	if l.EPRCableFail && v+cmpEps >= eprAVSLowestMinVoltageV {
+		m.addCaveat(CaveatEPRCableFail)
+		m.Messages = append(m.Messages, "the scan also reported an EPR cable failure: an EPR AVS range (15 V and up) may have been hidden; fit an eMarker-equipped 5 A EPR cable and rescan")
+	}
 }
+
+// eprAVSLowestMinVoltageV is the lowest voltage an EPR AVS range can start at.
+// USB-PD puts the floor of the EPR AVS operating range at 15 V, which is what
+// makes such a range the usual answer to a 15-20 V request and the thing a
+// failed EPR entry is most likely to have hidden.
+const eprAVSLowestMinVoltageV = 15.0
 
 // sprAVSFailureNote says why the SPR AVS APDO that best describes this source
 // cannot produce v, and reports whether the answer leans on the assumed range or
@@ -430,6 +492,9 @@ func (m *Match) pick(mode string, p PDO, v float64) float64 {
 	m.MaxCurrentA = usable
 	m.chosen = p
 	m.chosenDeclaredA = declared
+	if p.Kind == KindSPRAVS {
+		m.quotedSPRAVS = true
+	}
 	return usable
 }
 
@@ -479,10 +544,25 @@ func (l *Log) finish(m *Match, v, i float64) {
 	// any verdict resting on one rests partly on USB-PD 3.2 rather than on the
 	// scan. Disclosed here so that all three deciding paths -- spr_avs,
 	// upgrade_spr_avs_more_current, and the refusal in appendSPRFailure -- say
-	// it, instead of only the first.
-	if m.chosen.Kind == KindSPRAVS {
+	// it, instead of only the first. quotedSPRAVS keeps it attached when a later
+	// upgrade moved the verdict off the SPR AVS object: the message it left
+	// above still quotes what the assumed range offers at v.
+	if m.chosen.Kind == KindSPRAVS || m.quotedSPRAVS {
 		m.addCaveat(CaveatSPRAVSAssumedRange)
 		m.Messages = append(m.Messages, sprAVSAssumptionNote(v))
+	}
+
+	// A PPS APDO that declared itself power limited holds its Maximum Current
+	// only where the source's budget allows, and that budget is not in the log.
+	// Said here rather than in the branches for the same reason as the rest of
+	// this function -- spr_pps and upgrade_spr_pps_more_current are two paths to
+	// one object, and a disclosure only one of them made would be worse than
+	// none.
+	if m.chosen.Kind == KindPPS && m.chosen.PPSPowerLimited {
+		if note, disclose := ppsPowerLimitedNote(m.chosen, v, m.MaxCurrentA); disclose {
+			m.addCaveat(CaveatPPSPowerLimited)
+			m.Messages = append(m.Messages, note)
+		}
 	}
 
 	// EPR operation, whether because the request itself is above 20 V or
@@ -544,6 +624,35 @@ func sprAVSAssumptionNote(v float64) string {
 	return fmt.Sprintf("the assumed %s output range is not scanned data: %s, so reaching %s is what USB-PD 3.2 says such a source does rather than something this scan observed",
 		formatRange(SPRAVSMinVoltageV, SPRAVSMaxVoltageV), SPRAVSAssumptionClause, formatV(v))
 }
+
+// ppsPowerLimitedNote says what a PPS APDO's Power Limited bit cost this
+// verdict, and reports whether there is anything to disclose at all.
+//
+// There are two things to say and they are different answers. With a budget
+// inferred from the fixed PDOs, the reported current may be smaller than the
+// APDO advertises and the user is owed the arithmetic and its provenance. With
+// no budget to infer, nothing was reduced and the advertised figure is the one
+// reported — which is exactly when it may be optimistic, so the disclosure
+// matters most. Where a budget was inferred and does not bite at v, the answer
+// owes the bit nothing and saying so would be noise.
+func ppsPowerLimitedNote(p PDO, v, reported float64) (note string, disclose bool) {
+	advertised, _ := reportable(p.MaxCurrentA, p.DeclaredMaxCurrentA)
+	switch {
+	case p.PPSBudgetW <= 0:
+		return fmt.Sprintf("this PPS APDO sets the USB-PD Power Limited bit, so the source does not hold %s across the whole %s range; %s, and this source's fixed PDOs do not say what it is, so %s may be optimistic near the top of the range",
+			formatA(advertised), formatRange(p.MinVoltageV, p.MaxVoltageV), ppsBudgetClause, formatA(reported)), true
+	case reported+cmpEps < advertised:
+		return fmt.Sprintf("this PPS APDO sets the USB-PD Power Limited bit, so its %s applies only where the source's power budget allows: %d W permits %s at %s. That budget is inferred from the source's own fixed PDOs, not scanned — %s",
+			formatA(advertised), p.PPSBudgetW, formatA(reported), formatV(v), ppsBudgetClause), true
+	default:
+		return "", false
+	}
+}
+
+// ppsBudgetClause is the shared half-sentence for why a PPS power budget is
+// never read from the scan, so the two shapes of the disclosure above agree
+// about what is missing and why.
+const ppsBudgetClause = "a source's PDP travels in Source_Capabilities_Extended, which this scan does not capture (SPEC.md §9.3)"
 
 // SPRAVSAssumptionClause is the shared half-sentence, so the disclosure reads
 // identically wherever the assumption decides an answer. Exported because the

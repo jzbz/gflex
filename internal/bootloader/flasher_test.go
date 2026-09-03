@@ -471,6 +471,45 @@ func TestJumpToApp(t *testing.T) {
 	}
 }
 
+// A round that has already seen a CRC-less acknowledgement keeps that as the
+// cause in preference to the timeout which necessarily follows it -- but an
+// interrupted run is not that timeout. On the last attempt there is no round
+// pause left to surface the context again, so without this the operator's own
+// Ctrl-C came back as "verification failed: verify response carried no CRC
+// byte", i.e. as a fault of the unit.
+func TestVerifyReportsAnInterruptRatherThanTheCRCLessAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dev := &fakeBulk{}
+	rounds := 0
+	dev.respond = func(out []byte) [][]byte {
+		if proto.Cmd(out[1]&proto.CmdCodeMask) != proto.CmdBootloaderVerify {
+			return nil
+		}
+		if out[1]&proto.FlagWrite != 0 {
+			// The write form acknowledged with no CRC byte, which is the
+			// answer the preference above exists for. The CRC never follows,
+			// so the first round ends in the timeout it justifies.
+			return [][]byte{{0x02, 0x82}}
+		}
+		// The read form of the last round has gone out and the operator
+		// interrupts the run while it is still listening for the CRC frame.
+		if rounds++; rounds == verifyAttempts {
+			cancel()
+		}
+		return nil
+	}
+	f := newTestFlasher(dev)
+
+	_, err := f.Verify(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want it to carry context.Canceled", err)
+	}
+	if errors.Is(err, ErrVerifyNoCRC) {
+		t.Errorf("error = %v; an interrupted run must not be reported as a unit that failed verification", err)
+	}
+}
+
 func TestNewFlasherWithoutDevice(t *testing.T) {
 	t.Parallel()
 	f := NewFlasher(nil, usbfs.Interface{})
@@ -824,6 +863,89 @@ func TestUpdateSkipJumpLeavesDeviceInBootloader(t *testing.T) {
 	}
 }
 
+// jumpFailBulk is a fake whose CMD_BOOTLOAD_END write fails, and only that one:
+// every earlier frame is answered normally, so the flash and the verification
+// succeed and the failure lands exactly where the update is at its most
+// dangerous to describe wrongly. The frame is not recorded, because it never
+// reached the device.
+type jumpFailBulk struct {
+	*fakeBulk
+	err error
+}
+
+func (j *jumpFailBulk) Transfer(ctx context.Context, endpoint uint8, data []byte, timeout time.Duration) (int, error) {
+	if endpoint&0x80 == 0 && bytes.Equal(data, BootloadEndFrame()) {
+		return 0, j.err
+	}
+	return j.fakeBulk.Transfer(ctx, endpoint, data, timeout)
+}
+
+// Only a device that has left the bus may be assumed to have jumped. Anything
+// else means the frame was refused while the unit was still there -- a
+// cancelled context is not even submitted to the kernel -- and reporting that
+// as a completed jump is what made the CLI tell an operator whose unit is
+// sitting in the bootloader that the update succeeded and must not be redone.
+func TestUpdateReportsACMDBootloadEndThatWasNotDelivered(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		err      error
+		wantJump bool
+	}{
+		{name: "not submitted", err: fmt.Errorf("usbfs: transfer not submitted: %w", context.Canceled)},
+		{name: "endpoint stalled", err: usbfs.ErrStall},
+		{name: "timed out", err: usbfs.ErrTimeout},
+		// The one ambiguous case: a device that has gone may well have gone
+		// because it jumped.
+		{name: "device gone", err: usbfs.ErrNoDevice, wantJump: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fw := &Firmware{Pages: [][]byte{page(0, 16)}, CRC: 0x5A, CRCKnown: true}
+			inner := &fakeBulk{respond: ackEverything}
+			dev := &jumpFailBulk{fakeBulk: inner, err: tc.err}
+			lines, log := newLog()
+
+			res, err := update(t.Context(), newTestFlasher(dev), fw, UpdateOptions{Log: log})
+			if !res.CRCChecked {
+				t.Fatalf("the image did not verify, so this exercises the wrong failure: %v", err)
+			}
+			if inner.hasSent(BootloadEndFrame()) {
+				t.Fatal("the fake recorded CMD_BOOTLOAD_END although the write failed")
+			}
+			if tc.wantJump {
+				if err != nil {
+					t.Fatalf("update: %v; a vanished device is the one case that stays a warning", err)
+				}
+				if !res.JumpedToApp {
+					t.Error("JumpedToApp = false for a device that disappeared as it jumped")
+				}
+				if !lines.contains("may already have jumped") {
+					t.Errorf("log = %v, want the ambiguity reported", *lines)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("update returned nil although CMD_BOOTLOAD_END was never accepted")
+			}
+			if res.JumpedToApp {
+				t.Error("JumpedToApp = true although CMD_BOOTLOAD_END was never accepted")
+			}
+			if !errors.Is(err, tc.err) {
+				t.Errorf("error = %v, want it to wrap %v", err, tc.err)
+			}
+			// The user has to be told the unit is where it is, and that the
+			// remedy is the flash the success message would have forbidden.
+			for _, want := range []string{"bootloader mode", "re-flashed"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q should mention %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
 func TestUpdateRejectsNilFirmware(t *testing.T) {
 	t.Parallel()
 	f := newTestFlasher(&fakeBulk{})
@@ -1075,5 +1197,101 @@ func TestInApplicationModeUsesTheMIDIInterface(t *testing.T) {
 	}
 	if InApplicationMode(nil) {
 		t.Error("a nil config must not read as application mode")
+	}
+}
+
+// SPEC.md §4.2 selects the MIDI interface on (Class == 0x01 || Class == 0xFF)
+// && SubClass == 0x03, and usbmidi.SelectInterface accepts both spellings, so
+// the guard has to as well: on a unit whose MIDIStreaming interface is declared
+// vendor-class, a guard that knew only 01/03 would wave `flash --recover`
+// through at a running application, and the picker would then hand it the MIDI
+// endpoints the tool itself talks USB-MIDI to.
+func TestInApplicationModeAcceptsAVendorClassMIDIInterface(t *testing.T) {
+	midi := usbfs.Interface{
+		Number: 1, Class: 0xFF, SubClass: 0x03, ConfigurationValue: 1,
+		Endpoints: []usbfs.Endpoint{
+			{Address: 0x02, Attributes: 0x02}, {Address: 0x83, Attributes: 0x02},
+		},
+	}
+	vendor := usbfs.Interface{
+		Number: 2, Class: 0xFF, SubClass: 0x00, ConfigurationValue: 1,
+		Endpoints: []usbfs.Endpoint{
+			{Address: 0x01, Attributes: 0x02}, {Address: 0x81, Attributes: 0x02},
+		},
+	}
+	appMode := &usbfs.Config{Active: 1, Interfaces: []usbfs.Interface{midi, vendor}}
+	if !InApplicationMode(appMode) {
+		t.Error("a vendor-class MIDIStreaming interface must read as application mode; " +
+			"--transport usb drives that shape as MIDI")
+	}
+	// The MIDI interface comes first in descriptor order, so a picker that
+	// looked only at the class would choose it.
+	if iface, ok := PickBootloaderInterface(appMode); !ok {
+		t.Error("the vendor interface must still be selectable")
+	} else if iface.Number != vendor.Number {
+		t.Errorf("picked interface %d (subclass 0x%02X), want the non-MIDI vendor interface %d",
+			iface.Number, iface.SubClass, vendor.Number)
+	}
+
+	// The unmeasured half: nothing records the bootloader interface's
+	// bInterfaceSubClass (SPEC.md §14.3), so a bootloader that declares 0x03 on
+	// its one vendor interface must still be recognised as a bootloader and
+	// must still be flashable. Refusing here would leave a unit that needs
+	// re-flashing with no way to be re-flashed.
+	lone := &usbfs.Config{Active: 1, Interfaces: []usbfs.Interface{midi}}
+	if InApplicationMode(lone) {
+		t.Error("a unit presenting a single vendor-class interface and no second one must read as bootloader mode")
+	}
+	if _, ok := PickBootloaderInterface(lone); !ok {
+		t.Error("a bootloader whose only interface declares subclass 0x03 must still be selectable")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Connect's fail-fast option
+// ---------------------------------------------------------------------------
+
+// TestEveryCandidateWasApplicationModeNeedsEveryCandidate pins the guard that
+// makes ConnectOptions.FailFastOnApplicationMode safe. connectOnce reports
+// whichever candidate failed last, so a pass that saw a healthy VFLEX refuse as
+// an application while the real target was still re-enumerating can carry
+// ErrApplicationMode as its error. Abandoning the retry window on that would
+// give up on a flash that was about to succeed, which is why the option is
+// gated on the whole pass rather than on the reported error.
+func TestEveryCandidateWasApplicationModeNeedsEveryCandidate(t *testing.T) {
+	other := errors.New("bootloader: no vendor-class interface with both endpoints")
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"every candidate an application", &connectFailure{err: ErrApplicationMode, allApplicationMode: true}, true},
+		{"one candidate failed otherwise", &connectFailure{err: ErrApplicationMode, allApplicationMode: false}, false},
+		{"wrapped by the caller", fmt.Errorf("connecting: %w", &connectFailure{err: ErrApplicationMode, allApplicationMode: true}), true},
+		{"not a connect failure at all", ErrApplicationMode, false},
+		{"nil", nil, false},
+		{"unrelated failure", &connectFailure{err: other, allApplicationMode: false}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := everyCandidateWasApplicationMode(tt.err); got != tt.want {
+				t.Errorf("everyCandidateWasApplicationMode(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestConnectFailureStaysUnwrappable is the compatibility half: connectOnce now
+// returns a wrapper, and every existing errors.Is against the underlying error
+// has to keep answering the same way -- the CLI classifies an application-mode
+// refusal that way to tell the user their unit is not in the bootloader.
+func TestConnectFailureStaysUnwrappable(t *testing.T) {
+	err := error(&connectFailure{err: fmt.Errorf("claiming: %w", ErrApplicationMode), allApplicationMode: true})
+	if !errors.Is(err, ErrApplicationMode) {
+		t.Error("errors.Is(err, ErrApplicationMode) = false; the wrapper hides the sentinel")
+	}
+	if got, want := err.Error(), "claiming: "+ErrApplicationMode.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }

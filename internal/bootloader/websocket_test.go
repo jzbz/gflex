@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -558,5 +559,166 @@ func TestWSDialStillChecksTheHandshake(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "expected 101") {
 			t.Errorf("error = %q, want it to name the expected status", err.Error())
 		}
+	})
+}
+
+// net/http validates the three-digit status code and hands the reason phrase
+// over exactly as the server wrote it, so the status line is server-controlled
+// text on its way to the operator's terminal -- the same hazard the Close
+// reason and the version string are already sanitised for.
+func TestWSDialSanitisesTheServersStatusLine(t *testing.T) {
+	t.Parallel()
+	url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, _ string) {
+		io.WriteString(conn, "HTTP/1.1 403 \x1b[2J\x1b]0;pwned\x07Forbidden\r\nContent-Length: 0\r\n\r\n")
+		io.Copy(io.Discard, conn)
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	c, err := wsDial(ctx, url)
+	if err == nil {
+		c.Close()
+		t.Fatal("a 403 completed the handshake")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "expected 101") {
+		t.Errorf("error = %q, want it to name the expected status", msg)
+	}
+	for i := 0; i < len(msg); i++ {
+		if b := msg[i]; b < 0x20 || b > 0x7E {
+			t.Fatalf("error contains byte 0x%02x at offset %d: %q", b, i, msg)
+		}
+	}
+}
+
+// Connection is a list header and RFC 9110 §5.3 makes repeated field lines one
+// comma-joined list, so a proxy that splits the tokens over two lines still
+// sends a handshake RFC 6455 §4.1 requires the client to accept. Reading only
+// the first line refused it.
+func TestWSDialAcceptsAMultiLineConnectionHeader(t *testing.T) {
+	t.Parallel()
+	payload := []byte(`{"app_bin":["00010203"],"crc":9}`)
+	url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, accept string) {
+		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: keep-alive\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: "+accept+"\r\n\r\n")
+		conn.Write(append([]byte{0x81, byte(len(payload))}, payload...))
+		io.Copy(io.Discard, conn)
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	c, err := wsDial(ctx, url)
+	if err != nil {
+		t.Fatalf("wsDial: %v", err)
+	}
+	defer c.Close()
+	if _, _, err := c.readMessage(); err != nil {
+		t.Fatalf("readMessage: %v", err)
+	}
+}
+
+// The handshake used to be the one blocking exchange in this client that
+// cancellation could not reach: the close hook was armed only once wsDial had
+// returned, so a Ctrl-C against a server that stalls before its 101 did nothing
+// until the whole --fetch-timeout budget expired -- and was then reported as an
+// i/o timeout, which the CLI dresses up with a hint about a device that was
+// never involved.
+func TestFetchIsInterruptibleDuringTheUpgradeExchange(t *testing.T) {
+	t.Parallel()
+	url := wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, _ string) {
+		// Read the request, answer nothing, and stay open until the client
+		// gives up: exactly what a black-holing middlebox looks like.
+		io.Copy(io.Discard, conn)
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := FetchRaw(ctx, url, "VF001234", 30*time.Second)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a server that never answers the upgrade completed the fetch")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to carry context.Canceled", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %s: the upgrade exchange is bounded by the fetch budget rather than by the context", elapsed)
+	}
+}
+
+// The service's contract is one JSON blob (SPEC.md §10.3). ParseImage's raw
+// fallback is for a local .bin, and letting a network reply reach it turns any
+// plain-text answer -- an error string, a proxy's status page -- into a valid
+// one-page image of that text, which only --force stands between and flash.
+func TestFetchRefusesANonJSONReply(t *testing.T) {
+	t.Parallel()
+	for _, reply := range []string{
+		"Internal server error",
+		"Unknown serial number",
+		"<html><body>502 Bad Gateway</body></html>",
+	} {
+		fw, err := Fetch(t.Context(), replyServer(t, reply), "VF001234", 10*time.Second)
+		if err == nil {
+			t.Fatalf("Fetch accepted %q as a firmware image: %d page(s) of %d bytes",
+				reply, len(fw.Pages), fw.PageSize())
+		}
+		if !errors.Is(err, ErrBadPageLength) {
+			t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+		}
+		// The message has to name what actually happened, because the one the
+		// CLI would otherwise print -- "this image carries no CRC, re-run with
+		// --force" -- diagnoses the wrong problem and names the wrong remedy.
+		if !strings.Contains(err.Error(), "not JSON") {
+			t.Errorf("error = %v, want it to say the reply was not JSON", err)
+		}
+	}
+
+	// The refused reply is quoted, so it is one more piece of server-controlled
+	// text on its way to a terminal: inert and bounded, like the Close reason
+	// and the status line.
+	hostile := "\x1b[2J\x1b]0;pwned\x07" + strings.Repeat("A", 4096)
+	_, err := Fetch(t.Context(), replyServer(t, hostile), "VF001234", 10*time.Second)
+	if err == nil {
+		t.Fatal("a 4 KiB text reply was accepted as a firmware image")
+	}
+	msg := err.Error()
+	for i := 0; i < len(msg); i++ {
+		if b := msg[i]; b < 0x20 || b > 0x7E {
+			t.Fatalf("error contains byte 0x%02x at offset %d: %q", b, i, msg)
+		}
+	}
+	if len(msg) > 400 {
+		t.Errorf("error is %d bytes for a 4 KiB reply; the excerpt is not bounded", len(msg))
+	}
+
+	// A reply that is JSON but not a firmware document is still the parser's
+	// business to describe.
+	if _, err := Fetch(t.Context(), replyServer(t, `{"error":"unknown serial"}`), "VF001234", 10*time.Second); err == nil {
+		t.Error("a JSON object with no pages was accepted as an image")
+	} else if !strings.Contains(err.Error(), "app_bin") {
+		t.Errorf("error = %v, want the payload's missing keys named", err)
+	}
+}
+
+// replyServer completes the handshake and answers the client's serial with one
+// text frame carrying reply, whatever it is. It returns the URL to fetch from.
+func replyServer(t *testing.T, reply string) string {
+	t.Helper()
+	return wsUpgradeServer(t, func(conn net.Conn, _ *http.Request, accept string) {
+		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: "+accept+"\r\n\r\n")
+		header := []byte{0x81, byte(len(reply))}
+		if len(reply) > 125 {
+			header = []byte{0x81, 126, 0, 0}
+			binary.BigEndian.PutUint16(header[2:], uint16(len(reply)))
+		}
+		conn.Write(append(header, reply...))
+		io.Copy(io.Discard, conn)
 	})
 }

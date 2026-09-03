@@ -482,6 +482,91 @@ func TestVoltageZeroMeansNotReady(t *testing.T) {
 	})
 }
 
+// TestSetVoltageAsksWhatTheRailIsAfterAnUnansweredWrite is the case that has no
+// safe default answer.
+//
+// A write frame that was transmitted in full and never answered may have been
+// applied: the protocol has no NACK, so a lost echo and a lost command look
+// identical from here (SPEC.md §5.2), and the fake cannot stage it with a Drop
+// fault -- that suppresses the response before the responder runs, which models
+// the request being lost. A handler that stores the value and declines to
+// answer models the other half. Reporting "write voltage failed" and stopping
+// there is how a user connects a 5 V pedal to a rail sitting at 12 V, so the
+// device gets asked what it holds.
+func TestSetVoltageAsksWhatTheRailIsAfterAnUnansweredWrite(t *testing.T) {
+	t.Run("the reported value is the device's", func(t *testing.T) {
+		s, d := newTestSession(t, Options{Timeout: 100 * time.Millisecond})
+		d.SetHandler(proto.CmdVoltageMv, func(f proto.Frame) []byte {
+			if f.Write {
+				d.StoreRegister(proto.CmdVoltageMv, f.Payload) // applied...
+				return nil                                     // ...and the echo is lost
+			}
+			v, _ := d.Register(proto.CmdVoltageMv)
+			return v
+		})
+
+		got, err := s.SetVoltageMv(context.Background(), 12000)
+		if err == nil {
+			t.Fatal("want an error: the write was never acknowledged")
+		}
+		if !errors.Is(err, ErrUnacknowledged) {
+			t.Fatalf("error = %v, want it to wrap ErrUnacknowledged", err)
+		}
+		if got != 12000 {
+			t.Errorf("SetVoltageMv = %d, want the 12000 mV the device now holds", got)
+		}
+		if !strings.Contains(err.Error(), "the device now reports 12000 mV") {
+			t.Errorf("error = %v, want it to say what the device reports", err)
+		}
+		if n := len(d.Sent()); n != 2 {
+			t.Errorf("device saw %d frames, want 2 (the write plus one read-back)", n)
+		}
+	})
+
+	t.Run("the salvage read is asked once", func(t *testing.T) {
+		// The read-back is single-shot on purpose. VoltageMv's not-ready ladder
+		// exists for a unit that was only just plugged in (SPEC.md §6.5, §7),
+		// which is not the unit that just failed to answer a write: running it
+		// here would keep a silent device quiet for the whole ReadyTimeout
+		// budget before the user hears anything at all.
+		s, d := newTestSession(t, Options{Timeout: 100 * time.Millisecond}) // ReadyTimeout: the 10 s default
+
+		start := time.Now()
+		if _, err := s.SetVoltageMv(context.Background(), 12000); !errors.Is(err, ErrUnacknowledged) {
+			t.Fatalf("error = %v, want it to wrap ErrUnacknowledged", err)
+		}
+		if n := len(d.Sent()); n != 2 {
+			t.Errorf("device saw %d frames, want 2 (the write plus a single read-back attempt)", n)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("took %v; the read-back must not spend the ready budget", elapsed)
+		}
+	})
+
+	t.Run("a cancelled write asks nothing", func(t *testing.T) {
+		// There is no round trip left to make: the context that failed the
+		// write would fail the read the same way. The sentinel is what carries
+		// the warning instead.
+		s, d := newTestSession(t, Options{Timeout: 10 * time.Second})
+		d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(12000))
+		d.SetFault(proto.CmdVoltageMv, fake.Fault{Delay: 5 * time.Second})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		_, err := s.SetVoltageMv(ctx, 12000)
+		if !errors.Is(err, ErrUnacknowledged) {
+			t.Fatalf("error = %v, want it to wrap ErrUnacknowledged", err)
+		}
+		if n := len(d.Sent()); n != 1 {
+			t.Errorf("device saw %d frames, want 1 (the write alone)", n)
+		}
+	})
+}
+
 // TestSetVoltageReturnsReadBackNotEcho proves the write echo is not trusted:
 // the device echoes the requested value but reports a different one on read.
 func TestSetVoltageReturnsReadBackNotEcho(t *testing.T) {

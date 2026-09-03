@@ -3,10 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/session"
 	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
@@ -227,6 +231,402 @@ func TestSettingWriteFlagsRefuseGoLiteralShapes(t *testing.T) {
 			}
 		}
 	}
+}
+
+// applyButDoNotAnswer makes cmd behave like a device that received a write,
+// applied it, and whose acknowledgement was then lost.
+//
+// fake.Fault{Drop: true} deliberately does not stage this -- its own
+// documentation says so: Drop loses the REQUEST, so nothing is applied. The
+// host cannot tell the two apart, because there is no NACK anywhere in this
+// protocol (SPEC.md §5.2), and that is exactly why the advisory under test has
+// to assume the dangerous one. onWrite, when non-nil, runs after the write has
+// landed and before the silence.
+func applyButDoNotAnswer(dev *fake.Device, cmd proto.Cmd, onWrite func()) {
+	dev.SetHandler(cmd, func(f proto.Frame) []byte {
+		if !f.Write {
+			v, _ := dev.Register(cmd)
+			return v
+		}
+		dev.StoreRegister(cmd, f.Payload)
+		if onWrite != nil {
+			onWrite()
+		}
+		return nil // the write landed; the acknowledgement did not
+	})
+}
+
+// TestUnansweredVoltageWriteSaysTheRailMayBeLive covers the failure the
+// protocol produces routinely: the write frame is transmitted in full, the
+// device applies it, and the echo is lost (SPEC.md §5.2, §14.15). The command
+// still fails -- the device's state is unknown, not known-good -- but it must
+// not leave the user believing the rail is where it was, which is how a 5 V
+// pedal ends up on a 12 V rail.
+func TestUnansweredVoltageWriteSaysTheRailMayBeLive(t *testing.T) {
+	dev := fake.NewTypical()
+	applyButDoNotAnswer(dev, proto.CmdVoltageMv, nil)
+	tr := newFakeTree(t, dev)
+
+	err := tr.run(t, "voltage", "set", "12", "--yes", "--timeout=200ms")
+	if err == nil {
+		t.Fatal("`voltage set 12 --yes` reported success with nothing acknowledged")
+	}
+	// Assert the fake really did apply it first: otherwise a double that
+	// dropped the write would let this test pass while describing nothing.
+	if stored, ok := dev.Register(proto.CmdVoltageMv); !ok ||
+		!bytes.Equal(stored, proto.EncodeU16(12000)) {
+		t.Fatalf("device voltage register = %x, want the applied %x", stored, proto.EncodeU16(12000))
+	}
+	for _, want := range []string{"transmitted in full", "gflex voltage get"} {
+		if !strings.Contains(tr.stderr.String(), want) {
+			t.Errorf("stderr does not say the write may already have been applied (%q):\n%s",
+				want, tr.stderr.String())
+		}
+	}
+}
+
+// The same write cut short by a Ctrl-C or a SIGTERM, which
+// signal.NotifyContext turns into a cancelled context (root.go). This is the
+// case that has to be said on stderr rather than in the error: Execute prints
+// nothing but "gflex: interrupted" for anything chained to context.Canceled, so
+// a message folded into the error chain reaches nobody, and "interrupted" reads
+// as "nothing happened" while the rail is live.
+func TestInterruptedVoltageWriteSaysTheRailMayBeLive(t *testing.T) {
+	dev := fake.NewTypical()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The signal lands in the window between the last MIDI message and the
+	// echo: the frame is on the wire, so the device has it.
+	applyButDoNotAnswer(dev, proto.CmdVoltageMv, cancel)
+	tr := newFakeTree(t, dev)
+
+	err := tr.runContext(t, ctx, "voltage", "set", "12", "--yes")
+	if err == nil {
+		t.Fatal("`voltage set 12 --yes` reported success after being interrupted")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want it to carry context.Canceled", err)
+	}
+	if stored, ok := dev.Register(proto.CmdVoltageMv); !ok ||
+		!bytes.Equal(stored, proto.EncodeU16(12000)) {
+		t.Fatalf("device voltage register = %x, want the applied %x", stored, proto.EncodeU16(12000))
+	}
+	if !strings.Contains(tr.stderr.String(), "transmitted in full") {
+		t.Errorf("an interrupted write said nothing about the rail:\n%s", tr.stderr.String())
+	}
+}
+
+// The exclusion that makes the advisory worth trusting. A write whose SEND
+// failed did not land: the frame stopped at the message that could not be
+// written, so it is truncated and the device's receive state machine drops it
+// for want of an end-of-frame marker (SPEC.md §3.3). Saying "the device may
+// have applied it" there would be a false alarm on the one message that has to
+// stay trustworthy, which is why session.ErrUnacknowledged is not attached to
+// that leg -- and why this advisory keys on the sentinel rather than on "the
+// write returned an error".
+func TestOnlyAnUnacknowledgedWriteSaysItMayHaveLanded(t *testing.T) {
+	cases := []struct {
+		name         string
+		err          error
+		wantAdvisory bool
+	}{
+		{
+			"a send that never left the host",
+			fmt.Errorf("CMD_VOLTAGE_MV: send failed (tx 04 92 2e e0): %w", errors.New("no such device")),
+			false,
+		},
+		{
+			"a transmitted write that went unanswered",
+			fmt.Errorf("write voltage 12000 mV: %w: %w", session.ErrUnacknowledged, session.ErrTimeout),
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			warnUnacknowledged(newFormatter(false, &stdout, &stderr), tc.err,
+				"output voltage write", "gflex voltage get")
+			if got := strings.Contains(stderr.String(), "transmitted in full"); got != tc.wantAdvisory {
+				t.Errorf("advisory printed = %v, want %v; stderr: %q", got, tc.wantAdvisory, stderr.String())
+			}
+		})
+	}
+}
+
+// TestSettingDryRunsListTheWholeExchange holds the four commands that write a
+// setting to interlock 8 of SPEC.md §13: --dry-run prints the frames a command
+// would send, and is refused only where a frame cannot be known without reading
+// the device. Every frame these four issue is a constant, so there was no
+// excuse for listing only the write -- `voltage set 12 --dry-run` showed one
+// frame while the command sends three, and the two it hid are the window read
+// interlock 1 depends on and the read-back that verifies the value. An operator
+// auditing the command before running it on a rig reads this list and stops.
+//
+// Derived rather than asserted, the way TestInfoDryRunMatchesWhatInfoSends is:
+// each command runs for real against a fake device, and the frames the device
+// received are compared with what the same command's own --dry-run lists.
+func TestSettingDryRunsListTheWholeExchange(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"voltage set", []string{"voltage", "set", "12", "--yes"}},
+		{"current set", []string{"current", "set", "3", "--yes"}},
+		// A narrowing, so the run needs nothing but the flags themselves.
+		{"vlimit set", []string{"vlimit", "set", "--low", "3300mV", "--high", "12000mV", "--yes"}},
+		{"calibrate adc", []string{"calibrate", "adc", "--offset", "10", "--scale", "20", "--yes"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dev := fake.NewTypical()
+			live := newFakeTree(t, dev)
+			if err := live.run(t, tc.args...); err != nil {
+				t.Fatalf("`gflex %s`: %v\n%s", strings.Join(tc.args, " "), err, live.stderr.String())
+			}
+
+			dry := newFakeTree(t, fake.NewTypical())
+			if err := dry.run(t, append(append([]string{}, tc.args...), "--dry-run", "--json")...); err != nil {
+				t.Fatalf("`gflex %s --dry-run`: %v", strings.Join(tc.args, " "), err)
+			}
+			var listing struct {
+				Frames []struct {
+					Frame string `json:"frame"`
+				} `json:"frames"`
+			}
+			if err := json.Unmarshal(dry.stdout.Bytes(), &listing); err != nil {
+				t.Fatalf("decoding the dry-run listing: %v\n%s", err, dry.stdout.String())
+			}
+
+			sent := dev.SentHex()
+			listed := make([]string, len(listing.Frames))
+			for i, fr := range listing.Frames {
+				listed[i] = fr.Frame
+			}
+			if len(sent) != len(listed) {
+				t.Fatalf("the command sent %d frames and --dry-run lists %d\n  sent:   %v\n  listed: %v",
+					len(sent), len(listed), sent, listed)
+			}
+			for i := range sent {
+				if sent[i] != listed[i] {
+					t.Errorf("frame %d: sent %s, --dry-run lists %s", i, sent[i], listed[i])
+				}
+			}
+		})
+	}
+}
+
+// The other half of interlock 8's honesty: a --dry-run reads nothing, so it must
+// not report a read that failed. "user voltage limits could not be read"
+// described a failure that never happened, on the one output the spec calls a
+// safety property.
+func TestVoltageSetDryRunDoesNotClaimAFailedRead(t *testing.T) {
+	tr := newFakeTree(t, fake.NewTypical())
+	if err := tr.run(t, "voltage", "set", "12", "--dry-run"); err != nil {
+		t.Fatalf("`voltage set 12 --dry-run`: %v", err)
+	}
+	if strings.Contains(tr.stderr.String(), "could not be read") {
+		t.Errorf("a dry run reports a limit read that was never attempted:\n%s", tr.stderr.String())
+	}
+	if !strings.Contains(tr.stderr.String(), "were not read") {
+		t.Errorf("a dry run does not say the limits went unread:\n%s", tr.stderr.String())
+	}
+}
+
+// echoAndKeepTheOldValue makes cmd acknowledge a write, echo it, and keep what
+// it already held: the validate-and-discard shape SPEC.md §14.4 measured, which
+// is what any write the device does not commit looks like from the host. There
+// is no NACK to say so (SPEC.md §5.2), so the read-back is the only thing that
+// can notice.
+func echoAndKeepTheOldValue(dev *fake.Device, cmd proto.Cmd) {
+	dev.SetHandler(cmd, func(f proto.Frame) []byte {
+		if f.Write {
+			return append([]byte{}, f.Payload...)
+		}
+		v, _ := dev.Register(cmd)
+		return v
+	})
+}
+
+// TestVLimitSetComparesItsReadBack holds `vlimit set` to the claim the README
+// and SPEC.md §17 (row 6.5) make for it: the paths that can damage a load verify
+// by read-back. Reading the pair back and printing it without comparing it is
+// not verification -- the command exited 0 and printed the OLD window, which is
+// the guard rail interlock 1 checks every later `voltage set` against, so a
+// script chaining `vlimit set --high 5 && voltage set 12` would believe in a
+// 5 V ceiling that was never stored.
+func TestVLimitSetComparesItsReadBack(t *testing.T) {
+	dev := fake.NewTypical() // window 3300-48000 mV
+	echoAndKeepTheOldValue(dev, proto.CmdUserVLimit)
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "vlimit", "set", "--low", "3300mV", "--high", "5000mV"); err != nil {
+		t.Fatalf("`vlimit set --low 3300mV --high 5000mV`: %v", err)
+	}
+	if !strings.Contains(tr.stderr.String(), "read back [3300, 48000] mV after writing [3300, 5000] mV") {
+		t.Errorf("a window the device did not keep was reported without a word:\n%s", tr.stderr.String())
+	}
+}
+
+// The same for `current set`, which reads back for the same reason.
+func TestCurrentSetComparesItsReadBack(t *testing.T) {
+	dev := fake.NewTypical() // 5000 mA
+	echoAndKeepTheOldValue(dev, proto.CmdCurrentLimitMa)
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "current", "set", "4.9"); err != nil {
+		t.Fatalf("`current set 4.9`: %v", err)
+	}
+	if !strings.Contains(tr.stderr.String(), "read back 5000 mA after writing 4900 mA") {
+		t.Errorf("a current limit the device did not keep was reported without a word:\n%s",
+			tr.stderr.String())
+	}
+}
+
+// And when the read-back cannot be had at all, what is printed is the request,
+// so it says so. `voltage set` and `current set` both annotate that case; the
+// window -- the one value here that is itself a safety interlock -- did not.
+func TestVLimitSetAnnotatesAPairItCouldNotReadBack(t *testing.T) {
+	dev := fake.NewTypical()
+	var reads int
+	dev.SetHandler(proto.CmdUserVLimit, func(f proto.Frame) []byte {
+		if f.Write {
+			dev.StoreRegister(proto.CmdUserVLimit, f.Payload)
+			return append([]byte{}, f.Payload...)
+		}
+		// The first read is interlock 3's, and it is answered; the read-back
+		// after the write is not.
+		reads++
+		if reads > 1 {
+			return nil
+		}
+		v, _ := dev.Register(proto.CmdUserVLimit)
+		return v
+	})
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "vlimit", "set", "--low", "3300mV", "--high", "5000mV", "--timeout=200ms"); err != nil {
+		t.Fatalf("`vlimit set` with an unanswered read-back: %v", err)
+	}
+	if !strings.Contains(tr.stdout.String(), "(written, not read back)") {
+		t.Errorf("the requested window is presented as the device's answer:\n%s", tr.stdout.String())
+	}
+}
+
+// answerWritesOnly makes cmd store and echo a write while leaving every read
+// unanswered, which is how a single dropped response frame looks from the host
+// (SPEC.md §5.2): the setting still works, the question about it does not.
+func answerWritesOnly(dev *fake.Device, cmd proto.Cmd) {
+	dev.SetHandler(cmd, func(f proto.Frame) []byte {
+		if f.Write {
+			dev.StoreRegister(cmd, f.Payload)
+			return append([]byte{}, f.Payload...)
+		}
+		return nil
+	})
+}
+
+// TestCalibrateADCFillsInAnOmittedFlagFromItsOwnRead: `calibrate adc --offset 5`
+// needs the current SCALE to fill in the flag it was not given, and it had that
+// value in hand -- the scale read succeeded. Failing the whole command because
+// the unrelated offset read timed out threw away a perfectly good answer, on a
+// path whose reads are two independent commands with no NACK between them.
+func TestCalibrateADCFillsInAnOmittedFlagFromItsOwnRead(t *testing.T) {
+	dev := fake.NewTypical()
+	dev.StoreRegister(proto.CmdVMeasureADCScale, proto.EncodeI32(7))
+	answerWritesOnly(dev, proto.CmdVMeasureADCOffset)
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "calibrate", "adc", "--offset", "5", "--yes", "--timeout=200ms"); err != nil {
+		t.Fatalf("`calibrate adc --offset 5 --yes` with the offset read unanswered: %v", err)
+	}
+	if stored, ok := dev.Register(proto.CmdVMeasureADCOffset); !ok ||
+		!bytes.Equal(stored, proto.EncodeI32(5)) {
+		t.Errorf("device ADC offset = %x, want %x", stored, proto.EncodeI32(5))
+	}
+	if stored, ok := dev.Register(proto.CmdVMeasureADCScale); !ok ||
+		!bytes.Equal(stored, proto.EncodeI32(7)) {
+		t.Errorf("device ADC scale = %x, want the 7 it already held", stored)
+	}
+	// And the term nobody asked to change is not written back at all: the value
+	// came from the device one round trip ago, so rewriting it can only spend a
+	// non-volatile write, and would make a wrong read permanent.
+	if tr.wrote(t, proto.CmdVMeasureADCScale) {
+		t.Errorf("the scale was rewritten with the value it already held; frames: %v",
+			cmdNames(dev.Sent()))
+	}
+	if !strings.Contains(tr.stdout.String(), "(unchanged)") {
+		t.Errorf("the kept term is presented as one this command wrote:\n%s", tr.stdout.String())
+	}
+}
+
+// And the read with no consumer left is not issued at all. With both flags
+// given, the scale read exists only to print the previous pair beside the
+// offset in interlock 5's restore command (SPEC.md §13.5) -- which cannot be
+// printed once the offset read has failed. Issuing it anyway costs a round trip,
+// and a second full --timeout on a unit that has stopped answering.
+func TestCalibrateADCSkipsTheReadWithNoConsumer(t *testing.T) {
+	dev := fake.NewTypical()
+	answerWritesOnly(dev, proto.CmdVMeasureADCOffset)
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "calibrate", "adc", "--offset", "5", "--scale", "7", "--yes", "--timeout=200ms"); err != nil {
+		t.Fatalf("`calibrate adc --offset 5 --scale 7 --yes`: %v", err)
+	}
+	for _, fr := range dev.Sent() {
+		parsed, err := proto.Parse(fr)
+		if err != nil {
+			t.Fatalf("the device received an unparseable frame %s: %v", proto.Hex(fr), err)
+		}
+		if parsed.Cmd == proto.CmdVMeasureADCScale && !parsed.Write {
+			t.Errorf("the ADC scale was read with nothing left to read it for; frames: %v",
+				cmdNames(dev.Sent()))
+		}
+	}
+}
+
+// TestReadBackIsMarkedInJSON pins the machine-readable half of the annotation
+// the human output has carried all along. `current set --json` printed the same
+// current_limit_ma field whether the value was the device's read-back or only
+// the request whose read-back never came, so a script had nothing to key on --
+// and the read-back is what SPEC.md §17 (row 6.5) spends a round trip on.
+func TestReadBackIsMarkedInJSON(t *testing.T) {
+	readBack := func(t *testing.T, out []byte) (bool, bool) {
+		t.Helper()
+		var doc struct {
+			ReadBack *bool `json:"read_back"`
+		}
+		if err := json.Unmarshal(out, &doc); err != nil {
+			t.Fatalf("decoding the JSON result: %v\n%s", err, out)
+		}
+		if doc.ReadBack == nil {
+			return false, false
+		}
+		return *doc.ReadBack, true
+	}
+
+	t.Run("verified", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		if err := tr.run(t, "current", "set", "3", "--json"); err != nil {
+			t.Fatalf("`current set 3 --json`: %v", err)
+		}
+		verified, ok := readBack(t, tr.stdout.Bytes())
+		if !ok || !verified {
+			t.Errorf("a value the device reported is not marked as read back: %s", tr.stdout.String())
+		}
+	})
+
+	t.Run("unverified", func(t *testing.T) {
+		dev := fake.NewTypical()
+		answerWritesOnly(dev, proto.CmdCurrentLimitMa)
+		tr := newFakeTree(t, dev)
+		if err := tr.run(t, "current", "set", "3", "--json", "--timeout=200ms"); err != nil {
+			t.Fatalf("`current set 3 --json` with the read-back unanswered: %v", err)
+		}
+		verified, ok := readBack(t, tr.stdout.Bytes())
+		if !ok || verified {
+			t.Errorf("a value that was never read back is presented as confirmed: %s", tr.stdout.String())
+		}
+	})
 }
 
 // TestLEDSetReportsWhatItWrote pins the annotation that keeps `led set`'s

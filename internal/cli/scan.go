@@ -437,16 +437,16 @@ func emitMatch(f Formatter, m pdo.Match, voltageV, currentA float64) {
 		f.KV("match_mode", "negotiated as", m.Mode, m.Mode)
 	}
 	if m.MaxCurrentA > 0 {
-		display := trimFloat(m.MaxCurrentA, 2) + " A"
-		// When the 5 A cable bound reduced the figure, say what the source
-		// claimed as well. The verdict must use the conservative number, but
-		// hiding the difference would make a 140 W supply look under-powered
-		// for no visible reason.
-		if m.DeclaredMaxCurrentA > m.MaxCurrentA {
-			display += fmt.Sprintf("   (source declares %s A; no USB-C cable is rated above %s A)",
-				trimFloat(m.DeclaredMaxCurrentA, 2), trimFloat(pdo.MaxCableCurrentA, 2))
-		}
-		f.KV("match_max_current_a", "available current", m.MaxCurrentA, display)
+		// The row carries the conservative number alone. What the source
+		// declared, and why the figure is lower, is said by pdo.finish's own
+		// cable-bound note two lines below -- it is appended to Messages on
+		// every path that sets DeclaredMaxCurrentA, which is exactly the
+		// condition this row used to re-derive. Saying it here as well printed
+		// one fact twice in two wordings, which is two claims to a reader; the
+		// pdo package exported SPRAVSAssumptionClause rather than let a
+		// disclosure be spelled out differently in two places, and this is the
+		// same rule applied to the other one.
+		f.KV("match_max_current_a", "available current", m.MaxCurrentA, trimFloat(m.MaxCurrentA, 2)+" A")
 	}
 	for _, msg := range m.Messages {
 		f.Note("  %s", msg)

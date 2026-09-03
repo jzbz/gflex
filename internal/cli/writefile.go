@@ -13,7 +13,9 @@ import (
 // it cleans up nothing on the error path. A rename within one directory is
 // atomic, so a reader sees either the whole of the old file or the whole of the
 // new one -- never the window in between, whatever a signal, a full disk or a
-// power cut does to this process partway through.
+// power cut does to this process partway through. Two syncs are what make the
+// last of those true rather than merely likely: one for the contents, one for
+// the directory entry the rename creates.
 //
 // Both callers need that, for the same reason and with different consequences.
 // The udev rule lands in a directory udev re-reads on every `udevadm control
@@ -56,5 +58,23 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err = os.Rename(name, path); err != nil {
+		return err
+	}
+	// And sync the directory, because the rename is not covered by the sync
+	// above: fsync commits a file's contents, not the directory entry that
+	// names it. Without this the promise at the top of this function stops one
+	// step short of a power cut -- the bytes are on the disk under a name the
+	// directory may still not carry, so what comes back is the old file, or the
+	// temporary name, or neither. Opening the directory read-only and syncing
+	// it is what makes the rename itself durable.
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if err = dir.Sync(); err != nil {
+		dir.Close()
+		return err
+	}
+	return dir.Close()
 }

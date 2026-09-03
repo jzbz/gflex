@@ -1,12 +1,14 @@
 package usbfs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -461,6 +463,122 @@ func TestReleaseInterfaceStaysSilentWhenSysfsCannotAnswer(t *testing.T) {
 				t.Error("the reattach itself was skipped")
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The window between the release and the reattach.
+//
+// usbfs claims an interface for a process that did not: proc_bulk runs
+// checkintf(), and on an interface this fd does not hold it logs "did not claim
+// interface N before use" and claims it anyway. A transfer landing between
+// USBDEVFS_RELEASEINTERFACE and USBDEVFS_CONNECT therefore re-binds usbfs to the
+// interface, and the reattach then answers EBUSY without ever re-probing --
+// leaving snd-usb-audio unbound and the ALSA MIDI port missing until a replug,
+// which is the one thing ReleaseInterface exists to prevent. Both halves of the
+// defence are below: keeping the transfer out, and recovering if one gets in.
+// The scripted kernel makes the interleaving deterministic by submitting the
+// transfer from inside the release ioctl itself.
+// ---------------------------------------------------------------------------
+
+// The USB-MIDI reader checks its closed flag and its context *before* calling
+// Transfer and can be descheduled between the check and the ioctl, so the
+// exclusion has to live in the Device.
+func TestTransferIsRefusedWhileAnInterfaceIsBeingReleased(t *testing.T) {
+	var (
+		d                       *Device
+		transferErr, controlErr error
+	)
+	s := &scriptedIoctl{}
+	s.respond = func(c ioctlCall) error {
+		if c.req == ioctlReleaseInterface {
+			_, transferErr = d.Transfer(context.Background(), 0x81, make([]byte, 4), time.Millisecond)
+			// An interface-recipient control request goes through the same
+			// checkintf(), so it must be refused on the same terms.
+			_, controlErr = d.Control(context.Background(), 0x21, 0x22, 0, 1, nil, time.Millisecond)
+		}
+		return nil
+	}
+	d = s.device()
+	d.claimed[1] = claimState{detached: true}
+
+	if err := d.ReleaseInterface(1); err != nil {
+		t.Fatalf("ReleaseInterface: %v", err)
+	}
+	if transferErr == nil {
+		t.Error("a transfer submitted between the release and the reattach was accepted")
+	}
+	if controlErr == nil {
+		t.Error("a control transfer submitted between the release and the reattach was accepted")
+	}
+	if s.saw(ioctlBulk, 0, -1) || s.saw(ioctlControl, 0, -1) {
+		t.Error("a transfer submitted inside the release window reached the kernel")
+	}
+	// A window, not a latch: the reattach has happened, so the device is the
+	// kernel's business again and a transfer is once more its own affair.
+	if _, err := d.Transfer(context.Background(), 0x81, make([]byte, 4), time.Millisecond); err != nil {
+		t.Errorf("a transfer after the release had finished was refused: %v", err)
+	}
+}
+
+// The other half: a transfer that does get in leaves usbfs bound to the
+// interface, and EBUSY from USBDEVFS_CONNECT is that state rather than a driver
+// that declined. Giving the claim back and asking again is what puts the port
+// back; reporting it would tell the user to replug a device that did not need it.
+func TestReleaseInterfaceRetriesAReattachRefusedAsBusy(t *testing.T) {
+	connects := 0
+	s := &scriptedIoctl{}
+	s.respond = func(c ioctlCall) error {
+		if c.req == ioctlIoctl && c.inner == ioctlConnect {
+			connects++
+			if connects == 1 {
+				return unix.EBUSY
+			}
+		}
+		return nil
+	}
+	d := s.device()
+	d.claimed[1] = claimState{detached: true}
+
+	if err := d.ReleaseInterface(1); err != nil {
+		t.Fatalf("ReleaseInterface = %v, want nil: the second reattach succeeded", err)
+	}
+	// The claim has to be handed back before the retry, or the kernel has every
+	// reason to answer EBUSY again.
+	want := []uintptr{ioctlReleaseInterface, ioctlIoctl, ioctlReleaseInterface, ioctlIoctl}
+	if len(s.calls) != len(want) {
+		t.Fatalf("ioctl trace = %v, want release, connect, release, connect", s.calls)
+	}
+	for i, req := range want {
+		if s.calls[i].req != req {
+			t.Fatalf("ioctl %d of the trace is %v, want the sequence release, connect, release, connect", i, s.calls[i])
+		}
+	}
+}
+
+// The control for the retry: an interface held by something this process cannot
+// give back stays busy, and that is reported once rather than retried forever.
+func TestReleaseInterfaceReportsAReattachThatStaysBusy(t *testing.T) {
+	connects := 0
+	s := &scriptedIoctl{respond: func(c ioctlCall) error {
+		if c.req == ioctlIoctl && c.inner == ioctlConnect {
+			connects++
+			return unix.EBUSY
+		}
+		return nil
+	}}
+	d := s.device()
+	d.claimed[1] = claimState{detached: true}
+
+	err := d.ReleaseInterface(1)
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("ReleaseInterface err = %v, want one wrapping ErrBusy", err)
+	}
+	if connects != 2 {
+		t.Errorf("USBDEVFS_CONNECT issued %d times, want 2: one attempt and one retry", connects)
+	}
+	if !strings.Contains(err.Error(), "replug") {
+		t.Errorf("error %q does not tell the user to replug, which is the remedy left", err)
 	}
 }
 

@@ -1,7 +1,10 @@
 package usbfs
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -297,6 +300,67 @@ func descriptorDevice(t *testing.T, blob []byte, vendorID uint16) *Device {
 	return &Device{f: f, ref: DeviceRef{Path: p, VendorID: vendorID}, claimed: map[int]claimState{}}
 }
 
+// skippingReaderAt answers a pread the way usbfs does for a device whose
+// configuration descriptor over-claims wTotalLength: every byte of data is
+// counted in the return value, but the bytes in gap are never written into the
+// caller's buffer ("simply don't write (skip over) unallocated parts").
+type skippingReaderAt struct {
+	data     []byte
+	gapStart int64
+	gapEnd   int64
+}
+
+func (s skippingReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := min(len(s.data)-int(off), len(b))
+	for i := range n {
+		abs := off + int64(i)
+		if abs >= s.gapStart && abs < s.gapEnd {
+			continue // counted, never written
+		}
+		b[i] = s.data[abs]
+	}
+	if int(off)+n >= len(s.data) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// The bytes the kernel counts but never writes must come back as zeros, whatever
+// chunk of the blob they land in. Those zeros are a bLength of 0, which
+// ParseDescriptors refuses -- a deterministic rejection of a device that
+// over-claims wTotalLength. The alternative is worse than the rejection: reusing
+// the read buffer across chunks would fill the gap with the previous chunk's
+// bytes, which parse into interfaces and endpoints the device never declared.
+func TestReadDescriptorChunksZeroesBytesTheKernelSkipped(t *testing.T) {
+	const chunk = 4096
+	// One full chunk of non-zero bytes, then a second read whose whole payload
+	// is skipped -- so any staleness shows up as 0xEE rather than as zeros.
+	data := make([]byte, chunk+64)
+	for i := range data {
+		data[i] = 0xEE
+	}
+	r := skippingReaderAt{data: data, gapStart: chunk, gapEnd: int64(len(data))}
+
+	buf, err := readDescriptorChunks(r, "/dev/bus/usb/001/007")
+	if err != nil {
+		t.Fatalf("readDescriptorChunks: %v", err)
+	}
+	if len(buf) != len(data) {
+		t.Fatalf("got %d bytes, want the %d the kernel counted", len(buf), len(data))
+	}
+	for i, b := range buf[chunk:] {
+		if b != 0 {
+			t.Fatalf("byte %d of the skipped region is 0x%02x, want 0x00", chunk+i, b)
+		}
+	}
+	if !bytes.Equal(buf[:chunk], data[:chunk]) {
+		t.Error("the bytes the kernel did write were not returned intact")
+	}
+}
+
 // Enumeration reads idVendor from sysfs and then synthesises the node path from
 // busnum/devnum, and that path is a bus-address slot the kernel reuses -- so the
 // fd may not belong to the device sysfs described. The device descriptor at the
@@ -323,6 +387,38 @@ func TestDescriptorsRejectsAReplacedDevice(t *testing.T) {
 	// that into a rejection.
 	if _, err := descriptorDevice(t, sampleBlob(), 0).Descriptors(); err != nil {
 		t.Errorf("a DeviceRef with no vendor ID was rejected: %v", err)
+	}
+}
+
+// The device descriptor does not leave a usbfs node the way it left the device:
+// usbdev_read byte-swaps bcdUSB, idVendor, idProduct and bcdDevice into host
+// order, while the configuration trees behind it are copied out raw. Descriptors
+// has to read those two fields the way the kernel wrote them, or the
+// replaced-device guard above compares a byte-swapped vendor ID against the one
+// sysfs reported and rejects every device. On the little-endian architectures
+// this ships for (SPEC.md §12) the two orders coincide, so this pins the
+// contract; a big-endian build is where it would otherwise come apart.
+func TestDescriptorsReadTheDeviceIDsInHostOrder(t *testing.T) {
+	blob := sampleBlob()
+	binary.NativeEndian.PutUint16(blob[8:10], 0x37BF)
+	binary.NativeEndian.PutUint16(blob[10:12], 0x800F)
+
+	cfg, err := descriptorDevice(t, blob, 0x37BF).Descriptors()
+	if err != nil {
+		t.Fatalf("Descriptors: %v", err)
+	}
+	if cfg.VendorID != 0x37BF || cfg.ProductID != 0x800F {
+		t.Errorf("ids = %04x:%04x, want 37bf:800f", cfg.VendorID, cfg.ProductID)
+	}
+
+	// A device descriptor the parse itself declined to decode -- here a bLength
+	// running past the end of the blob -- must not acquire IDs from the
+	// re-decode: the replaced-device guard reads a zero vendor ID as "the blob
+	// did not say" and would otherwise be comparing invented bytes.
+	short := &Config{}
+	short.adjustDeviceIDsHostOrder([]byte{0x12, descTypeDevice, 0x00, 0x02})
+	if short.VendorID != 0 || short.ProductID != 0 {
+		t.Errorf("a truncated device descriptor yielded ids %04x:%04x", short.VendorID, short.ProductID)
 	}
 }
 

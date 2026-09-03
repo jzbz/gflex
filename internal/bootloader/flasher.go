@@ -452,6 +452,18 @@ func (f *Flasher) Verify(ctx context.Context) (crc uint8, err error) {
 				if errors.Is(err, usbfs.ErrNoDevice) {
 					return 0, fmt.Errorf("bootloader: verify: %w", err)
 				}
+				// An ended context is the operator's Ctrl-C or the caller's
+				// deadline, not the device's silence, so it is reported as
+				// itself rather than kept behind the preference below: on the
+				// last attempt there is no round pause left to surface it
+				// again, and the run would be reported as a unit that failed
+				// verification instead of one that was interrupted. The
+				// context's own error is what is returned, because awaitACK can
+				// come back with ErrACKTimeout from a budget that expired at
+				// the same moment.
+				if cerr := ctx.Err(); cerr != nil {
+					return 0, fmt.Errorf("bootloader: verify: %w", cerr)
+				}
 				// A round that already saw a CRC-less answer ends in a timeout by
 				// construction -- the loop keeps listening for the CRC frame until
 				// the round's budget runs out -- so overwriting the cause here
@@ -545,6 +557,34 @@ const (
 //
 // The caller owns the returned device and must Close it.
 func Connect(ctx context.Context) (*usbfs.Device, usbfs.Interface, error) {
+	return ConnectWithOptions(ctx, ConnectOptions{})
+}
+
+// ConnectOptions tunes ConnectWithOptions. The zero value is what Connect uses
+// and is the right choice everywhere the device is expected to be mid-excursion.
+type ConnectOptions struct {
+	// FailFastOnApplicationMode abandons the retry window as soon as a pass
+	// finds only units still running the application (ErrApplicationMode),
+	// instead of re-asking every 250 ms until the window expires.
+	//
+	// It is safe only where the caller knows no jump is in flight. During an
+	// update the refusal is expected and transient -- the unit is mid-reset and
+	// has not dropped off the bus yet -- so failing fast there would abandon a
+	// flash that was about to succeed. On `firmware flash --recover`, though,
+	// nothing was jumped: the user is asserting a unit is ALREADY sitting in
+	// the bootloader, so a unit answering as an application is a settled answer
+	// and re-asking it for 8 s only delays the message that says so.
+	//
+	// It deliberately does not fire while any candidate failed for some other
+	// reason. connectOnce reports whichever candidate failed last, so with a
+	// second, healthy VFLEX attached a pass can report ErrApplicationMode for
+	// the healthy unit while the real target is still re-enumerating; requiring
+	// every candidate to be an application refusal keeps that case waiting.
+	FailFastOnApplicationMode bool
+}
+
+// ConnectWithOptions is Connect with the retry policy tuned by opts.
+func ConnectWithOptions(ctx context.Context, opts ConnectOptions) (*usbfs.Device, usbfs.Interface, error) {
 	deadline := time.Now().Add(ConnectRetryWindow)
 	var lastErr error
 	for {
@@ -553,6 +593,11 @@ func Connect(ctx context.Context) (*usbfs.Device, usbfs.Interface, error) {
 			return dev, iface, nil
 		}
 		lastErr = err
+		if opts.FailFastOnApplicationMode && everyCandidateWasApplicationMode(err) {
+			// Every candidate this pass was an application, and the caller has
+			// told us nothing is in flight, so waiting cannot change the answer.
+			return nil, usbfs.Interface{}, err
+		}
 		if time.Now().After(deadline) {
 			break
 		}
@@ -576,18 +621,46 @@ func connectOnce(ctx context.Context) (*usbfs.Device, usbfs.Interface, error) {
 		return nil, usbfs.Interface{}, errors.New("bootloader: no device with vendor 0x37BF is attached")
 	}
 	var lastErr error
+	// allApplicationMode records that every attached candidate refused because
+	// it is still running the application. lastErr alone cannot answer that:
+	// it is whichever candidate failed last, so with a second, healthy VFLEX
+	// attached it can report the healthy unit's refusal while the real target
+	// is still re-enumerating. Only "every one of them" is a settled answer.
+	allApplicationMode := true
 	for _, ref := range refs {
 		dev, iface, err := claim(ctx, ref)
 		if err != nil {
 			lastErr = err
+			if !errors.Is(err, ErrApplicationMode) {
+				allApplicationMode = false
+			}
 			continue
 		}
 		return dev, iface, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("bootloader: no vendor-class interface with both endpoints")
+		allApplicationMode = false
 	}
-	return nil, usbfs.Interface{}, lastErr
+	return nil, usbfs.Interface{}, &connectFailure{err: lastErr, allApplicationMode: allApplicationMode}
+}
+
+// connectFailure carries connectOnce's verdict about the whole pass alongside
+// the error it reports. It is unwrappable, so every existing errors.Is against
+// the underlying error keeps working.
+type connectFailure struct {
+	err                error
+	allApplicationMode bool
+}
+
+func (e *connectFailure) Error() string { return e.err.Error() }
+func (e *connectFailure) Unwrap() error { return e.err }
+
+// everyCandidateWasApplicationMode reports whether err came from a pass in
+// which every attached candidate refused with ErrApplicationMode.
+func everyCandidateWasApplicationMode(err error) bool {
+	var f *connectFailure
+	return errors.As(err, &f) && f.allApplicationMode
 }
 
 // claim opens one candidate device and claims its bootloader interface.
@@ -672,9 +745,9 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 // InApplicationMode reports whether cfg belongs to a unit that is running its
 // application rather than sitting in the bootloader.
 //
-// The signal is the MIDIStreaming interface (USB Audio class 0x01, subclass
-// 0x03). SPEC.md §10.1 records that a unit in bootloader mode presents no MIDI
-// interface at all, so its presence means the application is running.
+// The signal is the MIDIStreaming interface (subclass 0x03). SPEC.md §10.1
+// records that a unit in bootloader mode presents no MIDI interface at all, so
+// its presence means the application is running.
 //
 // This exists because the obvious signal does NOT work: a real VFLEX
 // (APP.05.00.00, PID 0x800F, observed 2026-08-21) exposes its vendor-class
@@ -690,20 +763,46 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 // bootloader). Should some future firmware keep MIDI alive in the bootloader,
 // this refuses a legitimate recovery rather than permitting a dangerous flash,
 // and the caller can override.
+//
+// Both spellings of "MIDI" count, because the rest of the tool drives both:
+// SPEC.md §4.2 selects the MIDI interface on (Class == 0x01 || Class == 0xFF)
+// && SubClass == 0x03, and usbmidi.SelectInterface implements exactly that,
+// keeping the vendor-class form as deliberate breadth for firmware that
+// differs. Recognising only 01/03 here would leave --recover free to claim, and
+// stream WRITE_CHUNK frames at, an interface --transport usb would happily talk
+// USB-MIDI to.
+//
+// The vendor-class spelling carries one condition the audio-class one does not:
+// it means "application" only when a second, non-0x03 vendor-class interface is
+// there to be the bootloader's. No artifact records the real bootloader
+// interface's bInterfaceSubClass — SPEC.md §14.3 measured class 0xFF with bulk
+// endpoints 0x01/0x81 and nothing else — so a bootloader that happens to
+// declare 0xFF/0x03 must not read as an application: that would refuse every
+// flash, recovery or not, on a unit that is sitting in the bootloader waiting
+// for one. An application-mode unit presents the pair (measured layout: 1.1
+// MIDIStreaming beside 1.2 vendor class); a bootloader presents one interface.
 func InApplicationMode(cfg *usbfs.Config) bool {
 	if cfg == nil {
 		return false
 	}
+	var vendorMIDI, plainVendor bool
 	for _, i := range cfg.Interfaces {
-		if i.Class == usbAudioClass && i.SubClass == midiStreamingSubClass {
+		switch {
+		case i.Class == usbAudioClass && i.SubClass == midiStreamingSubClass:
 			return true
+		case i.Class == VendorClass && i.SubClass == midiStreamingSubClass:
+			vendorMIDI = true
+		case i.Class == VendorClass:
+			plainVendor = true
 		}
 	}
-	return false
+	return vendorMIDI && plainVendor
 }
 
-// The USB Audio class and its MIDIStreaming subclass, which together identify
-// the interface a VFLEX speaks the application protocol over.
+// The USB Audio class and the MIDIStreaming subclass, which identify the
+// interface a VFLEX speaks the application protocol over. The subclass is the
+// load-bearing half: SPEC.md §4.2 accepts it on the audio class or on the
+// vendor class.
 const (
 	usbAudioClass         uint8 = 0x01
 	midiStreamingSubClass uint8 = 0x03
@@ -731,14 +830,39 @@ const (
 // must not discard it, or this function undoes exactly the salvage the parser
 // performed. Such an orphan is kept as a fallback and an interface that
 // provably belongs to the active configuration is preferred when both exist.
+//
+// A vendor-class interface that also declares the MIDIStreaming subclass is
+// de-preferred in the same spirit: SPEC.md §4.2 accepts 0xFF/0x03 as a MIDI
+// interface, so a candidate wearing it may be the running application's MIDI
+// endpoints rather than the bootloader's (see InApplicationMode). It stays a
+// preference and never becomes an exclusion — the real bootloader interface's
+// bInterfaceSubClass has never been recorded (§14.3 measured class 0xFF with
+// bulk endpoints 0x01/0x81 and nothing else) — because a picker that can refuse
+// the only interface a unit offers turns "this needs re-flashing" into "this
+// cannot be re-flashed", which is the one failure a recovery tool must not
+// have.
 func PickBootloaderInterface(cfg *usbfs.Config) (usbfs.Interface, bool) {
 	if cfg == nil {
 		return usbfs.Interface{}, false
 	}
+	if iface, ok := pickVendorInterface(cfg, true); ok {
+		return iface, true
+	}
+	return pickVendorInterface(cfg, false)
+}
+
+// pickVendorInterface is one pass of PickBootloaderInterface's search.
+// skipMIDIStreaming leaves out the candidates that declare the MIDIStreaming
+// subclass, so the first pass can prefer an interface that cannot be the
+// application's, and the second fall back to one that might be.
+func pickVendorInterface(cfg *usbfs.Config, skipMIDIStreaming bool) (usbfs.Interface, bool) {
 	var orphan usbfs.Interface
 	var haveOrphan bool
 	for _, iface := range cfg.Interfaces {
 		if iface.Class != VendorClass {
+			continue
+		}
+		if skipMIDIStreaming && iface.SubClass == midiStreamingSubClass {
 			continue
 		}
 		if _, ok := iface.In(); !ok {

@@ -80,7 +80,15 @@ func (a *App) runMonitor(ctx context.Context, duration time.Duration) error {
 	// what §14.13 and §14.14 were watched for on hardware.
 	drops := monitorDrops(fr)
 	fr.Start()
-	defer fr.Close()
+	// The close error is not discarded the way every other command's is. This is
+	// the one command that does not build a conn, so conn.Close -- which exists
+	// solely to report a kernel driver that did not rebind -- never runs here,
+	// and `monitor --transport usb` is the documented workaround when another
+	// MIDI client holds the rawmidi node (SPEC.md §4.1). Without this, a monitor
+	// run that detached snd-usb-audio and failed to get it back would end at
+	// exit 0 with nothing said, and the next ordinary command would report no
+	// device (SPEC.md §4.2).
+	defer func() { warnDriverNotRebound(a.stderr, fr.Close()) }()
 
 	if duration > 0 {
 		var cancel context.CancelFunc
@@ -114,17 +122,26 @@ func (a *App) runMonitor(ctx context.Context, duration time.Duration) error {
 //
 // The terminal error is returned as well as printed: the framer stops reading
 // on it, so the monitor is over whether the user wanted it or not, and a real
-// transport failure must not exit 0. Context ends -- the --for deadline or
-// Ctrl-C -- stay a normal nil end as before, unless an error had already been
-// received by then.
+// transport failure must not exit 0. A context end -- the --for deadline or
+// Ctrl-C -- is a normal nil end unless an error is waiting in the channels when
+// it lands, which is what the drain below is for.
 func (a *App) monitorLoop(ctx context.Context, frames <-chan []byte, errs <-chan error, drops chan monitorDrop) error {
 	enc := json.NewEncoder(a.stdout)
 	var terminal error
 	for frames != nil || errs != nil {
 		select {
 		case <-ctx.Done():
-			a.drainMonitorDrops(enc, drops)
-			return terminal
+			// Everything already decoded is printed before returning, not just
+			// the drop notices. The framer goes on decoding into its 16-slot
+			// buffer until the deferred Close in runMonitor, and select picks
+			// uniformly among ready cases, so a --for deadline landing on a
+			// burst used to take ctx.Done first and abandon the tail of the
+			// record -- on the one command whose whole job is to be the record
+			// (SPEC.md §14.13, §14.14). Worse for an unplug that raced the
+			// deadline: the terminal error sat unread in errs and the command
+			// exited 0 with nothing printed, which is the failure the
+			// nil-the-channel handling below was written to eliminate.
+			return a.drainMonitor(enc, frames, errs, drops, terminal)
 		case frame, ok := <-frames:
 			if !ok {
 				frames = nil
@@ -147,19 +164,38 @@ func (a *App) monitorLoop(ctx context.Context, frames <-chan []byte, errs <-chan
 	// hook can fire again: whatever sits in drops now is all there will ever
 	// be. Print it rather than abandon it -- a drop notice is exactly the kind
 	// of evidence this command exists to surface.
-	a.drainMonitorDrops(enc, drops)
-	return terminal
+	return a.drainMonitor(enc, frames, errs, drops, terminal)
 }
 
-// drainMonitorDrops prints every drop notice already buffered, without
-// blocking. See monitorLoop for when this is complete versus best-effort.
-func (a *App) drainMonitorDrops(enc *json.Encoder, drops chan monitorDrop) {
+// drainMonitor prints everything the three channels already hold, without
+// blocking, and returns the terminal error -- the one passed in, or a later one
+// found in the drain.
+//
+// Reached from both ends of monitorLoop, where it means different things: after
+// the loop the reader has exited and this is complete, while on a context end
+// the framer is still running and it is a best-effort flush of what had already
+// been decoded when the deadline or the signal landed.
+func (a *App) drainMonitor(enc *json.Encoder, frames <-chan []byte, errs <-chan error,
+	drops chan monitorDrop, terminal error) error {
 	for {
 		select {
+		case frame, ok := <-frames:
+			if !ok {
+				frames = nil // a closed channel is always ready; stop drawing it
+				continue
+			}
+			a.printMonitorFrame(enc, time.Now(), "rx", frame, nil)
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			a.printMonitorFrame(enc, time.Now(), "err", nil, err)
+			terminal = err
 		case d := <-drops:
 			a.printMonitorFrame(enc, d.at, "drop", d.buffered, errors.New(d.reason))
 		default:
-			return
+			return terminal
 		}
 	}
 }

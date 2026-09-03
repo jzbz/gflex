@@ -124,12 +124,18 @@ type LoadOptions struct {
 	// one. Zero means DefaultPageSize. Exposed so the CLI can offer
 	// --page-size.
 	//
-	// Only a payload whose pages arrive already split ignores this value; a
-	// JSON document that is one string or one flat array of bytes carries no
-	// geometry of its own and is split on it exactly like a raw .bin. A
-	// non-zero value is also validated on every path: a caller asking for a
-	// geometry the wire format cannot express has made a mistake worth naming,
-	// and silently ignoring it is how that mistake survives to the next image.
+	// It applies to a raw .bin and to a top-level bare array that turns out to
+	// be a flat list of byte values — the two shapes that arrive with no
+	// geometry and no document to carry one. Any '{' payload ignores it
+	// outright and takes its split from its own page_size field, or
+	// DefaultPageSize when it declares none: the JSON document is the authority
+	// on its own geometry, and the CLI relies on that model, refusing
+	// --page-size on every JSON image rather than letting the two disagree.
+	//
+	// A non-zero value is validated on every path even where it is then
+	// ignored: a caller asking for a geometry the wire format cannot express
+	// has made a mistake worth naming, and silently ignoring it is how that
+	// mistake survives to the next image.
 	PageSize int
 }
 
@@ -384,14 +390,22 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 	}
 
 	pages := make([][]byte, 0, len(elems))
+	// The stated page ids come back from the same decode that produced the
+	// bytes. They used to be recovered by unmarshalling every element into a
+	// wirePage a second time, which re-tokenised the whole document — 165 page
+	// objects and their chunk maps, for the production payload — to read one
+	// integer per element that decodeChunkedPage had already parsed and thrown
+	// away.
+	ids := make([]*int, 0, len(elems))
 	for i, e := range elems {
-		page, err := decodePage(e)
+		page, id, err := decodePage(e)
 		if err != nil {
 			return nil, fmt.Errorf("%w (page %d)", err, i)
 		}
 		pages = append(pages, page)
+		ids = append(ids, id)
 	}
-	if err := orderByPageID(elems, pages); err != nil {
+	if err := orderByPageID(ids, pages); err != nil {
 		return nil, err
 	}
 	return pages, nil
@@ -409,22 +423,35 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 // So when ids are present they are the authority, and they must form exactly
 // 0..n-1: a gap means a page is missing, a duplicate means one overwrites
 // another, and either would otherwise be discovered by a user with a brick.
-// Elements without an id are left in array order, which is all a payload that
-// never claimed page numbers can offer.
-func orderByPageID(elems []json.RawMessage, pages [][]byte) error {
-	ids := make([]int, len(elems))
-	for i, e := range elems {
-		if trimmed := bytes.TrimSpace(e); len(trimmed) == 0 || trimmed[0] != '{' {
-			return nil // not the object shape; array order is all there is
+//
+// Either every element states an id or none does. A payload that never claimed
+// page numbers — an array of strings, an array of byte arrays — has only array
+// order to offer and keeps it. A payload where some elements state an id and
+// others do not is refused rather than quietly falling back to array order:
+// falling back discards the ids that *were* stated, which writes a page that
+// says it belongs at 5 to address 0, and that is the same silent mis-assembly a
+// gap or a duplicate is refused for. Nothing downstream can catch it, because
+// the device CRCs what it was told to write.
+func orderByPageID(ids []*int, pages [][]byte) error {
+	firstStated, firstMissing := -1, -1
+	for i, id := range ids {
+		switch {
+		case id == nil && firstMissing < 0:
+			firstMissing = i
+		case id != nil && firstStated < 0:
+			firstStated = i
 		}
-		var wp wirePage
-		if err := json.Unmarshal(e, &wp); err != nil || wp.PageID == nil {
-			return nil // no stated id, so nothing to order by
-		}
-		ids[i] = *wp.PageID
+	}
+	if firstStated < 0 {
+		return nil // no element claimed a page number; array order is all there is
+	}
+	if firstMissing >= 0 {
+		return fmt.Errorf("%w: element %d states pg_id %d but element %d states none; either every "+
+			"page states its id or none does", ErrBadPageLength, firstStated, *ids[firstStated], firstMissing)
 	}
 	seen := make(map[int]bool, len(ids))
-	for i, id := range ids {
+	for i, p := range ids {
+		id := *p
 		if id < 0 || id >= len(ids) {
 			return fmt.Errorf("%w: page id %d is outside 0..%d, so the image is not a contiguous "+
 				"run of pages (element %d)", ErrBadPageLength, id, len(ids)-1, i)
@@ -436,8 +463,8 @@ func orderByPageID(elems []json.RawMessage, pages [][]byte) error {
 		seen[id] = true
 	}
 	ordered := make([][]byte, len(pages))
-	for i, id := range ids {
-		ordered[id] = pages[i]
+	for i, p := range ids {
+		ordered[*p] = pages[i]
 	}
 	copy(pages, ordered)
 	return nil
@@ -454,26 +481,31 @@ type wirePage struct {
 	Chunks map[string]json.RawMessage `json:"chunks"`
 }
 
-// decodePage converts one page element: an array of byte values, or a base64 or
-// hex string.
-func decodePage(raw json.RawMessage) ([]byte, error) {
+// decodePage converts one page element: an array of byte values, a base64 or
+// hex string, or the vendor service's {pg_id, chunks} object.
+//
+// The stated page id comes back alongside the bytes, nil for the shapes that
+// cannot carry one, so that orderByPageID needs no second decode of its own.
+func decodePage(raw json.RawMessage) ([]byte, *int, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("%w: empty page element", ErrBadPageLength)
+		return nil, nil, fmt.Errorf("%w: empty page element", ErrBadPageLength)
 	}
 	switch trimmed[0] {
 	case '[':
-		return decodeByteArray(trimmed)
+		b, err := decodeByteArray(trimmed)
+		return b, nil, err
 	case '"':
 		var s string
 		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return nil, fmt.Errorf("%w: page string: %w", ErrBadPageLength, err)
+			return nil, nil, fmt.Errorf("%w: page string: %w", ErrBadPageLength, err)
 		}
-		return decodeByteString(s)
+		b, err := decodeByteString(s)
+		return b, nil, err
 	case '{':
 		return decodeChunkedPage(trimmed)
 	default:
-		return nil, fmt.Errorf("%w: page is neither an array, a string nor a {pg_id, chunks} object", ErrBadPageLength)
+		return nil, nil, fmt.Errorf("%w: page is neither an array, a string nor a {pg_id, chunks} object", ErrBadPageLength)
 	}
 }
 
@@ -491,16 +523,16 @@ func decodePage(raw json.RawMessage) ([]byte, error) {
 // the wire happens to use. A short or gappy chunk map would otherwise yield a
 // short page, which is precisely the wrongly-split image that can flash and
 // verify cleanly (SPEC.md §10.2, §14.12).
-func decodeChunkedPage(raw json.RawMessage) ([]byte, error) {
+func decodeChunkedPage(raw json.RawMessage) ([]byte, *int, error) {
 	var wp wirePage
 	if err := json.Unmarshal(raw, &wp); err != nil {
-		return nil, fmt.Errorf("%w: page object: %w", ErrBadPageLength, err)
+		return nil, nil, fmt.Errorf("%w: page object: %w", ErrBadPageLength, err)
 	}
 	if len(wp.Chunks) == 0 {
-		return nil, fmt.Errorf("%w: page object carries no chunks", ErrBadPageLength)
+		return nil, nil, fmt.Errorf("%w: page object carries no chunks", ErrBadPageLength)
 	}
 	if len(wp.Chunks) != ChunksPerPage {
-		return nil, fmt.Errorf("%w: page has %d chunks, want exactly %d",
+		return nil, nil, fmt.Errorf("%w: page has %d chunks, want exactly %d",
 			ErrBadPageLength, len(wp.Chunks), ChunksPerPage)
 	}
 	out := make([]byte, 0, ChunksPerPage*64)
@@ -508,16 +540,16 @@ func decodeChunkedPage(raw json.RawMessage) ([]byte, error) {
 		key := strconv.Itoa(i)
 		elem, ok := wp.Chunks[key]
 		if !ok {
-			return nil, fmt.Errorf("%w: page has no chunk %q; chunks must be numbered 0..%d",
+			return nil, nil, fmt.Errorf("%w: page has no chunk %q; chunks must be numbered 0..%d",
 				ErrBadPageLength, key, ChunksPerPage-1)
 		}
 		b, err := decodeChunk(elem)
 		if err != nil {
-			return nil, fmt.Errorf("%w (chunk %d)", err, i)
+			return nil, nil, fmt.Errorf("%w (chunk %d)", err, i)
 		}
 		out = append(out, b...)
 	}
-	return out, nil
+	return out, wp.PageID, nil
 }
 
 // decodeChunk converts one chunk: an array of byte values, or a base64/hex

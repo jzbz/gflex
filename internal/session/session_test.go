@@ -3,8 +3,10 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +79,139 @@ func TestNoResponseTimesOut(t *testing.T) {
 	_, err := s.VoltageMv(context.Background())
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("error = %v, want ErrTimeout", err)
+	}
+}
+
+// TestUnansweredWriteIsMarkedUnacknowledged: once SendFrame has returned, the
+// whole frame including the end-of-frame marker is on the wire and the device
+// acts on it -- there is no NACK to decline it with (SPEC.md §5.2). A write that
+// then goes unanswered has an unknown outcome, not a failed one, and
+// ErrUnacknowledged is what says so to the layers that phrase it for the user.
+func TestUnansweredWriteIsMarkedUnacknowledged(t *testing.T) {
+	write := func(t *testing.T, ctx context.Context, s *Session) error {
+		t.Helper()
+		_, err := s.Do(ctx, proto.CmdVoltageMv, proto.EncodeU16(12000), true)
+		if err == nil {
+			t.Fatal("want an error from an unanswered write")
+		}
+		return err
+	}
+
+	t.Run("no answer within the deadline", func(t *testing.T) {
+		s, _ := newTestSession(t, Options{Timeout: 100 * time.Millisecond})
+		err := write(t, context.Background(), s)
+		if !errors.Is(err, ErrUnacknowledged) {
+			t.Errorf("error = %v, want it to wrap ErrUnacknowledged", err)
+		}
+		if !errors.Is(err, ErrTimeout) {
+			t.Errorf("error = %v, want the timeout still visible underneath", err)
+		}
+	})
+
+	t.Run("context cancelled while waiting for the echo", func(t *testing.T) {
+		// The window a user's Ctrl-C actually lands in: the frame is gone, the
+		// echo is late. Collapsing that to "interrupted" tells the user nothing
+		// happened while the rail may already have moved.
+		s, d := newTestSession(t, Options{Timeout: 10 * time.Second})
+		d.SetResponse(proto.CmdVoltageMv, proto.EncodeU16(12000))
+		d.SetFault(proto.CmdVoltageMv, fake.Fault{Delay: 5 * time.Second})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		err := write(t, ctx, s)
+		if !errors.Is(err, ErrUnacknowledged) {
+			t.Errorf("error = %v, want it to wrap ErrUnacknowledged", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error = %v, want the cancellation still visible underneath", err)
+		}
+	})
+
+	t.Run("a read is not marked", func(t *testing.T) {
+		// Nothing was applied, so there is nothing to warn about; the sentinel
+		// has to stay rare enough to mean something.
+		s, _ := newTestSession(t, Options{Timeout: 100 * time.Millisecond})
+		_, err := s.Do(context.Background(), proto.CmdVoltageMv, nil, false)
+		if errors.Is(err, ErrUnacknowledged) {
+			t.Errorf("error = %v, want a read timeout left unmarked", err)
+		}
+	})
+
+	t.Run("a failed send is not marked", func(t *testing.T) {
+		// SendFrame stops at the message it could not write, so the frame is
+		// truncated and the device drops it for want of an end marker. Warning
+		// that the rail may have moved would be a false alarm here.
+		s, _, tr := newFailingWriteSession(t, Options{Timeout: 100 * time.Millisecond})
+		tr.unplug()
+
+		err := write(t, context.Background(), s)
+		if errors.Is(err, ErrUnacknowledged) {
+			t.Errorf("error = %v; a frame that never left must not be reported as sent", err)
+		}
+		if !strings.Contains(err.Error(), "send failed") {
+			t.Errorf("error = %v, want it to name the send as the failure", err)
+		}
+	})
+
+	t.Run("a dead transport is not marked", func(t *testing.T) {
+		// ErrTransportClosed already names the link as the cause and is acted
+		// on as permanent; the sentinel is for the two failures that otherwise
+		// read as "the device refused it" and "the run was aborted".
+		s, d := newTestSession(t, Options{Timeout: 5 * time.Second})
+		d.SetHandler(proto.CmdVoltageMv, func(proto.Frame) []byte {
+			d.Unplug(errors.New("read /dev/snd/midiC1D0: no such device"))
+			return nil
+		})
+
+		err := write(t, context.Background(), s)
+		if !errors.Is(err, ErrTransportClosed) {
+			t.Fatalf("error = %v, want ErrTransportClosed", err)
+		}
+		if errors.Is(err, ErrUnacknowledged) {
+			t.Errorf("error = %v, want the transport-closed verdict left alone", err)
+		}
+	})
+}
+
+// TestSendFailureOnADeadLinkIsPermanent: an unplug that lands between commands
+// fails the next SEND, not a wait, and PermanentErr has to see it.
+//
+// Nothing else in the chain does. The framer's reader dies without closing the
+// done channel SendFrame gates on, so the command is transmitted into a port
+// the kernel has already disconnected and comes back as the raw ENODEV. Left
+// unclassified, that is a retryable error to every loop in this package.
+func TestSendFailureOnADeadLinkIsPermanent(t *testing.T) {
+	s, _, tr := newFailingWriteSession(t, Options{Timeout: 2 * time.Second})
+	tr.unplug()
+
+	_, err := s.Do(context.Background(), proto.CmdSerialNumber, nil, false)
+	if err == nil {
+		t.Fatal("want an error when the write fails")
+	}
+	if !errors.Is(err, syscall.ENODEV) {
+		t.Fatalf("error = %v, want the kernel's cause carried through", err)
+	}
+	if !PermanentErr(err) {
+		t.Errorf("PermanentErr(%v) = false; a device that is gone is not worth retrying", err)
+	}
+	if !strings.Contains(err.Error(), "send failed") {
+		t.Errorf("error = %v, want it to name the send as the failure", err)
+	}
+}
+
+// TestTransferTimeoutOnSendStaysRetryable is the other half of the
+// classification: a write that fails without saying the device is gone -- a
+// usbfs transfer that timed out, say -- is a failed write to a unit that is
+// still there, and the retry loops must keep their budgets for it.
+func TestTransferTimeoutOnSendStaysRetryable(t *testing.T) {
+	err := fmt.Errorf("CMD_SERIAL_NUMBER: send failed (tx 02 08): %w",
+		fmt.Errorf("usbfs: bulk transfer: %w", syscall.ETIMEDOUT))
+	if PermanentErr(err) {
+		t.Errorf("PermanentErr(%v) = true; only a device that is gone is permanent", err)
 	}
 }
 
@@ -214,50 +349,69 @@ func TestTraceHook(t *testing.T) {
 // TestSingleFlight: the protocol has one pending slot and no tagging, so
 // concurrent callers must be serialised. If they were not, one command's
 // response would satisfy another's wait.
+//
+// What proves that is every caller getting ITS OWN answer back, not a count of
+// how many handlers ran at once. A counter cannot see this at all: the fake
+// dispatches from inside writeMIDI, which the framer calls while holding its
+// write lock for the whole frame, so the reply is produced before the sender's
+// SendFrame returns and every other caller is parked on that lock -- the count
+// stays at one whatever this package does with its own semaphore.
+//
+// So the answers are delayed instead. That puts each reply in flight while its
+// caller waits and the next caller is free to send, which is exactly the
+// overlap the semaphore exists to prevent: without it a reply lands with a
+// different command's wait outstanding, gets dropped for a code mismatch
+// (SPEC.md §5.2), and its owner times out.
 func TestSingleFlight(t *testing.T) {
 	s, d := newTestSession(t, Options{Timeout: 2 * time.Second})
 
-	var mu sync.Mutex
-	inFlight, maxInFlight := 0, 0
-	respond := func(payload []byte) func(proto.Frame) []byte {
-		return func(proto.Frame) []byte {
-			mu.Lock()
-			inFlight++
-			if inFlight > maxInFlight {
-				maxInFlight = inFlight
-			}
-			mu.Unlock()
-			time.Sleep(5 * time.Millisecond)
-			mu.Lock()
-			inFlight--
-			mu.Unlock()
-			return payload
-		}
+	const replyDelay = 20 * time.Millisecond
+	answers := map[proto.Cmd][]byte{
+		proto.CmdSerialNumber:   []byte("VF000001"),
+		proto.CmdCurrentLimitMa: proto.EncodeU16(5000),
+		proto.CmdUserVLimit:     proto.EncodeVLimit(3300, 48000),
 	}
-	d.SetHandler(proto.CmdSerialNumber, respond([]byte("VF000001")))
-	d.SetHandler(proto.CmdCurrentLimitMa, respond(proto.EncodeU16(5000)))
-	d.SetHandler(proto.CmdUserVLimit, respond(proto.EncodeVLimit(3300, 48000)))
+	for cmd, payload := range answers {
+		d.SetResponse(cmd, payload)
+		d.SetFault(cmd, fake.Fault{Delay: replyDelay})
+	}
 
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	errs := make(chan error, 30)
 	for i := 0; i < 10; i++ {
 		wg.Add(3)
-		go func() { defer wg.Done(); _, err := s.SerialNumber(ctx); errs <- err }()
-		go func() { defer wg.Done(); _, err := s.CurrentLimitMa(ctx); errs <- err }()
-		go func() { defer wg.Done(); _, _, err := s.VLimit(ctx); errs <- err }()
+		go func() {
+			defer wg.Done()
+			got, err := s.SerialNumber(ctx)
+			if err == nil && got != "VF000001" {
+				err = fmt.Errorf("serial = %q, want \"VF000001\"", got)
+			}
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			got, err := s.CurrentLimitMa(ctx)
+			if err == nil && got != 5000 {
+				err = fmt.Errorf("current limit = %d, want 5000", got)
+			}
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			low, high, err := s.VLimit(ctx)
+			if err == nil && (low != 3300 || high != 48000) {
+				err = fmt.Errorf("vlimit = %d/%d, want 3300/48000", low, high)
+			}
+			errs <- err
+		}()
 	}
 	wg.Wait()
 	close(errs)
 	for err := range errs {
 		if err != nil {
-			t.Fatalf("concurrent command failed: %v", err)
+			t.Fatalf("concurrent command: %v", err)
 		}
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if maxInFlight != 1 {
-		t.Errorf("saw %d commands in flight at once, want 1", maxInFlight)
 	}
 }
 

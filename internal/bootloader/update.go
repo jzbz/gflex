@@ -286,8 +286,25 @@ func update(ctx context.Context, f *Flasher, fw *Firmware, opts UpdateOptions) (
 	}
 	report(Progress{Phase: PhaseEnd, Chunk: -1, TotalPages: len(fw.Pages)})
 	if err := f.JumpToApp(ctx); err != nil {
-		// The device may already have disconnected as it jumped, so this is
-		// reported rather than treated as a failed update.
+		// "It may already have jumped" is only true of a device that has left
+		// the bus. Every other failure means the frame was not accepted while
+		// the unit was still there: usbfs.Device.Transfer refuses to submit at
+		// all once the context is done, and a stall or a bulkWriteTimeout
+		// expiry is the same story from the other end. Reporting any of those
+		// as a completed jump is how a unit that is sitting in the bootloader
+		// gets described to its owner as "the update SUCCEEDED and the jump was
+		// sent, do NOT re-flash" — advice that forbids the one action that
+		// would fix it (SPEC.md §10.5).
+		//
+		// "probably" is deliberate: a jump that races its own disconnect can
+		// surface as an errno usbfs does not classify as ErrNoDevice, so this
+		// can name the bootloader for a unit that did leave it. That direction
+		// is the safe one — the operator re-enters the bootloader and finds
+		// nothing to do — and claim()'s ErrApplicationMode guard catches it.
+		if !errors.Is(err, usbfs.ErrNoDevice) {
+			return res, fmt.Errorf("bootloader: CMD_BOOTLOAD_END was not delivered, so the unit is "+
+				"probably still in bootloader mode (slow blinking white LED) and can be re-flashed: %w", err)
+		}
 		logf("warning: %v (the device may already have jumped)", err)
 	}
 	res.JumpedToApp = true

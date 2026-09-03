@@ -349,12 +349,27 @@ type transport struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 
-	// ctx is cancelled by Close so a transfer that has not yet been submitted is
-	// refused rather than started. It does not unblock one already in flight:
-	// usbfs consults the context only when deciding whether to submit and cannot
-	// abort an ioctl the kernel already has (usbfs.Device.Transfer), so an
-	// in-flight transfer still runs out its own timeout. That timeout, not this
-	// cancellation, is what framer.Close sizes its close grace against.
+	// ctx is cancelled by Close so a transfer that has not yet reached usbfs is
+	// refused rather than started. Two things it does not do, and both matter.
+	//
+	// It does not unblock one already in flight: usbfs consults the context only
+	// when deciding whether to submit and cannot abort an ioctl the kernel
+	// already has (usbfs.Device.Transfer), so an in-flight transfer still runs
+	// out its own timeout. That timeout, not this cancellation, is what
+	// framer.Close sizes its close grace against.
+	//
+	// And it does not serialise the reader against Close. The reader checks the
+	// closed flag and this context before calling Transfer and can be
+	// descheduled between the check and the ioctl, so it can still enter the
+	// kernel after Close has started releasing the interface -- where usbfs
+	// claims the interface back for this fd implicitly and the rebind that gives
+	// the user their ALSA MIDI port back answers EBUSY. Closing that window
+	// belongs to usbfs, which refuses a submission for the span of
+	// ReleaseInterface and hands back an implicit claim that beat the flag before
+	// asking for the rebind a second time. It is deliberately not closed with a
+	// lock here: excluding transfers around the release would make every Close
+	// wait out the reader's 100 ms IN poll, on a tool whose whole device
+	// conversation is about 45 ms (SPEC.md §14.15).
 	ctx    context.Context
 	cancel context.CancelFunc
 

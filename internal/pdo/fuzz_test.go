@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+// budgetAt is the current p's power budget allows at v, or 0 where the class
+// carries no budget. Two classes do: the EPR AVS PDP read off the wire, and the
+// SPR power budget inferred for a PPS APDO that declared itself power limited.
+func budgetAt(p PDO, v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	switch {
+	case p.Kind == KindEPRAVS && p.PDPWatts > 0:
+		return float64(p.PDPWatts) / v
+	case p.Kind == KindPPS && p.PPSPowerLimited && p.PPSBudgetW > 0:
+		return float64(p.PPSBudgetW) / v
+	}
+	return 0
+}
+
 // FuzzParse asserts that no byte sequence can panic the decoder or produce a
 // log that violates its own invariants. The blob comes off a USB link from
 // firmware whose behaviour is only partially known, so it must be treated as
@@ -12,6 +28,8 @@ import (
 func FuzzParse(f *testing.F) {
 	f.Add(buildLog(9000, 9010, 6, 1, 0, 0,
 		fixed5V3A, fixed9V3A, fixed12V3A, pps3311V3A, eprAVS140W, sprAVS))
+	f.Add(buildLog(11000, 11000, 5, 1, 0, 0,
+		fixed5V3A, fixed9V3A, fixed15V3A, fixed20V225A, pps3311V5APL))
 	f.Add(buildLog(0, 0, 255, 255, 0xFFFF, 0xFFFF, augReserved, battery, variablePDO))
 	f.Add(make([]byte, LogBytes))
 	f.Add([]byte{1, 2, 3})
@@ -59,6 +77,14 @@ func FuzzParse(f *testing.F) {
 			for _, v := range []float64{3.3, 5, 9, 15, 15.1, 20, 28, 48} {
 				if a := p.CurrentAt(v); math.IsNaN(a) || a > MaxCableCurrentA+cmpEps {
 					t.Fatalf("CurrentAt(%v) = %v: %+v", v, a, p)
+				}
+				// A power budget is the other ceiling, and it is derived by
+				// division rather than read off the wire, so a rounding that went
+				// to nearest could put the answer above it by a few milliamps.
+				if budget := budgetAt(p, v); budget > 0 {
+					if a := p.CurrentAt(v); a > budget+cmpEps && a < MaxCableCurrentA {
+						t.Fatalf("CurrentAt(%v) = %v, above the %v A its power budget allows: %+v", v, a, budget, p)
+					}
 				}
 			}
 			if p.Valid && p.Kind == KindUnknown {

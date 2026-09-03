@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -82,7 +83,8 @@ const (
 //
 // A Device is safe for concurrent use. Transfers do not serialise against each
 // other -- the kernel handles concurrent URBs on distinct endpoints -- but the
-// bookkeeping of claimed interfaces does.
+// bookkeeping of claimed interfaces does, and a transfer submitted while
+// ReleaseInterface is in flight is refused rather than run (see releasing).
 type Device struct {
 	f   *os.File
 	ref DeviceRef
@@ -94,6 +96,37 @@ type Device struct {
 	// can be driven against scripted errnos. It is set at construction and
 	// never written afterwards, so it needs no lock.
 	ioctlFn func(op string, req uintptr, arg unsafe.Pointer, retryEINTR bool) (int, error)
+
+	// releasing is set for the span of ReleaseInterface: from before
+	// USBDEVFS_RELEASEINTERFACE until after the USBDEVFS_CONNECT that hands the
+	// interface back to its kernel driver. Transfers submitted inside that window
+	// are refused.
+	//
+	// They have to be, because usbfs will claim an interface *for* a process that
+	// did not. proc_bulk runs checkintf(), which on an interface this fd does not
+	// hold logs "did not claim interface N before use" and claims it anyway -- so
+	// a transfer landing between the two ioctls re-binds usbfs to the interface,
+	// and the USBDEVFS_CONNECT that follows takes proc_ioctl's `else retval =
+	// -EBUSY` arm without ever calling device_attach(). snd-usb-audio is never
+	// offered the interface back and the ALSA MIDI port stays missing until the
+	// device is replugged (SPEC.md §4.2), which is the exact outcome
+	// ReleaseInterface exists to prevent. The layer above cannot close that
+	// window on its own: the USB-MIDI reader checks its closed flag and its
+	// context before calling Transfer and can be descheduled between the check
+	// and the ioctl.
+	//
+	// A flag rather than a lock, deliberately. Excluding transfers with a mutex
+	// would make the release wait out whatever IN transfer is in flight, and on
+	// the MIDI reader that is a 100 ms poll paid on every close of a command
+	// whose device work is around 45 ms (SPEC.md §14.15). Nor is it needed: a
+	// transfer already inside the ioctl passed checkintf() while the claim was
+	// still held and is harmless. Only a new submission has to be kept out.
+	//
+	// It is per-Device rather than per-interface because the window is the
+	// teardown of a device that this package's callers drive one interface at a
+	// time -- usbmidi and the flasher each claim exactly one -- and because the
+	// racing reader knows nothing about which interface is being released anyway.
+	releasing atomic.Bool
 
 	mu sync.Mutex
 	// claimed maps an interface number to what claiming it took away, which is
@@ -204,6 +237,11 @@ func (d *Device) Descriptors() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usbfs: %s: %w", d.ref.Path, err)
 	}
+	// The blob came off the usbfs node, where the kernel has already byte-swapped
+	// the device descriptor's 16-bit fields into host order -- which the parse,
+	// written for wire order, would otherwise decode backwards on a big-endian
+	// build and hand straight to the identity check below.
+	cfg.adjustDeviceIDsHostOrder(raw)
 	// The fd is the first authoritative statement of what is actually on the
 	// other end. Enumeration read idVendor from sysfs and then *synthesised*
 	// the node path from busnum/devnum (Enumerate), and /dev/bus/usb/BBB/DDD is
@@ -228,15 +266,35 @@ func (d *Device) Descriptors() (*Config, error) {
 }
 
 func (d *Device) readRawDescriptors() ([]byte, error) {
+	return readDescriptorChunks(d.f, d.ref.Path)
+}
+
+// readDescriptorChunks pages a descriptor blob out of an open usbfs node.
+//
+// It takes the reader rather than reaching for d.f so that the kernel's one
+// surprising behaviour here can be driven from a test. usbdev_read positions
+// each configuration descriptor by the *raw* wTotalLength but copies only as
+// many bytes as it actually parsed -- "the descriptor may claim to be longer
+// than it really is ... simply don't write (skip over) unallocated parts" -- and
+// still counts the full length in what it returns. So on a device whose
+// configuration descriptor over-claims wTotalLength, pread reports bytes it
+// never wrote, and what those bytes hold is decided entirely by the buffer
+// handed in. Clearing it makes that a run of zeros, which ParseDescriptors
+// rejects outright and identically every time; leaving it dirty would let the
+// previous chunk's bytes be decoded as interfaces and endpoints the device never
+// declared. The cost is one 4 KiB memclr per chunk on a path that runs once per
+// device.
+func readDescriptorChunks(r io.ReaderAt, path string) ([]byte, error) {
 	const chunk = 4096
 	buf := make([]byte, 0, chunk)
 	tmp := make([]byte, chunk)
 	var off int64
 	for len(buf) < maxDescriptorBytes {
+		clear(tmp)
 		// ReadAt (pread) rather than Seek+Read: it needs no lock against
 		// concurrent transfers and cannot be disturbed by them. usbfs
 		// implements llseek, so the fd supports pread.
-		n, err := d.f.ReadAt(tmp, off)
+		n, err := r.ReadAt(tmp, off)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			off += int64(n)
@@ -245,14 +303,14 @@ func (d *Device) readRawDescriptors() ([]byte, error) {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return nil, wrapErrno("read descriptors", d.ref.Path, err)
+			return nil, wrapErrno("read descriptors", path, err)
 		}
 		if n == 0 {
 			break
 		}
 	}
 	if len(buf) == 0 {
-		return nil, fmt.Errorf("usbfs: %s returned no descriptor bytes", d.ref.Path)
+		return nil, fmt.Errorf("usbfs: %s returned no descriptor bytes", path)
 	}
 	return buf, nil
 }
@@ -368,9 +426,13 @@ func (d *Device) ReleaseInterface(num int) error {
 	st := d.claimed[num]
 	d.mu.Unlock()
 
-	n := uint32(num)
-	_, relErr := d.ioctl(fmt.Sprintf("release interface %d", num), ioctlReleaseInterface, unsafe.Pointer(&n), true)
-	runtime.KeepAlive(&n)
+	// Nothing new may enter the kernel between the release and the reattach: a
+	// transfer submitted there makes usbfs claim the interface back implicitly
+	// and costs the user their ALSA MIDI port. See releasing.
+	d.releasing.Store(true)
+	defer d.releasing.Store(false)
+
+	relErr := d.releaseClaim(num)
 
 	// A device that has gone away has already released everything, and there is
 	// no driver left to rebind, so that is a success with nothing left to do.
@@ -441,8 +503,15 @@ func (d *Device) Control(ctx context.Context, requestType, request uint8, value,
 		timeout:      ms,
 		data:         ptr,
 	}
-	n, err := d.ioctl(fmt.Sprintf("control transfer bmRequestType=0x%02x bRequest=0x%02x", requestType, request),
-		ioctlControl, unsafe.Pointer(&ct), false)
+	// Checked as late as possible, with the description built first so nothing
+	// sits between the check and the syscall. An interface-recipient control
+	// request goes through the same checkintf() as a bulk transfer and can
+	// re-claim the interface just as readily; see releasing.
+	op := fmt.Sprintf("control transfer bmRequestType=0x%02x bRequest=0x%02x", requestType, request)
+	if err := d.refuseWhileReleasing(); err != nil {
+		return 0, err
+	}
+	n, err := d.ioctl(op, ioctlControl, unsafe.Pointer(&ct), false)
 	runtime.KeepAlive(keep)
 	runtime.KeepAlive(&ct)
 	if err != nil {
@@ -489,8 +558,15 @@ func (d *Device) Transfer(ctx context.Context, endpoint uint8, data []byte, time
 	if endpoint&endpointDirMask != 0 {
 		dir = "IN"
 	}
-	n, err := d.ioctl(fmt.Sprintf("transfer %d bytes %s on endpoint 0x%02x", len(data), dir, endpoint),
-		ioctlBulk, unsafe.Pointer(&bt), false)
+	// The description is built first so that nothing but the call itself sits
+	// between the check and the syscall: the reader goroutine racing a Close is
+	// exactly the caller this is here for, and every instruction in between
+	// widens the window the check leaves open. See releasing.
+	op := fmt.Sprintf("transfer %d bytes %s on endpoint 0x%02x", len(data), dir, endpoint)
+	if err := d.refuseWhileReleasing(); err != nil {
+		return 0, err
+	}
+	n, err := d.ioctl(op, ioctlBulk, unsafe.Pointer(&bt), false)
 	runtime.KeepAlive(keep)
 	runtime.KeepAlive(&bt)
 	if err != nil {
@@ -514,6 +590,27 @@ func (d *Device) claim(num int) error {
 	_, err := d.ioctl(fmt.Sprintf("claim interface %d", num), ioctlClaimInterface, unsafe.Pointer(&n), true)
 	runtime.KeepAlive(&n)
 	return err
+}
+
+// releaseClaim issues USBDEVFS_RELEASEINTERFACE and nothing else. Giving up the
+// claim is only part of what ReleaseInterface owes; this is the ioctl on its own,
+// which attachDriver also needs.
+func (d *Device) releaseClaim(num int) error {
+	n := uint32(num)
+	_, err := d.ioctl(fmt.Sprintf("release interface %d", num), ioctlReleaseInterface, unsafe.Pointer(&n), true)
+	runtime.KeepAlive(&n)
+	return err
+}
+
+// refuseWhileReleasing reports the error a transfer gets when it is submitted
+// into the window ReleaseInterface holds open. It is a refusal to start, not a
+// failure of anything: the caller is closing the device, and the alternative is
+// re-claiming an interface that is on its way back to its kernel driver.
+func (d *Device) refuseWhileReleasing() error {
+	if d.releasing.Load() {
+		return fmt.Errorf("usbfs: transfer not submitted on %s: an interface is being released", d.ref.Path)
+	}
+	return nil
 }
 
 // claimDetaching issues USBDEVFS_DISCONNECT_CLAIM: detach (subject to flags)
@@ -556,11 +653,24 @@ func (d *Device) detachDriver(num int) error {
 // interface -- is expected to stay unbound, and reporting that would be a false
 // alarm on the firmware path.
 func (d *Device) attachDriver(num int, verify bool) error {
-	err := d.interfaceIoctl(num, ioctlConnect, fmt.Sprintf("reattach kernel driver to interface %d", num))
-	// ENODATA here means no driver wanted the interface -- nothing to rebind,
-	// which is not a failure.
-	if err != nil && errors.Is(err, unix.ENODATA) {
-		err = nil
+	err := d.connectDriver(num)
+	// EBUSY is not a re-probe that failed; it is a re-probe that never happened.
+	// proc_ioctl only calls device_attach() when intf->dev.driver is NULL and
+	// answers EBUSY otherwise, so something is bound to the interface already.
+	// Usually that something is usbfs itself: the kernel claims an interface
+	// implicitly for a transfer submitted on one this fd does not hold (proc_bulk
+	// -> checkintf -> claimintf, logged as "did not claim interface N before
+	// use"), which a reader goroutine racing a Close can still just manage
+	// despite the releasing flag. Handing that claim back and asking once more is
+	// what stands between the user and an ALSA MIDI port that stays missing until
+	// they replug, and it cannot disturb a real driver on the way: releaseintf
+	// clears this fd's own claim bit and nothing else. If EBUSY comes back a
+	// second time the interface is held by something this process cannot give
+	// back -- another usbfs client, or a driver that has already rebound -- and
+	// that is reported as it happened.
+	if errors.Is(err, ErrBusy) {
+		_ = d.releaseClaim(num)
+		err = d.connectDriver(num)
 	}
 	if err != nil || !verify {
 		return err
@@ -570,6 +680,16 @@ func (d *Device) attachDriver(num int, verify bool) error {
 			"no driver bound to it", ErrDriverNotRebound, num, d.ref.Path)
 	}
 	return nil
+}
+
+// connectDriver issues USBDEVFS_CONNECT for one interface, reading ENODATA -- no
+// driver wanted it -- as the success it is rather than as a failure to rebind.
+func (d *Device) connectDriver(num int) error {
+	err := d.interfaceIoctl(num, ioctlConnect, fmt.Sprintf("reattach kernel driver to interface %d", num))
+	if err != nil && errors.Is(err, unix.ENODATA) {
+		return nil
+	}
+	return err
 }
 
 // driverRebound is interfaceDriverBound with a short settle window, for use

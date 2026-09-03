@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -10,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/jzbz/gflex/internal/proto"
 )
 
 // withEuid points the privilege gate in installUdev at a fixed value for the
@@ -248,5 +252,77 @@ func TestUdevadmIsNotResolvedThroughPATH(t *testing.T) {
 		// A machine with no udevadm at all is a legitimate outcome; what
 		// matters is that the shadow was refused, which is asserted above.
 		t.Logf("no udevadm in the standard locations: %v", err)
+	}
+}
+
+// TestInstallUdevReportsAnInterruptedRun is the regression test for a Ctrl-C
+// that exited 0.
+//
+// runUdevadm turns every exec failure into a warning and carries on, which is
+// right for a udevadm that would not run -- the rule file is written either way
+// -- but exec.CommandContext also SIGKILLs the child when the signal context
+// ends and returns ctx.Err() from Start when it has ended already. Both landed
+// in that same branch, so an aborted install printed its usual report, said the
+// rules merely needed a manual reload, and returned nil: a parent reading the
+// exit status was told the install had completed.
+func TestInstallUdevReportsAnInterruptedRun(t *testing.T) {
+	withEuid(t, 0)
+
+	path := filepath.Join(t.TempDir(), "70-gflex.rules")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out, errOut bytes.Buffer
+	app := &App{stdout: &out, stderr: &errOut}
+	f := newFormatter(false, &out, &errOut)
+	err := app.installUdev(ctx, f, path)
+	if err == nil {
+		t.Fatal("an interrupted install reported success")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("installUdev returned %v, want the cancellation", err)
+	}
+
+	// The rule file is on disk, so what is left to do has to reach the operator
+	// -- and only Diag does: App.run skips Flush on a failing command, which
+	// would swallow a Note.
+	got := errOut.String()
+	for _, want := range []string{path, "udevadm control --reload-rules"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stderr does not mention %q:\n%s", want, got)
+		}
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("the rule file the message promises is not there: %v", statErr)
+	}
+}
+
+// TestTheUdevTriggerIsScopedToTheRuleItInstalls covers the blast radius of the
+// one command that runs as root.
+//
+// An argument-less `udevadm trigger` replays action=change across the whole of
+// sysfs, re-running every installed rule and every RUN+= program on the system,
+// while the rule installed here matches one subsystem and one vendor ID. This
+// file already refuses to resolve udevadm through PATH for the same reason.
+func TestTheUdevTriggerIsScopedToTheRuleItInstalls(t *testing.T) {
+	if udevTriggerArgs[0] != "trigger" {
+		t.Fatalf("udevTriggerArgs = %v, want it to start with the trigger subcommand", udevTriggerArgs)
+	}
+	if len(udevTriggerArgs) == 1 {
+		t.Fatal("the trigger has no selector: it would re-emit a change event for every device on the system")
+	}
+	// Derived from the rule rather than restated, so a rule that starts matching
+	// something else fails here instead of quietly triggering the wrong set.
+	for _, want := range []string{
+		fmt.Sprintf("--subsystem-match=%s", "usb"),
+		fmt.Sprintf("--attr-match=idVendor=%04x", proto.VendorID),
+	} {
+		if !slices.Contains(udevTriggerArgs, want) {
+			t.Errorf("udevTriggerArgs = %v, want it to carry %q", udevTriggerArgs, want)
+		}
+	}
+	if !strings.Contains(udevRules, fmt.Sprintf(`ATTR{idVendor}=="%04x"`, proto.VendorID)) {
+		t.Errorf("the embedded rule no longer matches vendor %04x, so the trigger scope is wrong:\n%s",
+			proto.VendorID, udevRules)
 	}
 }

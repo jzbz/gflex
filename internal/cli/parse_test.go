@@ -183,6 +183,17 @@ func TestParseHexBytes(t *testing.T) {
 		{name: "odd digits", in: []string{"020"}, wantErr: true},
 		{name: "not hex", in: []string{"zz"}, wantErr: true},
 		{name: "empty", in: []string{""}, wantErr: true},
+		// A prefix covers as many bytes as it is given, and separates them from
+		// whatever follows.
+		{name: "prefixed pair in one token", in: []string{"0x0208"}, want: []byte{0x02, 0x08}},
+		{name: "prefixed and separated", in: []string{"0x02:0x08"}, want: []byte{0x02, 0x08}},
+		// Without a prefix the arguments are concatenated, so a lone digit is a
+		// nibble. That is documented behaviour and stays.
+		{name: "bare nibbles concatenate", in: []string{"0", "4", "92", "2E", "E0"},
+			want: []byte{0x04, 0x92, 0x2E, 0xE0}},
+		// With one it is a byte the user got wrong, and merging it into its
+		// neighbour is not a reading anybody intended.
+		{name: "prefixed nibble", in: []string{"0x4", "0x92", "0x2E", "0xE0"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -272,5 +283,36 @@ func TestFormatters(t *testing.T) {
 	}
 	if got, want := trimFloat(48, 3), "48"; got != want {
 		t.Errorf("trimFloat(48) = %q, want %q", got, want)
+	}
+}
+
+// TestParseHexBytesRefusesAShortPrefixedToken is the regression test for `gflex
+// raw` sending a frame nobody typed.
+//
+// The arguments were joined and every "0x" deleted from the joined string
+// before the digits were paired, so a prefixed one-digit token borrowed a
+// nibble from its neighbour. `raw 0x0 0x3 0x96 0x01` is five bytes the operator
+// expected to be refused for its 0x00 length byte; it arrived as the
+// well-formed three-byte CMD_AUTHLOCK write 03 96 01, cleared the length gate,
+// and under --yes went out as a lock level nobody asked for. `raw` is the one
+// path to the rail the SPEC.md §13 range checks do not police, so a silent
+// substitution of one frame for another is the worst thing that can happen on
+// it.
+func TestParseHexBytesRefusesAShortPrefixedToken(t *testing.T) {
+	got, err := parseHexBytes([]string{"0x0", "0x3", "0x96", "0x01"})
+	if err == nil {
+		t.Fatalf("four tokens were merged into the frame % x", got)
+	}
+	if code := ExitCode(err); code != ExitUsage {
+		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+	}
+	// The diagnostic has to name the token the user typed. Counting the digits
+	// of the joined string reported "an odd number of digits (7)" for four
+	// arguments, which points at nothing.
+	if !strings.Contains(err.Error(), `"0x0"`) {
+		t.Errorf("the error does not name the short token:\n%v", err)
+	}
+	if !strings.Contains(err.Error(), "0x00") {
+		t.Errorf("the error does not say what to write instead:\n%v", err)
 	}
 }

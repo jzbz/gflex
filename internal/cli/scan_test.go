@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jzbz/gflex/internal/pdo"
 	"github.com/jzbz/gflex/internal/proto"
 	"github.com/jzbz/gflex/internal/session"
 	"github.com/jzbz/gflex/internal/transport/fake"
@@ -309,7 +310,7 @@ func TestScanNoPromptUSBGatePropagatesCancellation(t *testing.T) {
 // Under the default rawmidi transport nothing in this process hides the node,
 // so the watch stays exactly what it was: depart, settle, return.
 func TestScanNoPromptRawMIDIUnchanged(t *testing.T) {
-	app := &App{Transport: transportRawMIDI}
+	app := &App{Transport: transportRawMIDI, midiPortVIDConfirmed: true}
 	f := newFormatter(false, io.Discard, io.Discard)
 	o := scanOpts{noPrompt: true, wait: time.Minute}
 
@@ -336,7 +337,17 @@ func interactiveApp(t *testing.T, transport string) *App {
 	if _, err := master.WriteString("\n"); err != nil {
 		t.Fatalf("writing the keypress to the terminal: %v", err)
 	}
-	return &App{Transport: transport, stdout: io.Discard, stderr: io.Discard, stdin: slave}
+	// midiPortVIDConfirmed models the ordinary case these tests are about: the
+	// port openRawMIDI opened was identified by the vendor ID, so the ALSA node
+	// is a usable presence signal (see midiPresenceMeaningful). Under
+	// --transport usb it is not, and that is decided by the transport.
+	return &App{
+		Transport:            transport,
+		stdout:               io.Discard,
+		stderr:               io.Discard,
+		stdin:                slave,
+		midiPortVIDConfirmed: true,
+	}
 }
 
 // TestScanInteractiveUSBDoesNotWaitOnThePort is the regression test for the
@@ -477,5 +488,47 @@ func TestScanRefusesBeforeErasingWhenStdinIsNotATerminal(t *testing.T) {
 	}
 	if after, ok := dev.Register(proto.CmdPDOLog); !ok || !bytes.Equal(after, before) {
 		t.Fatalf("the capture log was erased before the command refused: %x -> %x", before, after)
+	}
+}
+
+// TestScanVerdictStatesTheCableCeilingOnce holds one fact to one wording.
+//
+// The verdict's current row used to re-derive the cable bound and append its
+// own parenthetical, two lines above the note pdo.finish attaches to
+// Match.Messages on exactly the same condition -- so a scan against a source
+// advertising more than 5 A said the same thing twice, in two phrasings, in one
+// block. A reader has no way to tell a restatement from a second claim about a
+// second limit. The pdo package exported SPRAVSAssumptionClause rather than let
+// a disclosure be spelled two ways; the cable ceiling is the other disclosure
+// and gets the same treatment.
+func TestScanVerdictStatesTheCableCeilingOnce(t *testing.T) {
+	log := &pdo.Log{
+		NPDOsReceived: 1,
+		PDOs: []pdo.PDO{{
+			Index: 0, Kind: pdo.KindFixed, VoltageV: 9,
+			MaxCurrentA: pdo.MaxCableCurrentA, DeclaredMaxCurrentA: 10.23, Valid: true,
+		}},
+	}
+	m := log.Evaluate(9, 4)
+	if len(m.Messages) == 0 {
+		t.Fatal("pdo.Evaluate attached no cable-bound note, so there is nothing to duplicate")
+	}
+
+	var out, errBuf bytes.Buffer
+	f := newFormatter(false, &out, &errBuf)
+	emitMatch(f, m, 9, 4)
+	if err := f.Flush(); err != nil {
+		t.Fatalf("flushing the formatter: %v", err)
+	}
+	got := out.String()
+
+	if n := strings.Count(got, "no USB-C cable"); n != 1 {
+		t.Errorf("the cable ceiling is stated %d times in one verdict, want once:\n%s", n, got)
+	}
+	// And it is still stated: dropping the row's parenthetical must not take
+	// the disclosure with it, or a 140 W supply reads as under-powered for no
+	// visible reason.
+	if !strings.Contains(got, "10.23") {
+		t.Errorf("the verdict reports a reduced current without saying what the source declared:\n%s", got)
 	}
 }
