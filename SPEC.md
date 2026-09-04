@@ -1076,7 +1076,8 @@ Three phases across two transports. **This is the riskiest feature; ship it last
                wait BOOTLOADER_MODE_SWITCH_DELAY_MS = 4000
 2. Bootloader: device re-enumerates. Open by vendor 0x37BF, select configuration 1 if unset,
                pick the first interface alt whose class is 0xFF and that has both IN and OUT
-               endpoints, claim it, then a best-effort class control-OUT
+               endpoints -- direction is the whole test, see below --
+               claim it, then a best-effort class control-OUT
                (bRequest 0x22 SET_CONTROL_LINE_STATE, wValue 1, wIndex=ifnum), then a
                64-byte read loop.
                Confirm identity: [0x02, 0x08] over raw bulk returns the serial — the bootloader
@@ -1088,6 +1089,16 @@ Three phases across two transports. **This is the riskiest feature; ship it last
 4. Exit:       [0x02, 0x03] (CMD_BOOTLOAD_END) over bulk, wait 4000 ms, re-init MIDI with a
                15000 ms timeout, then run the post-update sequence (§10.4).
 ```
+
+**Direction is the whole endpoint test in step 2, and the asymmetry with §4.2 is deliberate.** MIDI
+selection applies snd-usb-audio's own bulk-or-interrupt filter; the bootloader picker applies no
+transfer-type test at all. §14.3 measured this interface declaring bulk 0x01/0x81, so the filter
+would change the answer only for a unit whose endpoints are *unexpected* — which is precisely the
+unit that most needs to stay flashable. A wrong-typed endpoint fails visibly at the first transfer,
+before any page is written and with the failing address named; an interface never offered fails as
+"this cannot be re-flashed", which is the one outcome a recovery tool must not produce. This is not
+a §17 deviation — the implementation matches this section exactly — and it is recorded here because
+the risk runs the other way: a reader arriving from §4.2 may otherwise "correct" conforming code.
 
 ### 10.2 Bootloader frames — raw bulk bytes, no nibble encoding
 
@@ -1253,6 +1264,24 @@ past the vendor ID, the name substring and the sole-port fallback (§3.4) -- but
 of file: without the check a stale `GFLEX_PORT` or a mistyped path was opened `O_RDWR` and the
 first frame written into whatever it named. A path that does not exist is still left to the
 transport, so the missing-node and permission errors are unchanged.
+
+The check happens **twice, on two different questions**, and both answer exit 2 with the same
+wording. The CLI stats the *path* before anything is opened, so a mistake is refused early and the
+message can name the flag and point at `gflex devices`. The transport then fstats the *descriptor*
+it actually holds, and that answer is the authoritative one: a path can be replaced between the
+stat and the open, and only the descriptor says what the frames would really have gone into. The
+descriptor test is `IsRegular`, not "is a character device", because a regular file is the only
+object MIDI frames corrupt silently and a stricter test would refuse the FIFO the transport's own
+deadlock tests open as a stand-in. `O_NOFOLLOW` is deliberately absent: `/dev/snd/by-path` holds
+legitimate udev symlinks to real nodes, and refusing a symlinked final component would refuse a
+path an operator could reasonably pass.
+
+**A firmware image may be a pipe, if something is writing to it.** `firmware flash <path>` opens
+the image `O_NONBLOCK`, so `<(curl -sL ...)` and `/dev/stdin` are read in full like any file. Only
+a FIFO with *no* writer is refused, and it is refused rather than tolerated because opening one
+blocks inside the kernel past the first Ctrl-C, which sets a cancellation nothing is waiting on. It
+exits 1, as every other unreadable image does. A directory is still the read failing, not a guard
+on the mode, and still exits 1.
 
 **There is no global `--force`.** An earlier draft of this section listed one alongside `--yes`,
 and it was dropped deliberately: `--force` already means something specific and narrow on
@@ -1786,6 +1815,7 @@ mechanism and there is nothing a test could hold still.
 | 10.3 | `--fetch` over whatever URL it is given; the vendor client has no scheme rule | `ws://` and `http://` refused; TLS required, or the explicit `ws+insecure://` downgrade | The image and the CRC it is checked against arrive in the same document, so a cleartext fetch authenticates neither. The downgrade is spelled out in full for the same reason as `--ignore-device-limits` (§11): a second key nobody types out of habit, left in the shell history of the run it applied to. |
 | 5.2, 7 | A write that goes unanswered is reported as a failed command | Marked `session.ErrUnacknowledged` when the frame was fully transmitted and the wait then timed out or was cancelled; the write commands say so and `voltage set` follows with one read-back | There is no NACK, so a lost echo and a lost command are the same error, and the device acts on any complete frame it receives. "The write failed" can therefore mean a rail live at the new value — the one thing §6.5's read-back rule exists to prevent. A failed *send* is excluded and still returned directly: there the frame was truncated mid-message and demonstrably did not land, so the same warning would be a false alarm on the one message that has to stay trustworthy. |
 | 5.2 | Send failures carry no classification | `PermanentErr` also treats `ENODEV`, `ENXIO`, `ESHUTDOWN` and `os.ErrClosed` from a failed send as permanent | An unplug landing between commands fails the next *write*, not a wait, so none of the receive-side sentinels appear. Without this `info --all` returns a report full of nil fields and exit 0, and the PDO chunk retry and the scan's serial re-read spend their whole budgets on a link that is gone. A usbfs transfer `ETIMEDOUT` is deliberately not in the set: that is a device still on the bus declining to answer. |
+| 6, 7 | A best-effort optional read that fails leaves its field nil, whatever the failure was | `Info` additionally fails the whole call when **all nine** optional reads failed, returning no report and naming the first cause | The errno set above cannot be widened to cover a link that dies as `EPIPE`, `EPROTO`, `EILSEQ` or `ETIME`: arriving *once*, those are the transient bus errors the PDO chunk retry and the vlimit re-read exist to ride out, and making them permanent would turn recoverable noise into hard failures across the package. A link failing every read is told apart from a firmware declining some of them by **count** rather than by classification. What the count refuses is the all-nil report an operator cannot distinguish from a unit that simply does not implement these commands. The cost is a unit that genuinely declines all nine: `info --all` now fails for it instead of printing the core set and nine blanks. Nothing measured behaves that way — bring-up answered eight of the nine (§14) — and plain `info`, which never issues them, is unaffected. |
 | 10.4 | An unreadable vlimit read-back counts as invalid, so the defaults are rewritten | Retried three times 300 ms apart; a window that still cannot be read is left exactly as the flash left it, and reported as a step that did not take | The protocol has no NACK, so a dropped frame is routine (§5.2), and rewriting on one widens a 5 V ceiling to 48 V — the fallback this table's first row already refuses for `voltage set`. A window an erase really did wipe cannot bound anything, so the next `voltage set` refuses it (§13.1) rather than falling back to the envelope. |
 | 9.4 | SPR PPS bit 27 ("PPS Power Limited") ignored; the APDO's Maximum Current is credited at every voltage | Bit 27 decoded; a power-limited range is bounded by the source's SPR power budget, inferred from its fixed PDOs, and every verdict resting on it discloses that the bound is inferred rather than scanned | A 45 W charger's 3.3-11 V / 5 A range supplies 4.09 A at 11 V. The PDP itself is in Source_Capabilities_Extended, which the scan never captures (§9.3), so the inference is disclosed the way the assumed SPR AVS range is — and declined outright where only the mandatory 5 V object exists to infer from. |
 | 9.4 | Derived currents rounded to nearest, like decoded ones | Currents obtained by division (EPR AVS PDP/V, a power-limited PPS budget/V) are floored to the 10 mA wire step | Rounding a quotient to nearest moves it *up* by up to 5 mA, and the figure is what the verdict compares the request against: 140 W at 36 V is 3.8889 A and was answered "yes" to a request for 3.89 A. |

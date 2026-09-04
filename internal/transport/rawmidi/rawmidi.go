@@ -84,7 +84,8 @@ type port struct {
 // Open opens an ALSA rawmidi device node, e.g. /dev/snd/midiC1D0, for reading
 // and writing. Failures are classified into the package's sentinel errors:
 // ErrBusy when another MIDI client holds the port, ErrPermission for a udev/ACL
-// problem, ErrNotFound when the node is gone.
+// problem, ErrNotFound when the node is gone, ErrNotADevice when the path
+// opened to a regular file.
 func Open(path string) (proto.Transport, error) {
 	if path == "" {
 		return nil, fmt.Errorf("%w: empty device path", ErrNotFound)
@@ -94,6 +95,37 @@ func Open(path string) (proto.Transport, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, classifyOpenError(path, err)
+	}
+	// The caller checked a name; nobody has yet checked the object. internal/cli
+	// stats a --port path and refuses anything that is not a character device
+	// (SPEC.md §11), but a stat and an open are two syscalls: a path replaced
+	// between them passes the check and is opened anyway, and the first frame is
+	// then written into whatever it now names. Asking the kernel about the
+	// descriptor already held closes that window, because the descriptor cannot
+	// be swapped out from under us.
+	//
+	// It refuses a regular file, not "anything that is not a character device",
+	// and the difference is the whole design of the check. A regular file is the
+	// only thing MIDI frames corrupt silently -- the write succeeds, the file
+	// grows, nothing on stderr says so -- while every other kind of file either
+	// fails the open or is a legitimate byte stream. Demanding ModeCharDevice
+	// would additionally refuse a FIFO, which is what the tests use as a
+	// hardware stand-in for exactly the deadlock behaviour this transport exists
+	// to get right.
+	//
+	// O_NOFOLLOW is the wrong tool for the same reason: /dev/snd/by-path holds
+	// udev symlinks to real nodes (pci-0000:c4:00.1 -> ../controlC0), so
+	// refusing a symlinked final component would refuse a path an operator can
+	// reasonably pass to --port. It is the object at the end that matters, and
+	// fstat is what reports it.
+	//
+	// A stat that fails on a descriptor we just opened is not itself a reason to
+	// refuse a port that opened cleanly, so only a positive answer stops us.
+	if fi, serr := f.Stat(); serr == nil && fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: %s is a regular file. Expected an ALSA rawmidi node such as "+
+			"/dev/snd/midiC1D0; nothing was written to it. Run \"gflex devices\" to list what is "+
+			"present", ErrNotADevice, path)
 	}
 	p := &port{f: f, path: path}
 	// SetReadDeadline reports os.ErrNoDeadline when the descriptor could not be

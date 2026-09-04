@@ -22,6 +22,13 @@ var (
 	// ErrNotFound reports that the named port does not exist.
 	ErrNotFound = errors.New("rawmidi: no such MIDI port")
 
+	// ErrNotADevice reports that the path opened to a regular file rather than
+	// to a device node. Only a regular file earns it: a regular file is the one
+	// kind of object MIDI frames can silently corrupt, and Open refuses exactly
+	// that and nothing else -- see the fstat in Open for why the check is not
+	// "is this a character device".
+	ErrNotADevice = errors.New("rawmidi: not a device node")
+
 	// ErrNoPorts reports that the system exposes no ALSA rawmidi ports at all.
 	ErrNoPorts = errors.New("rawmidi: no ALSA rawmidi ports found")
 

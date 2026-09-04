@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -273,6 +274,242 @@ func TestNormalisePagesBoundsPageCountBeforeDecoding(t *testing.T) {
 	}
 	if want := "16-bit"; !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want the page count refused before any page is decoded (%q)", err.Error(), want)
+	}
+	// The count is refused the moment it is exceeded, so the message cannot
+	// name the total: a document with far more elements than the id field can
+	// address must not be walked to the end just to put a number in an error.
+	if want := "more than"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to say %q rather than a total that only a full walk could know",
+			err.Error(), want)
+	}
+}
+
+// The same ceiling, on a document that carries far more elements than it: an
+// implementation that unmarshals the array whole before counting pays 24 bytes
+// of slice header for every three bytes of "[]," -- 31x, measured, and 2.37 GB
+// from a 75 MB page array -- and it can name the total, which is exactly what
+// this asserts it cannot do.
+func TestNormalisePagesStopsCountingAtTheCeiling(t *testing.T) {
+	t.Parallel()
+	const excess = 50000
+	var sb strings.Builder
+	sb.Grow(3*(MaxPages+excess) + 32)
+	sb.WriteString(`{"app_bin":[`)
+	for i := 0; i < MaxPages+excess; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(`[]`)
+	}
+	sb.WriteString(`]}`)
+
+	_, err := ParseJSONPayload([]byte(sb.String()))
+	if err == nil {
+		t.Fatal("expected an image with more than MaxPages pages to be rejected")
+	}
+	if !errors.Is(err, ErrBadPageLength) {
+		t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+	}
+	if got := fmt.Sprint(MaxPages + excess); strings.Contains(err.Error(), got) {
+		t.Errorf("error = %q names the total element count %s, so the whole array was decoded before it was judged",
+			err.Error(), got)
+	}
+	if want := fmt.Sprintf("more than %d pages", MaxPages); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// A flat array of byte values has no page ceiling to bound it -- its elements
+// are bytes, and an image of more than MaxPages bytes is perfectly ordinary --
+// so it needs a ceiling of its own: the largest image the geometry can address,
+// MaxPages pages of pageSize bytes. It has to be applied while the array is
+// decoded rather than to the finished bytes.
+//
+// Measured before it existed: a 140 MB flat array cost 3.39 GB, 24x the file,
+// because encoding/json materialises a json.RawMessage per element and then a
+// json.Number per element before any value is looked at. That makes a ~300 MB
+// image an out-of-memory kill on an 8 GB host rather than the error it deserves,
+// and `gflex firmware flash <path> --dry-run` reaches this loader with no
+// hardware attached at all.
+//
+// page_size 8 -- the smallest legal geometry -- is what keeps these documents
+// small: about a megabyte for the ceiling itself and four for the one that
+// exceeds it. The rule under test is MaxPages*pageSize bytes, not a constant.
+//
+// Not parallel: it reads process-global allocation counters, and top-level
+// parallel tests are held until every sequential one has finished.
+func TestNormalisePagesBoundsFlatImageBeforeDecoding(t *testing.T) {
+	const pageSize = ChunksPerPage
+	const ceiling = MaxPages * pageSize
+
+	doc := func(n int) []byte {
+		var b bytes.Buffer
+		b.Grow(2*n + 40)
+		fmt.Fprintf(&b, `{"page_size":%d,"app_bin":[`, pageSize)
+		// Written without a per-element loop: the over-limit document below is
+		// millions of elements, and under -race the loop costs more than the
+		// parse being measured.
+		b.Write(bytes.Repeat([]byte("0,"), n-1))
+		b.WriteString(`0]}`)
+		return b.Bytes()
+	}
+
+	// Four times the ceiling, not one element over it. A decoder with no
+	// ceiling at all stops in the same place on a ceiling+1 document and
+	// allocates the same -- measured identical to the byte -- so the budget
+	// below would be pinning the streaming rewrite rather than the ceiling, and
+	// only the error message would have anything to say.
+	over := doc(4 * ceiling)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := ParseJSONPayload(over)
+	runtime.ReadMemStats(&after)
+
+	if err == nil {
+		t.Fatal("expected a flat image larger than the page id can address to be rejected")
+	}
+	if !errors.Is(err, ErrBadPageLength) {
+		t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+	}
+	if want := fmt.Sprint(ceiling); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want the %d-byte ceiling to be what refused it (%q); reporting the page count "+
+			"instead means the whole array was decoded and split first", err.Error(), ceiling, want)
+	}
+
+	// TotalAlloc is cumulative, so it does not depend on when the collector
+	// ran; what it measures is everything the parse asked for. Measured on this
+	// 4.2 MB document: 179 MB before the bound existed -- 43x -- against 13 MB
+	// with it. The budget sits between them with about 1.8x of room on each
+	// side, because what is being pinned is the amplification, tens of bytes
+	// per element, and not an exact figure.
+	//
+	// The room on the low side has to be that wide because CI runs `go test
+	// -race`, and the race detector inflates this path unevenly: it takes the
+	// bounded decode from 13 MB to 55 MB, since that is per-element work inside
+	// the loop, while leaving the 179 MB of a whole-array json.Unmarshal
+	// untouched. A budget picked without -race in hand lands between the two.
+	const budget = 96 << 20
+	if got := after.TotalAlloc - before.TotalAlloc; got > budget {
+		t.Errorf("parsing a %d-byte document allocated %d bytes, over the %d-byte budget: the array was "+
+			"materialised before the ceiling was applied", len(over), got, budget)
+	}
+
+	// The ceiling itself is a legal image -- exactly MaxPages pages -- and a
+	// bound that rejects it would make a valid image unflashable.
+	fw, err := ParseJSONPayload(doc(ceiling))
+	if err != nil {
+		t.Fatalf("ParseJSONPayload(%d bytes, the ceiling): %v", ceiling, err)
+	}
+	if len(fw.Pages) != MaxPages || fw.PageSize() != pageSize {
+		t.Errorf("got %d pages of %d bytes, want %d of %d", len(fw.Pages), fw.PageSize(), MaxPages, pageSize)
+	}
+}
+
+// One page element is bounded too, by the largest page the wire format can
+// express. The page ceiling above does not reach it: a single element carrying
+// a hundred megabytes of byte values is one page, and newFirmware would reject
+// it for its length -- after every one of those values had been decoded.
+func TestDecodePageBoundsOnePageBeforeDecoding(t *testing.T) {
+	t.Parallel()
+	var sb strings.Builder
+	sb.WriteString(`{"app_bin":[[`)
+	// A multiple of ChunksPerPage, so that an implementation which decodes
+	// first fails on the chunk size rather than on divisibility.
+	for i := 0; i < maxPageSize+ChunksPerPage; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('0')
+	}
+	sb.WriteString(`]]}`)
+
+	_, err := ParseJSONPayload([]byte(sb.String()))
+	if err == nil {
+		t.Fatal("expected a page longer than the wire format can express to be rejected")
+	}
+	if !errors.Is(err, ErrBadPageLength) {
+		t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+	}
+	if want := fmt.Sprintf("longer than the %d bytes", maxPageSize); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want the %d-byte ceiling to be what refused it (%q)", err.Error(), maxPageSize, want)
+	}
+	if want := "(page 0)"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to name %q", err.Error(), want)
+	}
+}
+
+// The raw path judges its page count before it builds the pages. newFirmware
+// refuses this image either way, but only after every page of it has been
+// allocated and copied: a 500 MB .bin peaked at 1.08 GB to be told it has
+// 976563 pages.
+//
+// Not parallel, for the same reason as the flat-image test above.
+func TestParseRawImageBoundsPageCountBeforeSplitting(t *testing.T) {
+	const pageSize = ChunksPerPage
+	data := make([]byte, MaxPages*pageSize+1)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := ParseImage(data, LoadOptions{PageSize: pageSize})
+	runtime.ReadMemStats(&after)
+
+	if err == nil {
+		t.Fatal("expected an image with more pages than the page id can address to be rejected")
+	}
+	if !errors.Is(err, ErrBadPageLength) {
+		t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+	}
+	// newFirmware's wording, so the same violation reads the same way wherever
+	// it is caught, and the count is exact here because it is arithmetic.
+	if want := fmt.Sprintf("image has %d pages", MaxPages+1); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+	if want := "16-bit"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to explain the %s page id", err.Error(), want)
+	}
+	// Nothing at all should have been built: the input is already in memory and
+	// the count is a division. Before the check the split cost about 3.6 MB for
+	// this 512 KiB image -- a slice header and a page per 8 bytes.
+	const budget = 64 << 10
+	if got := after.TotalAlloc - before.TotalAlloc; got > budget {
+		t.Errorf("refusing a %d-byte image allocated %d bytes, over the %d-byte budget: the pages were built "+
+			"before the count was judged", len(data), got, budget)
+	}
+
+	// The ceiling itself still splits.
+	fw, err := ParseImage(data[:MaxPages*pageSize], LoadOptions{PageSize: pageSize})
+	if err != nil {
+		t.Fatalf("ParseImage(%d pages): %v", MaxPages, err)
+	}
+	if len(fw.Pages) != MaxPages {
+		t.Errorf("got %d pages, want %d", len(fw.Pages), MaxPages)
+	}
+}
+
+// A bare array is read from a file, not from a payload that has already been
+// parsed once, so the array decode is the only thing standing between a
+// malformed document and a firmware image. Trailing data and a truncated array
+// both used to be caught by unmarshalling the whole document; reading the
+// elements one at a time does not get that for free.
+func TestParseImageRejectsMalformedBareArray(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, doc string
+	}{
+		{"trailing text", "[1,2,3,4,5,6,7,8] and then some"},
+		{"a second value", "[1,2,3,4,5,6,7,8][9]"},
+		{"truncated", "[1,2,3,4,5,6,7,8"},
+		{"truncated pages", `[[1,2,3,4,5,6,7,8]`},
+		{"trailing text after pages", `[[1,2,3,4,5,6,7,8]] and then some`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if fw, err := ParseImage([]byte(tc.doc), LoadOptions{}); err == nil {
+				t.Errorf("accepted %q as %d pages of %d bytes", tc.doc, len(fw.Pages), fw.PageSize())
+			} else if !errors.Is(err, ErrBadPageLength) {
+				t.Errorf("error = %v, want it to wrap ErrBadPageLength", err)
+			}
+		})
 	}
 }
 

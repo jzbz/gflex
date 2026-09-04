@@ -612,3 +612,66 @@ func TestInterfaceDriverBoundGlobsTheConfigurationNumber(t *testing.T) {
 		t.Errorf("interfaceDriverBound(3) = %v, %v; want cannot-tell for an interface with no directory", bound, known)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The byte count a transfer comes back with.
+//
+// No device can produce a count outside the buffer it was handed: the device
+// never chooses what the ioctl returns, and an IN transfer that overruns the
+// buffer is reported as EOVERFLOW on the error path. Only the kernel side can
+// answer this, which is what the ioctlFn seam is for -- and what is being
+// pinned is that the answer is refused where it is produced rather than passed
+// on to the three call sites that slice by it.
+// ---------------------------------------------------------------------------
+
+func TestTransferRejectsAByteCountOutsideTheBuffer(t *testing.T) {
+	const requested = 8
+	tests := []struct {
+		name    string
+		result  int
+		wantErr bool
+	}{
+		{name: "longer than the buffer", result: requested + 1, wantErr: true},
+		{name: "negative", result: -1, wantErr: true},
+		// The controls. A short IN transfer is the ordinary case on a bulk
+		// endpoint -- the device answers with what it has -- so the check must
+		// not touch it, nor the full-length answer at the boundary.
+		{name: "shorter than the buffer", result: requested - 3},
+		{name: "the whole buffer", result: requested},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Device{ref: DeviceRef{Path: "/dev/bus/usb/001/007"}, claimed: map[int]claimState{}}
+			d.ioctlFn = func(_ string, req uintptr, arg unsafe.Pointer, _ bool) (int, error) {
+				if req != ioctlBulk {
+					t.Errorf("ioctl request %#x, want USBDEVFS_BULK", req)
+				}
+				if got := int((*bulkTransfer)(arg).length); got != requested {
+					t.Errorf("bulkTransfer.length = %d, want %d", got, requested)
+				}
+				return tc.result, nil
+			}
+
+			n, err := d.Transfer(context.Background(), 0x81, make([]byte, requested), time.Millisecond)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("Transfer = %d, %v; want %d and no error", n, err, tc.result)
+				}
+				if n != tc.result {
+					t.Errorf("Transfer = %d, want the %d bytes the kernel reported", n, tc.result)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Transfer = %d, nil; want an error: %d bytes cannot have moved through a %d-byte buffer",
+					n, tc.result, requested)
+			}
+			if n != 0 {
+				t.Errorf("Transfer returned %d beside its error, want 0: the count is the thing being refused", n)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprint(tc.result)) {
+				t.Errorf("error %q does not name the count %d it refused", err, tc.result)
+			}
+		})
+	}
+}

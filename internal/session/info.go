@@ -31,7 +31,9 @@ import (
 //
 // Best-effort stops where no further read could succeed either. A cancelled
 // context or any other failure PermanentErr names ends the call with an error
-// rather than with a report full of holes; see the loop below.
+// rather than with a report full of holes, and so does a run in which all nine
+// failed, whatever the cause: a report with nothing in it describes a link that
+// never answered, not a firmware exercising its discretion. See the loop below.
 func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceInfo, error) {
 	info := &proto.DeviceInfo{}
 
@@ -152,10 +154,16 @@ func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceIn
 		},
 	}
 
+	failed := 0
+	var firstErr error
 	for _, read := range optional {
 		err := read()
 		if err == nil {
 			continue
+		}
+		failed++
+		if firstErr == nil {
+			firstErr = err
 		}
 		// Tolerating a failure is right for a command the firmware may not
 		// implement; it is wrong for a cancelled context. ctx.Err() != nil means
@@ -188,6 +196,30 @@ func (s *Session) Info(ctx context.Context, includeUnused bool) (*proto.DeviceIn
 		if PermanentErr(err) {
 			return nil, fmt.Errorf("read device info: %w", err)
 		}
+	}
+
+	// A link can be just as gone without saying so in a word this package
+	// recognises. EPIPE from a halted endpoint, EPROTO, EILSEQ, ETIME are all
+	// errors a usbfs bulk transfer produces, and a link failing that way fails
+	// all nine of these reads exactly as an unplug does -- so the check above
+	// never fires and the report is the one it exists to prevent.
+	//
+	// Widening PermanentErr to name them is the wrong repair. It is shared:
+	// readVLimitRetrying below and FullPDOLog's chunk retry both give up the
+	// moment it says true, and a per-transfer bus error is precisely what those
+	// retries are there to ride out. Recoverable noise would become a hard
+	// failure across the package to fix a report in this one function.
+	//
+	// The count fixes it here instead, and needs no classifier. One of these
+	// commands failing is the case the tolerance exists for and is still
+	// tolerated; every one of them failing is not a firmware's preference about
+	// nine unrelated commands. The cost is a unit that genuinely declines all
+	// nine: `info --all` now fails for it rather than printing the core set and
+	// nine blanks. Nothing recorded behaves that way -- bring-up answered eight
+	// of the nine on the one unit there is (SPEC.md §14) -- and plain `info`,
+	// which never issues them, is unaffected either way.
+	if failed == len(optional) {
+		return nil, fmt.Errorf("read device info: none of the %d optional reads got through, so the report was abandoned rather than empty: %w", len(optional), firstErr)
 	}
 
 	return info, nil

@@ -355,6 +355,7 @@ gflex firmware version
 gflex firmware flash firmware.json --yes
 gflex firmware flash --fetch --yes             # pull the image from the vendor's server
 gflex firmware flash firmware.json --recover   # unit already stuck in the bootloader
+gflex firmware flash <(curl -sL "$URL") --yes   # a pipe works, as long as something is writing
 ```
 
 | Flag | Meaning |

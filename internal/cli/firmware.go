@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/jzbz/gflex/internal/bootloader"
 	"github.com/jzbz/gflex/internal/ctxwait"
@@ -1407,6 +1408,20 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 			return nil, fetchError(o.wsURL, serial, o.fetchTimeout, err)
 		}
 	} else {
+		// One open, one read, one parse. The image used to be opened twice --
+		// once by the sniff below, once by bootloader.LoadFileWithOptions --
+		// and on a FIFO those two opens share one stream, so the sniff would
+		// swallow its first 4 KiB and hand the loader the remainder. That is
+		// not a corrupt image, it is a *different* one, on the path where a
+		// wrong split can flash and even verify cleanly (SPEC.md §10.2,
+		// §14.12). Reading the bytes once and asking both questions of the
+		// bytes is what the loader would do anyway: LoadFileWithOptions is
+		// os.ReadFile plus ParseImage, and this is the same two steps with the
+		// open under this package's control.
+		data, rerr := readImageFile(o.path)
+		if rerr != nil {
+			return nil, localFileError("loading", o.path, rerr)
+		}
 		// --page-size is refused on every JSON image, because whether the
 		// loader would honour it depends on the shape *inside* the document.
 		// The object payload takes its split from the payload's own page_size
@@ -1422,20 +1437,15 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 		// images that would actually ignore the flag: it costs a bare-array
 		// user the ability to state a geometry from this command, which is a
 		// worse outcome only if they cannot hand the same bytes over as a .bin.
-		//
-		// A sniff error is deliberately not acted on here: LoadFileWithOptions
-		// reads the same file next and reports the failure with the path in it.
-		if o.pageSize != 0 {
-			if isJSON, jerr := fileLooksJSON(o.path); jerr == nil && isJSON {
-				return nil, codedf(ExitUsage, "--page-size splits a raw .bin, but %s is a JSON image, "+
-					"where the page split is the payload's to state; drop the flag, or pass the "+
-					"image as a raw .bin", o.path)
-			}
+		if o.pageSize != 0 && imageLooksJSON(data) {
+			return nil, codedf(ExitUsage, "--page-size splits a raw .bin, but %s is a JSON image, "+
+				"where the page split is the payload's to state; drop the flag, or pass the "+
+				"image as a raw .bin", o.path)
 		}
 		// Page-geometry validation (divisibility by ChunksPerPage, chunk fit)
 		// is the library's alone; its error names the exact rule violated and
 		// is surfaced verbatim inside the wrap below.
-		fw, err = bootloader.LoadFileWithOptions(o.path, bootloader.LoadOptions{PageSize: o.pageSize})
+		fw, err = bootloader.ParseImage(data, bootloader.LoadOptions{PageSize: o.pageSize})
 		if err != nil {
 			return nil, localFileError("loading", o.path, err)
 		}
@@ -1469,36 +1479,72 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 	return fw, nil
 }
 
-// fileLooksJSON reports whether the image at path is one of the JSON payload
-// shapes rather than a raw binary, by the same rule bootloader.ParseImage
-// detects the format with: the first non-whitespace byte is '{' or '['. The
-// duplication is one switch on one byte, and it exists so that --page-size can
-// be refused on a JSON image *before* the loader is handed it -- see
-// loadFirmware for why that refusal deliberately covers every JSON shape and
-// not only the ones whose split really does come from the payload. A wholly
-// whitespace or unreadable file is not judged here: the loader reads the same
-// file next and its error names the path.
-func fileLooksJSON(path string) (bool, error) {
-	fh, err := os.Open(path)
+// readImageFile reads the firmware image the user named, once.
+//
+// The open is O_NONBLOCK, and the flag is about open(2) rather than about the
+// read: opening a FIFO O_RDONLY blocks inside the kernel until a writer
+// appears, and nothing above can call that off -- not the command's context,
+// and not the first Ctrl-C, which sets the cancellation nobody is waiting on
+// and leaves only the re-armed second signal to end the process (root.go). So
+// `gflex firmware flash /tmp/somefifo` hung, on every mode of the command,
+// --dry-run with no device attached included. O_NONBLOCK returns from that open
+// immediately whether or not anyone is writing.
+//
+// Refusing anything that is not a regular file would have been simpler and
+// would have been wrong. `gflex firmware flash <(curl -sL ...)` names a /dev/fd
+// pipe that has a live writer behind it, and /dev/stdin names whatever the
+// shell redirected; neither is documented or tested, both work today, and both
+// are reasonable ways to hand this command an image. What hangs is the narrower
+// case -- a FIFO with nothing writing to it -- and that is what is refused.
+//
+// Nothing is given up on the writer that is there. Go registers a non-blocking
+// FIFO with the netpoller, so the read below waits for bytes exactly as a
+// blocking one would and the EAGAIN never surfaces; a 200 ms curl is read in
+// full. A FIFO with no writer reads EOF at once instead, which is how it
+// arrives here as an empty image and why it is worth its own sentence: the
+// parser's "file is empty" would send the user looking at the contents of a
+// file that has no contents to look at.
+//
+// A directory still reports "is a directory" and still exits 1 -- that is the
+// read failing, exactly as os.ReadFile's does, not a guard on the mode.
+func readImageFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	defer fh.Close()
-	buf := make([]byte, 4096)
-	for {
-		n, rerr := fh.Read(buf)
-		for _, b := range buf[:n] {
-			switch b {
-			case ' ', '\t', '\r', '\n':
-				// The same leading whitespace ParseImage trims.
-			default:
-				return b == '{' || b == '[', nil
-			}
-		}
-		if rerr != nil {
-			return false, nil
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	// The descriptor is asked, not the path: this says what was actually read
+	// from, and it cannot have been swapped since.
+	if fi, serr := f.Stat(); serr == nil && len(data) == 0 && fi.Mode()&os.ModeNamedPipe != 0 {
+		return nil, errors.New("this is a FIFO and nothing is writing to it, so there are no " +
+			"image bytes to read; a process substitution such as <(curl -sL ...) carries its " +
+			"writer with it, a bare FIFO does not")
+	}
+	return data, nil
+}
+
+// imageLooksJSON reports whether the image is one of the JSON payload shapes
+// rather than a raw binary, by the same rule bootloader.ParseImage detects the
+// format with: the first non-whitespace byte is '{' or '['. The duplication is
+// one switch on one byte, and it exists so that --page-size can be refused on a
+// JSON image before the parser is handed it -- see loadFirmware for why that
+// refusal deliberately covers every JSON shape and not only the ones whose
+// split really does come from the payload. A wholly whitespace image is not
+// judged here: ParseImage sees the same bytes next and rejects them.
+func imageLooksJSON(data []byte) bool {
+	for _, b := range data {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			// The same leading whitespace ParseImage trims.
+		default:
+			return b == '{' || b == '['
 		}
 	}
+	return false
 }
 
 // openBootloaderInterface opens the vendor-class interface and turns a failure

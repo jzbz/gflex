@@ -128,6 +128,44 @@ func TestCloseIsIdempotentAndConcurrent(t *testing.T) {
 	}
 }
 
+// internal/cli stats a --port path and refuses anything that is not a character
+// device, but a stat and an open are two syscalls and a path can change between
+// them. Open's own fstat is what closes that window, so it has to refuse a
+// regular file on its own -- and leave the file exactly as it found it, since
+// the corruption being prevented is a frame written into somebody's data.
+func TestOpenRefusesRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "midiC9D0")
+	want := []byte("not a MIDI port\n")
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatalf("write decoy file: %v", err)
+	}
+
+	tr, err := Open(path)
+	if err == nil {
+		_ = tr.Close()
+		t.Fatal("Open accepted a regular file")
+	}
+	if !errors.Is(err, ErrNotADevice) {
+		t.Errorf("Open error = %v, want it to wrap ErrNotADevice", err)
+	}
+	// The three sentinels the CLI maps onto its own exit codes must not widen to
+	// cover this: a regular file is neither a missing node, a busy port, nor an
+	// ACL problem, and the "gflex install-udev" hint would be nonsense advice.
+	for _, other := range []error{ErrNotFound, ErrPermission, ErrBusy} {
+		if errors.Is(err, other) {
+			t.Errorf("Open error = %v, must not also wrap %v", err, other)
+		}
+	}
+
+	got, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read back decoy file: %v", rerr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("file contents = %q, want %q", got, want)
+	}
+}
+
 func TestIOAfterCloseReportsClosed(t *testing.T) {
 	p, _ := fifoTransport(t)
 	if err := p.Close(); err != nil {

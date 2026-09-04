@@ -95,6 +95,29 @@ func newPDOCommand(app *App) *cobra.Command {
 	dump.Flags().BoolVar(&raw, "raw", false, "also emit the undecoded 90-byte blob as hex")
 	cmd.AddCommand(dump)
 
+	// `clear` erases non-volatile state that nothing can hand back, and it does
+	// so with no confirmation. That is deliberate, and it was looked at again
+	// rather than assumed.
+	//
+	// It is not a SPEC.md §13 interlock. That list is ten items and it is
+	// closed, and every one of them is scoped to a value that can damage a load
+	// or lock the owner out of their own device: the rail, the window that
+	// bounds it, the calibration the window's evidence comes from, the auth
+	// lock, a flash, and the raw escape hatch. Writing NVM is not by itself the
+	// test -- `tolerance set`, `led set` and `led color` all write it and none
+	// of them prompts, under the policy warnUnacknowledged states in
+	// settings.go. A capture log is a measurement of somebody else's charger,
+	// and the Note printed straight after this says how to take it again.
+	//
+	// What settles it is that `scan` already erases the same log on the way
+	// past (scan.go), and `scan --no-prompt` does it unattended and silently --
+	// the bigger, longer, more surprising erase of the two. Gating the small
+	// deliberate one alone would refuse `pdo clear` on a non-TTY without --yes,
+	// breaking exactly the scripted use the erase exists to serve, while the
+	// scripted wizard went on erasing without a word. An interlock that stops
+	// the careful spelling of an operation and waves through the automatic one
+	// is not a safety property; it is a lottery. If a confirmation is ever
+	// wanted here, it belongs on both, and on the same day.
 	cmd.AddCommand(&cobra.Command{
 		Use:   "clear",
 		Short: "Erase the captured PD capability log",

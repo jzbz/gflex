@@ -841,6 +841,22 @@ const (
 // the only interface a unit offers turns "this needs re-flashing" into "this
 // cannot be re-flashed", which is the one failure a recovery tool must not
 // have.
+//
+// The endpoint pair is tested for direction alone, with no bulk-or-interrupt
+// filter, and the absence is deliberate rather than an oversight.
+// usbmidi.endpointsFor does apply that filter, but the asymmetry is the spec's:
+// §4.2 mandates the transfer-type test on the MIDI path, quoting
+// snd-usb-audio's own (midi.c:2006), while §10.1 states the bootloader rule as
+// class 0xFF plus an IN and an OUT endpoint and stops there. Adding it here
+// would be a rule this tool invented, on the one path that has to work when the
+// application firmware no longer does. It would also buy nothing against the
+// evidence: §14.3 measured the bootloader interface declaring bulk 0x01/0x81,
+// so any unit whose answer the filter would change is a unit whose bootloader
+// endpoints are something this tool did not anticipate — exactly the unit that
+// has to stay flashable. Without the filter a wrong-type endpoint fails at the
+// first transfer, which is a visible error the user can report; with it the
+// interface is never offered at all, which is the same "cannot be re-flashed"
+// the subclass rule above stays a preference to avoid.
 func PickBootloaderInterface(cfg *usbfs.Config) (usbfs.Interface, bool) {
 	if cfg == nil {
 		return usbfs.Interface{}, false

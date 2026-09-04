@@ -572,6 +572,27 @@ func (d *Device) Transfer(ctx context.Context, endpoint uint8, data []byte, time
 	if err != nil {
 		return 0, err
 	}
+	// A conforming kernel cannot answer this. proc_bulk copies at most
+	// bt.length bytes and returns what usb_bulk_msg actually transferred, so
+	// the count is always within [0, len(data)]; a device that sends more than
+	// the buffer holds is a babble/overflow condition the host controller
+	// reports as EOVERFLOW, which leaves on the error path above. Nor can a
+	// device reach this by misbehaving -- it never gets to choose the number
+	// the ioctl returns.
+	//
+	// The check is here because a count that did come back out of range would
+	// not stay in this package: every caller slices by it (usbmidi's reader
+	// takes scratch[:n] and its writer b[n:], the flasher takes buf[:n]), and
+	// their own guards stop at the low end -- n <= 0 in usbmidi, n == 0 in the
+	// flasher, so none of them bounds n from above. A kernel bug, a host-controller
+	// fault or a struct layout that does not match this architecture's would
+	// therefore surface as a panic three packages away instead of an error at
+	// the syscall that produced it. One branch at this boundary covers all
+	// three call sites, which is why it is not repeated at any of them.
+	if n < 0 || n > len(data) {
+		return 0, fmt.Errorf("usbfs: %s on %s: the kernel reported %d bytes transferred, "+
+			"which is out of range for the buffer", op, d.ref.Path, n)
+	}
 	return n, nil
 }
 

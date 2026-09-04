@@ -146,6 +146,13 @@ func (a *App) openTransport(ctx context.Context) (proto.Transport, string, error
 	}
 }
 
+// notACharDeviceMsg is the refusal a --port path that is not a device node
+// produces. One string, because two checks produce it -- the stat before the
+// open and the transport's fstat after it -- and the operator is meant to get
+// the same sentence whichever one fired.
+const notACharDeviceMsg = "--port %s is not a character device; expected an ALSA rawmidi node such as " +
+	"/dev/snd/midiC1D0 (see gflex devices)"
+
 // openRawMIDI opens the ALSA rawmidi node.
 //
 // A --port beginning with "/" is taken as a device node path and opened
@@ -156,24 +163,29 @@ func (a *App) openRawMIDI(ctx context.Context) (proto.Transport, string, error) 
 	if strings.HasPrefix(a.Port, "/") {
 		// --port says "yes, that one, I mean it" about IDENTIFICATION -- it
 		// overrides the vendor ID, the name match and the sole-port fallback
-		// alike (SPEC.md §3.4). It does not say the path is a device node, and
-		// nothing else asks: rawmidi.Open is a plain O_RDWR open, so a regular
-		// file named by mistake -- a stale GFLEX_PORT, a shell completion that
-		// landed beside the node -- is opened and then WRITTEN to. The framer's
-		// first SendFrame stamps MIDI messages over the start of the file and
-		// the reader's EOF tears the session down a moment later, with nothing
-		// on stderr saying the file was modified. Every other path into this
-		// package refuses to write frames at something it cannot identify or
-		// warns loudly first; this is that guard for the one path that skips
-		// discovery entirely.
+		// alike (SPEC.md §3.4). It does not say the path is a device node: a
+		// regular file named by mistake -- a stale GFLEX_PORT, a shell
+		// completion that landed beside the node -- would be opened and then
+		// WRITTEN to. The framer's first SendFrame stamps MIDI messages over
+		// the start of the file and the reader's EOF tears the session down a
+		// moment later, with nothing on stderr saying the file was modified.
+		// Every other path into this package refuses to write frames at
+		// something it cannot identify or warns loudly first; this is that
+		// guard for the one path that skips discovery entirely.
+		//
+		// It is no longer the only guard -- rawmidi.Open fstats the descriptor
+		// it opened and refuses a regular file there too -- and this one is
+		// kept for what a name check is good for: it is a syscall cheaper, and
+		// it can name the flag and point at `gflex devices` because it knows
+		// what the user typed. The descriptor check is what actually closes the
+		// window, since a path can be replaced between this stat and that open;
+		// see the discipline written down in writefile.go.
 		//
 		// Only a positive answer refuses. A path that does not exist falls
 		// through untouched, so rawmidi.Open keeps classifying ENOENT and EACCES
 		// the way it does today.
 		if fi, serr := os.Stat(a.Port); serr == nil && fi.Mode()&os.ModeCharDevice == 0 {
-			return nil, "", codedf(ExitUsage,
-				"--port %s is not a character device; expected an ALSA rawmidi node such as "+
-					"/dev/snd/midiC1D0 (see gflex devices)", a.Port)
+			return nil, "", codedf(ExitUsage, notACharDeviceMsg, a.Port)
 		}
 		t, err := openWaitingForACL(ctx, func() (proto.Transport, error) {
 			p, oerr := rawmidi.Open(a.Port)
@@ -183,6 +195,20 @@ func (a *App) openRawMIDI(ctx context.Context) (proto.Transport, string, error) 
 			return p, nil
 		})
 		if err != nil {
+			// The transport's fstat caught what the stat above was reaching
+			// for, on the descriptor rather than on the name. Same refusal,
+			// same wording: which of the two checks fired is an implementation
+			// detail, and an operator who swapped a path under us is owed the
+			// message that names the flag, not the transport's phrasing of it.
+			//
+			// It is answered here rather than left to ExitCode because
+			// transportError below would get there first: its fallthrough
+			// formats with %v, so the sentinel does not survive it, and it
+			// codes what is left ExitNoDevice -- "no device found", plus the
+			// whole search report, for a command line that named a file.
+			if errors.Is(err, rawmidi.ErrNotADevice) {
+				return nil, "", codedf(ExitUsage, notACharDeviceMsg, a.Port)
+			}
 			return nil, "", a.transportError(ctx, fmt.Errorf("opening %s: %w", a.Port, err))
 		}
 		// --port skips discovery, so nothing has yet said what this node is.

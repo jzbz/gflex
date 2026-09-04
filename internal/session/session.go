@@ -137,10 +137,17 @@ func PermanentErr(err error) bool {
 // and FullPDOLog and the scan wizard's serial re-read would spend their retry
 // budgets on a link that is gone.
 //
-// The set is the one internal/cli's ExitCode already maps to the no-device exit
-// code, so a link the CLI calls gone is a link this package stops retrying.
-// Matching the errnos rather than usbfs's class sentinel keeps layer 3 free of a
-// transport import and covers rawmidi, which returns the bare kernel error.
+// The errnos are the ones internal/cli's ExitCode maps to the no-device exit
+// code -- ENODEV, ENXIO and ESHUTDOWN, the same three -- so a link the CLI calls
+// gone is a link this package stops retrying. Matching the errnos rather than
+// usbfs's class sentinel keeps layer 3 free of a transport import and covers
+// rawmidi, which returns the bare kernel error.
+//
+// This set has one member more, and on purpose: os.ErrClosed is a send into a
+// port this tool has already closed. That means "stop retrying" here, but it is
+// this program's own doing rather than a device that went away, so ExitCode
+// leaves it on the generic failure code. The two sets agree on every errno and
+// differ on the one member that is not one.
 //
 // Deliberately NOT "any failed send". A usbfs transfer that times out
 // (ETIMEDOUT) is a failed write to a device that is still there, and a second

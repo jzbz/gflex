@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -203,23 +204,52 @@ func ParseImage(data []byte, opts LoadOptions) (*Firmware, error) {
 	}
 }
 
-// parseRawImage splits a flat binary image into equal pages, padding the last
-// one out to a whole page with RawImagePad.
-func parseRawImage(data []byte, pageSize int) (*Firmware, error) {
-	// Zero means "unset"; anything else is validated, including a negative,
-	// which used to be silently replaced by the default. Substituting 512 for a
-	// stated geometry is wrong on the one path where a wrong split can flash and
-	// even verify cleanly (SPEC.md §10.2, §14.12).
+// effectivePageSize resolves the "zero means unset" rule and validates the
+// result, so that one answer serves every caller that needs a geometry before
+// it allocates.
+//
+// Zero means "unset"; anything else is validated, including a negative, which
+// used to be silently replaced by the default. Substituting 512 for a stated
+// geometry is wrong on the one path where a wrong split can flash and even
+// verify cleanly (SPEC.md §10.2, §14.12).
+//
+// The validation is not optional for a caller that only wants the number:
+// normalisePages derives a byte ceiling from it, MaxPages*pageSize, and the
+// MaxInt64-7 that used to reach make([]byte, pageSize) would overflow that
+// product into a negative bound and wave the image through.
+func effectivePageSize(pageSize int) (int, error) {
 	if pageSize == 0 {
 		pageSize = DefaultPageSize
 	}
-	// Every rule has to hold *before* the two expressions below: the capacity
-	// arithmetic (len(data)+pageSize-1) overflows on a huge pageSize, and the
-	// per-page make() is the unbounded allocation itself.
 	if err := validatePageSize(pageSize); err != nil {
+		return 0, err
+	}
+	return pageSize, nil
+}
+
+// parseRawImage splits a flat binary image into equal pages, padding the last
+// one out to a whole page with RawImagePad.
+func parseRawImage(data []byte, pageSize int) (*Firmware, error) {
+	// Every rule has to hold *before* the arithmetic below: the capacity
+	// expression (len(data)+pageSize-1) overflows on a huge pageSize, and the
+	// per-page make() is the unbounded allocation itself.
+	pageSize, err := effectivePageSize(pageSize)
+	if err != nil {
 		return nil, err
 	}
-	pages := make([][]byte, 0, (len(data)+pageSize-1)/pageSize)
+	// The page count is judged before the pages are built, for the same reason
+	// the JSON path judges its element count first. newFirmware refuses this
+	// image either way, but only once every page has been allocated and copied:
+	// a 500 MB .bin peaked at 1.08 GB to be told it has 976563 pages. The
+	// wording is newFirmware's, so the same violation reads the same way
+	// whether it is caught here or there.
+	count := (len(data) + pageSize - 1) / pageSize
+	if count > MaxPages {
+		return nil, fmt.Errorf("%w: image has %d pages but the WRITE_CHUNK page id is a 16-bit "+
+			"field, so at most %d can be addressed; page %d would wrap onto page 0",
+			ErrBadPageLength, count, MaxPages, MaxPages)
+	}
+	pages := make([][]byte, 0, count)
 	for off := 0; off < len(data); off += pageSize {
 		end := off + pageSize
 		page := make([]byte, pageSize)
@@ -348,12 +378,9 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 		return splitFlat(b, pageSize)
 	}
 
-	var elems []json.RawMessage
-	if err := json.Unmarshal(trimmed, &elems); err != nil {
-		return nil, fmt.Errorf("%w: firmware payload is neither an array nor a string: %w", ErrBadPageLength, err)
-	}
-	if len(elems) == 0 {
-		return nil, fmt.Errorf("%w: firmware payload has no pages", ErrBadPageLength)
+	first, err := firstElementByte(trimmed)
+	if err != nil {
+		return nil, err
 	}
 
 	// A flat array of numbers is the whole image rather than a list of pages.
@@ -361,32 +388,29 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 	// this branch: the vendor service sends exactly that shape, and reading it
 	// as a byte list is how `firmware flash --fetch` failed against the real
 	// endpoint with "cannot unmarshal object into Go value of type json.Number".
-	if first := bytes.TrimSpace(elems[0]); len(first) > 0 && first[0] != '[' && first[0] != '"' && first[0] != '{' {
-		b, err := decodeByteArray(trimmed)
+	if first != '[' && first != '"' && first != '{' {
+		// The elements here are bytes, not pages, so the page ceiling below
+		// cannot bound them: an image of more than MaxPages bytes is perfectly
+		// ordinary. What bounds them is the largest image this geometry could
+		// ever address — MaxPages pages of pageSize bytes — which is why the
+		// geometry is resolved before the decode rather than inside splitFlat
+		// after it. Measured without a bound here: a 140 MB flat array of byte
+		// values cost 3.39 GB, 24x the file, and a ~300 MB one is an
+		// out-of-memory kill rather than the error it deserves.
+		size, err := effectivePageSize(pageSize)
+		if err != nil {
+			return nil, err
+		}
+		b, err := decodeByteArray(trimmed, MaxPages*size)
 		if err != nil {
 			return nil, err
 		}
 		return splitFlat(b, pageSize)
 	}
 
-	// The page ceiling applies here, before the second slice is sized and
-	// before a single page is decoded — the same before-you-allocate discipline
-	// validatePageSize follows, and for the same reason: the element count
-	// comes from outside, and only the JSON *document* is bounded by
-	// MaxMessageBytes, never the number of things inside it. Three bytes of
-	// "[]," per element buy a 24-byte slice header here plus another 24 in the
-	// decoded slice, so an 8 MiB message of empty pages used to cost a few
-	// hundred megabytes and millions of decodePage calls before newFirmware
-	// rejected it for exactly this. It cannot move above the flat-array branch:
-	// there the elements are bytes, not pages, and an image larger than
-	// MaxPages bytes is perfectly ordinary.
-	//
-	// The wording is deliberately identical to newFirmware's, so the same
-	// violation reads the same way whether it is caught here or there.
-	if len(elems) > MaxPages {
-		return nil, fmt.Errorf("%w: image has %d pages but the WRITE_CHUNK page id is a 16-bit "+
-			"field, so at most %d can be addressed; page %d would wrap onto page 0",
-			ErrBadPageLength, len(elems), MaxPages, MaxPages)
+	elems, err := decodePageElements(trimmed)
+	if err != nil {
+		return nil, err
 	}
 
 	pages := make([][]byte, 0, len(elems))
@@ -409,6 +433,98 @@ func normalisePages(raw json.RawMessage, pageSize int) ([][]byte, error) {
 		return nil, err
 	}
 	return pages, nil
+}
+
+// firstElementByte reports the first byte of an array's first element, which is
+// the whole of the shape discrimination normalisePages performs.
+//
+// It looks rather than unmarshals. Reading the array into a []json.RawMessage
+// first and then examining elems[0] costs a 24-byte slice header and a copy per
+// element before anything has decided what the elements even are — and on a
+// flat image those "elements" are single bytes, so that walk is the
+// amplification this path exists to avoid.
+func firstElementByte(raw []byte) (byte, error) {
+	rest := raw
+	if rest[0] != '[' {
+		return 0, fmt.Errorf("%w: firmware payload is neither an array nor a string", ErrBadPageLength)
+	}
+	rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+	if len(rest) == 0 {
+		return 0, fmt.Errorf("%w: firmware payload array is truncated", ErrBadPageLength)
+	}
+	if rest[0] == ']' {
+		return 0, fmt.Errorf("%w: firmware payload has no pages", ErrBadPageLength)
+	}
+	return rest[0], nil
+}
+
+// decodePageElements reads the elements of the pages array one at a time,
+// refusing an image with more pages than the WRITE_CHUNK page id can address as
+// soon as the count is exceeded.
+//
+// The ceiling has to be applied during the decode rather than to a finished
+// []json.RawMessage — the same before-you-allocate discipline validatePageSize
+// follows, and for the same reason: the element count comes from outside, and
+// only the JSON *document* is bounded by MaxMessageBytes, never the number of
+// things inside it. Three bytes of "[]," per element buy a 24-byte slice header
+// plus a copy, so unmarshalling the array whole cost 2.37 GB on a 75 MB page
+// array — 31x — and a few hundred megabytes on an 8 MiB message, all of it
+// discarded. It cannot move above the flat-array branch: there the elements are
+// bytes, not pages, and an image larger than MaxPages bytes is perfectly
+// ordinary.
+//
+// The wording is newFirmware's, so the same violation reads the same way
+// whether it is caught here or there, with one difference: it cannot name the
+// total. Refusing the count the moment it is exceeded is the point, and walking
+// the rest of a hostile document to put a number in a message is the walk this
+// avoids.
+func decodePageElements(raw json.RawMessage) ([]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// The opening '['. firstElementByte has already seen it, so an error here is
+	// a truncated or malformed document rather than the wrong shape — which is
+	// why it does not say "neither an array nor a string" the way the shape
+	// tests above do.
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("%w: firmware payload array is truncated or malformed: %w", ErrBadPageLength, err)
+	}
+	var elems []json.RawMessage
+	for dec.More() {
+		if len(elems) == MaxPages {
+			return nil, fmt.Errorf("%w: image has more than %d pages but the WRITE_CHUNK page id is a "+
+				"16-bit field, so at most %d can be addressed; page %d would wrap onto page 0",
+				ErrBadPageLength, MaxPages, MaxPages, MaxPages)
+		}
+		var e json.RawMessage
+		if err := dec.Decode(&e); err != nil {
+			return nil, fmt.Errorf("%w: firmware payload element %d: %w", ErrBadPageLength, len(elems), err)
+		}
+		elems = append(elems, e)
+	}
+	if err := closeArray(dec); err != nil {
+		return nil, err
+	}
+	return elems, nil
+}
+
+// closeArray consumes an array's closing bracket and checks that nothing
+// follows it.
+//
+// Unmarshalling a whole document did both for free; reading its elements one at
+// a time does not. A decoder stops at the end of the first value, so
+// "[1,2,3,4,5,6,7,8] and then some" would otherwise decode as a one-page image
+// and a truncated "[1,2,3,4,5,6,7,8" as the same — and these arrays come
+// straight out of a file (ParseImage's bare-array case), not only out of a
+// json.RawMessage that has already been parsed once.
+func closeArray(dec *json.Decoder) error {
+	// dec.More() reports "no more elements" for the end of the array and for a
+	// scanner error alike, so a truncated document arrives here.
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("%w: array is truncated or malformed: %w", ErrBadPageLength, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: unexpected data after the array", ErrBadPageLength)
+	}
+	return nil
 }
 
 // orderByPageID reorders pages into pg_id order, when the elements carry one.
@@ -493,7 +609,12 @@ func decodePage(raw json.RawMessage) ([]byte, *int, error) {
 	}
 	switch trimmed[0] {
 	case '[':
-		b, err := decodeByteArray(trimmed)
+		// A page cannot exceed what one WRITE_CHUNK frame times ChunksPerPage
+		// can carry, so that is the ceiling. Without it the page ceiling above
+		// is no protection at all: one element holding a hundred megabytes of
+		// byte values is a single page, and newFirmware would refuse it for its
+		// length only after every one of those values had been decoded.
+		b, err := decodeByteArray(trimmed, maxPageSize)
 		return b, nil, err
 	case '"':
 		var s string
@@ -561,7 +682,12 @@ func decodeChunk(raw json.RawMessage) ([]byte, error) {
 	}
 	switch trimmed[0] {
 	case '[':
-		return decodeByteArray(trimmed)
+		// A whole page's worth, not MaxChunkSize: the chunks of one page are
+		// not required to be equal here — only their total has to be a legal
+		// page — so a per-chunk ceiling of MaxChunkSize would refuse an image
+		// this decoder currently accepts. The bound exists to stop an unbounded
+		// allocation, not to add a rule.
+		return decodeByteArray(trimmed, maxPageSize)
 	case '"':
 		var s string
 		if err := json.Unmarshal(trimmed, &s); err != nil {
@@ -574,20 +700,45 @@ func decodeChunk(raw json.RawMessage) ([]byte, error) {
 }
 
 // decodeByteArray converts a JSON array of numbers to bytes, rejecting anything
-// outside 0-255. json.Number is used so that a value written as 1e2 or 255.0
-// does not silently truncate into range.
-func decodeByteArray(raw json.RawMessage) ([]byte, error) {
-	var nums []json.Number
-	if err := json.Unmarshal(raw, &nums); err != nil {
+// outside 0-255 and anything longer than max. json.Number is used so that a
+// value written as 1e2 or 255.0 does not silently truncate into range.
+//
+// max is the largest decoded length the caller's geometry could ever accept, and
+// the elements are read one at a time so that it bounds the allocation rather
+// than judging it afterwards. Unmarshalling the array whole materialises a
+// json.Number — a string header and a small string — for every element before a
+// single value is looked at: measured, a 140 MB flat array of byte values cost
+// 3.39 GB that way, 24x the file. A caller with no ceiling of its own does not
+// get to skip this; every path into a firmware image has one, because a page is
+// at most maxPageSize bytes and an image at most MaxPages pages.
+func decodeByteArray(raw json.RawMessage, max int) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// The opening '['. Every caller has already seen it, so an error here is a
+	// truncated or malformed document rather than the wrong shape.
+	if _, err := dec.Token(); err != nil {
 		return nil, fmt.Errorf("%w: byte array: %w", ErrBadPageLength, err)
 	}
-	out := make([]byte, len(nums))
-	for i, n := range nums {
+	// A number and its comma are two bytes of document apiece, so half the
+	// document is an upper bound on the result; the ceiling bounds it again for
+	// a document that is mostly whitespace.
+	out := make([]byte, 0, min(max, (len(raw)+1)/2))
+	for dec.More() {
+		if len(out) == max {
+			return nil, fmt.Errorf("%w: byte array is longer than the %d bytes the page geometry can address",
+				ErrBadPageLength, max)
+		}
+		var n json.Number
+		if err := dec.Decode(&n); err != nil {
+			return nil, fmt.Errorf("%w: byte array: %w", ErrBadPageLength, err)
+		}
 		v, err := strconv.ParseUint(n.String(), 10, 8)
 		if err != nil {
-			return nil, fmt.Errorf("%w: byte %d (%s) is not in 0-255", ErrBadPageLength, i, n.String())
+			return nil, fmt.Errorf("%w: byte %d (%s) is not in 0-255", ErrBadPageLength, len(out), n.String())
 		}
-		out[i] = byte(v)
+		out = append(out, byte(v))
+	}
+	if err := closeArray(dec); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -686,8 +837,11 @@ func firstNonHex(s string) int {
 // splitFlat imposes a page geometry on an image that arrived without one.
 //
 // The page size here comes straight out of the payload's page_size field, so it
-// is untrusted; the defaulting and the validation both live in parseRawImage so
-// that this path cannot diverge from the raw-.bin one.
+// is untrusted; the defaulting and the validation both live in
+// effectivePageSize so that this path cannot diverge from the raw-.bin one —
+// normalisePages resolves the same geometry a second time to size the ceiling
+// it decodes under, and one function answering both is what keeps the two
+// answers the same.
 func splitFlat(data []byte, pageSize int) ([][]byte, error) {
 	fw, err := parseRawImage(data, pageSize)
 	if err != nil {

@@ -304,40 +304,92 @@ func TestConnCloseIsSilentForOrdinaryErrors(t *testing.T) {
 //
 // It overrides IDENTIFICATION -- the vendor ID, the name match, the sole-port
 // fallback (SPEC.md §3.4) -- and nothing else asked whether the path was a
-// device node at all. rawmidi.Open is a plain O_RDWR open, so a stale
+// device node at all. rawmidi.Open was a plain O_RDWR open, so a stale
 // GFLEX_PORT or a shell completion that landed beside the node opened a regular
 // file and the framer's first frame went into it, overwriting the beginning of
 // somebody's file with 80 00 00 90 ... and then failing with EOF.
 //
-// The file is the assertion: it has to come back byte for byte.
+// Two checks refuse it now, one on the name and one on the descriptor, and both
+// subtests below assert the same three things: exit 2, the one refusal wording,
+// and -- the assertion that matters -- the file back byte for byte.
 func TestPortPathThatIsNotADeviceNodeIsRefused(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.txt")
 	const content = "a file of somebody's, and not a MIDI port at all.\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
+	newFile := func(t *testing.T) (dir, path string) {
+		t.Helper()
+		dir = t.TempDir()
+		path = filepath.Join(dir, "notes.txt")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return dir, path
 	}
-
-	app := &App{Port: path, stdout: io.Discard, stderr: io.Discard}
-	tr, _, err := app.openRawMIDI(context.Background())
-	if err == nil {
-		_ = tr.Close()
-		t.Fatal("openRawMIDI opened a regular file named by --port")
-	}
-	if code := ExitCode(err); code != ExitUsage {
-		t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
-	}
-	for _, want := range []string{path, "character device", "/dev/snd/"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+	refused := func(t *testing.T, path string, err error) {
+		t.Helper()
+		if code := ExitCode(err); code != ExitUsage {
+			t.Errorf("ExitCode = %d, want ExitUsage (%d): %v", code, ExitUsage, err)
+		}
+		for _, want := range []string{path, "character device", "/dev/snd/"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not mention %q:\n%v", want, err)
+			}
+		}
+		after, rerr := os.ReadFile(path)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		if string(after) != content {
+			t.Errorf("the file was written to:\n%q", after)
 		}
 	}
-	after, rerr := os.ReadFile(path)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if string(after) != content {
-		t.Errorf("the file was written to:\n%q", after)
-	}
+
+	t.Run("the stat on the name", func(t *testing.T) {
+		_, path := newFile(t)
+		app := &App{Port: path, stdout: io.Discard, stderr: io.Discard}
+		tr, _, err := app.openRawMIDI(context.Background())
+		if err == nil {
+			_ = tr.Close()
+			t.Fatal("openRawMIDI opened a regular file named by --port")
+		}
+		refused(t, path, err)
+	})
+
+	// The stat is positive-only on purpose -- a path it cannot answer for falls
+	// through, so ENOENT stays a missing device -- and a name is not the object
+	// anyway: it can be replaced between the stat and the open. What catches
+	// that is rawmidi.Open's fstat on the descriptor it is already holding, and
+	// the CLI has to render it as the same refusal, not as "no device found".
+	//
+	// A directory the process cannot search is the one shape of that window
+	// which can be staged from inside this process: the stat fails EACCES and
+	// says nothing, the open behind it is denied too, and openWaitingForACL
+	// retries a denial for rawmidiACLGrace (TestOpenWaitsOutTheUdevACL), so
+	// restoring the mode partway through lets the open land on the file the
+	// stat never saw. The elapsed-time check is what proves it got there: the
+	// stat guard would have answered in microseconds.
+	t.Run("the transport's fstat on the descriptor", func(t *testing.T) {
+		dir, path := newFile(t)
+		if err := os.Chmod(dir, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(dir, 0o700) })
+		go func() {
+			time.Sleep(2 * rawmidiACLPoll)
+			os.Chmod(dir, 0o700)
+		}()
+
+		app := &App{Port: path, stdout: io.Discard, stderr: io.Discard}
+		start := time.Now()
+		tr, _, err := app.openRawMIDI(context.Background())
+		if err == nil {
+			_ = tr.Close()
+			t.Fatal("openRawMIDI opened a regular file the stat could not see")
+		}
+		if elapsed := time.Since(start); elapsed < 2*rawmidiACLPoll {
+			t.Fatalf("refused after %s, before the mode was restored: the stat answered and "+
+				"the transport's check was never reached", elapsed)
+		}
+		refused(t, path, err)
+	})
 }
 
 // A path that does not exist must still fall through to the transport, so the

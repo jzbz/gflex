@@ -3,8 +3,10 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -86,6 +88,47 @@ func TestInfoIncludeUnusedToleratesFailure(t *testing.T) {
 	}
 	if info.SerialNum == "" {
 		t.Error("core fields must still be populated")
+	}
+}
+
+// TestInfoIncludeUnusedToleratesOneFailure is the other side of the test above,
+// and the negative that keeps TestInfoAllOptionalReadsFailingAbortsTheCall from
+// being satisfied by a blanket abort: eight of the nine answer and one does
+// not, which is the ordinary case of a firmware declining a single command it
+// does not implement, and it must still be a nil error and a full report.
+func TestInfoIncludeUnusedToleratesOneFailure(t *testing.T) {
+	// A short timeout keeps the one unanswered read quick.
+	s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
+	scriptCore(d)
+	d.SetResponse(proto.CmdChipUUID, []byte("CHIP0001"))
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), proto.AuthLockUnlocked})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+	// The sag tolerance is the one left silent: its units are still unknown
+	// (SPEC.md §14, question 9), so it is the likeliest of the nine to be
+	// missing from another firmware revision.
+
+	info, err := s.Info(context.Background(), true)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info == nil {
+		t.Fatal("info = nil for a single declined command")
+	}
+	if info.VToleranceSagPerMa != nil {
+		t.Errorf("sag tolerance = %v, want nil for the read that went unanswered", info.VToleranceSagPerMa)
+	}
+	if info.UUID != "CHIP0001" || info.HardwareID != "HW000001" || info.MfgDate != "20250101" {
+		t.Errorf("extra identity = %+v", info)
+	}
+	if info.AuthLockLevel == nil || info.VToleranceNominalMv == nil ||
+		info.VMeasureADCOffset == nil || info.VMeasureADCScale == nil ||
+		info.VMeasureRawADC == nil || info.VMeasureCalibratedMv == nil {
+		t.Errorf("the other eight reads must still populate their fields: %+v", info)
 	}
 }
 
@@ -329,6 +372,126 @@ func TestInfoUnplugBetweenOptionalReadsAbortsTheCall(t *testing.T) {
 	// follow are never transmitted, so nothing after the death is recorded.
 	if n := len(d.Sent()); n != 7 {
 		t.Errorf("sent %d frames, want 7 (6 core + chip uuid); the run kept asking a device that was gone", n)
+	}
+}
+
+// epipeWrites is harness_test.go's enodevWrites for the errno on the other side
+// of the classification. A halted bulk endpoint answers every transfer with
+// EPIPE until something clears the halt, and nothing in this tool does -- so
+// the failure is as persistent as an unplug while wearing an errno deviceGone
+// deliberately does not name, since the same errno arriving once is transient
+// bus noise the PDO chunk retry exists to ride out.
+type epipeWrites struct {
+	proto.Transport
+	halted atomic.Bool
+}
+
+// halt makes every subsequent WriteMIDI fail with EPIPE. Reads are left alone,
+// as in enodevWrites: what this models is the send leg.
+func (t *epipeWrites) halt() { t.halted.Store(true) }
+
+func (t *epipeWrites) WriteMIDI(p []byte) error {
+	if t.halted.Load() {
+		return fmt.Errorf("rawmidi: write /dev/snd/midiC1D0: %w", syscall.EPIPE)
+	}
+	return t.Transport.WriteMIDI(p)
+}
+
+// newHaltedWriteSession is newFailingWriteSession with the transport above, so
+// a test can halt the endpoint at a chosen moment rather than unplug it.
+func newHaltedWriteSession(t *testing.T, opts Options) (*Session, *fake.Device, *epipeWrites) {
+	t.Helper()
+	d := fake.New()
+	d.SetDefault(nil)
+	tr := &epipeWrites{Transport: d.Transport()}
+	if opts.ByteDelay == 0 {
+		opts.ByteDelay = time.Nanosecond
+	}
+	if opts.Timeout == 0 {
+		opts.Timeout = 2 * time.Second
+	}
+	s := New(tr, opts)
+	t.Cleanup(func() { _ = s.Close() })
+	return s, d, tr
+}
+
+// TestInfoAllOptionalReadsFailingAbortsTheCall covers the link failure the two
+// unplug tests above cannot: one whose errno PermanentErr does not name.
+//
+// EPIPE, EPROTO, EILSEQ and ETIME are all errors a usbfs bulk transfer
+// produces, and a link stuck in one of those states fails all nine optional
+// reads exactly as an unplug does -- but the classifier says nothing, each
+// failure is tolerated on its own terms, and what comes back is the core set,
+// nine nil fields and a nil error: the very report the unplug tests refuse.
+// Widening the classifier is not the repair, because a single EPIPE really is
+// the transient the PDO chunk retry rides out, so what Info checks is that the
+// whole block failed rather than what any one failure was called.
+func TestInfoAllOptionalReadsFailingAbortsTheCall(t *testing.T) {
+	// Every command reaching SendFrame is traced before it is written, so this
+	// counts reads attempted rather than reads that got out -- which is what
+	// separates nine tolerated failures from an abort at the first one.
+	var mu sync.Mutex
+	attempted := 0
+
+	// A generous timeout for the same reason as the unplug tests: nothing here
+	// waits it out, since the core commands are answered and the optional ones
+	// fail on the write.
+	s, d, tr := newHaltedWriteSession(t, Options{
+		Timeout: 2 * time.Second,
+		Trace: func(dir string, frame []byte) {
+			if dir != "tx" {
+				return
+			}
+			mu.Lock()
+			attempted++
+			mu.Unlock()
+		},
+	})
+	scriptCore(d)
+	// Every optional command is answered, so a nil field can only mean the read
+	// never reached the device.
+	d.SetResponse(proto.CmdChipUUID, []byte("CHIP0001"))
+	d.SetResponse(proto.CmdHardwareID, []byte("HW000001"))
+	d.SetResponse(proto.CmdMfgDate, []byte("20250101"))
+	d.SetResponse(proto.CmdAuthLock, []byte{byte(proto.CmdAuthLock), proto.AuthLockUnlocked})
+	d.SetResponse(proto.CmdVToleranceNominalMv, proto.EncodeU16(750))
+	d.SetResponse(proto.CmdVToleranceSagPerMa, proto.EncodeU16(4))
+	d.SetResponse(proto.CmdVMeasureADCOffset, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasureADCScale, proto.EncodeI32(0))
+	d.SetResponse(proto.CmdVMeasure, []byte{0x04, 0xD2, 0x23, 0x28})
+
+	// Halt the endpoint from the last of the six core reads, so all nine
+	// optional sends fail and none of the reads the call depends on does: the
+	// report this produces is precisely the one an operator cannot tell apart
+	// from a unit declining the unused commands.
+	d.SetHandler(proto.CmdDisableLEDDuringOp, func(proto.Frame) []byte {
+		defer tr.halt()
+		return []byte{0x00}
+	})
+
+	info, err := s.Info(context.Background(), true)
+	if err == nil {
+		t.Fatalf("Info returned a report of nine nil fields and no error: %+v", info)
+	}
+	if !errors.Is(err, syscall.EPIPE) {
+		t.Errorf("error = %v, want the first failure's cause carried through", err)
+	}
+	if info != nil {
+		t.Errorf("info = %+v, want nil alongside the error", info)
+	}
+	mu.Lock()
+	n := attempted
+	mu.Unlock()
+	// Six core reads plus all nine optional ones. Fewer means the run gave up
+	// partway, which here could only be PermanentErr having been widened to
+	// name EPIPE -- the repair this test exists to rule out, since the sibling
+	// retries would then abandon a recoverable bus error.
+	if n != 15 {
+		t.Errorf("attempted %d reads, want 15 (6 core + all 9 optional); the loop stopped early instead of counting the failures", n)
+	}
+	// Nothing was written after the halt, so the device saw only the core six.
+	if got := len(d.Sent()); got != 6 {
+		t.Errorf("device received %d frames, want 6 (the core reads); the halted endpoint let a frame through", got)
 	}
 }
 

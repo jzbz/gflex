@@ -1087,6 +1087,120 @@ func TestPageSizeIsPlainDecimal(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// opening the image file
+// ---------------------------------------------------------------------------
+
+// TestFlashDoesNotBlockOnAFIFOWithNoWriter is the regression test for a hang.
+//
+// The image path was handed to two plain opens -- the --page-size sniff and the
+// loader -- and open(2) on a FIFO with no writer blocks inside the kernel until
+// one turns up. Nothing above reaches that: not the command's context, and not
+// the first Ctrl-C, which sets a cancellation nobody is waiting on and leaves
+// the re-armed second signal to end the process (root.go). `gflex firmware
+// flash /tmp/somefifo` therefore sat there, on every mode of the command,
+// --dry-run with no device attached included.
+//
+// The timeout is the assertion, and it is doing real work: without the fix this
+// test does not fail, it hangs -- which is exactly what the user saw.
+func TestFlashDoesNotBlockOnAFIFOWithNoWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = path
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := app.loadFirmware(context.Background(), o, "")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a FIFO with nothing writing to it loaded as a firmware image")
+		}
+		// A file the user named that cannot be read is a plain failure whose
+		// own text says which file and why; see localFileError.
+		if code := ExitCode(err); code != ExitFailure {
+			t.Errorf("ExitCode = %d, want ExitFailure (%d): %v", code, ExitFailure, err)
+		}
+		for _, want := range []string{path, "FIFO"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not mention %q:\n%v", want, err)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loadFirmware is still blocked in open(2) on a FIFO nobody is writing to")
+	}
+}
+
+// TestFlashReadsAPipeThatHasAWriter is the other half, and the reason the fix
+// above is not "refuse anything that is not a regular file".
+//
+// `gflex firmware flash <(curl -sL ...)` names a /dev/fd pipe with the writer
+// still running behind it, and /dev/stdin is the same shape. Neither is
+// documented or tested anywhere else, both work today, and both are reasonable
+// ways to hand this command an image, so the guard is aimed at the case that
+// actually hangs and not at the file type. The path here is built the way the
+// shell builds one, from the read end of a real pipe, and the writer feeds it
+// in two goes with a pause between: what a download does.
+func TestFlashReadsAPipeThatHasAWriter(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	image := bytes.Repeat([]byte{0x77}, bootloader.DefaultPageSize)
+	go func() {
+		defer w.Close()
+		w.Write(image[:64])
+		time.Sleep(20 * time.Millisecond)
+		w.Write(image[64:])
+	}()
+
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = fmt.Sprintf("/dev/fd/%d", r.Fd())
+	fw, err := app.loadFirmware(context.Background(), o, "")
+	if err != nil {
+		t.Fatalf("a pipe with a live writer did not load: %v", err)
+	}
+	if len(fw.Pages) != 1 {
+		t.Fatalf("%d pages, want 1", len(fw.Pages))
+	}
+	if !bytes.Equal(fw.Pages[0], image) {
+		t.Error("the image that came back is not the one that was written into the pipe")
+	}
+}
+
+// And the ordinary case the other two must not cost anything: a raw .bin on
+// disk, read through the same descriptor, split by the same parser.
+func TestFlashReadsARegularImageFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fw.bin")
+	image := bytes.Repeat([]byte{0x5C}, 2*bootloader.DefaultPageSize)
+	if err := os.WriteFile(path, image, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, _, _ := newFlashTestApp()
+	o := baseOpts()
+	o.path = path
+
+	fw, err := app.loadFirmware(context.Background(), o, "")
+	if err != nil {
+		t.Fatalf("loadFirmware: %v", err)
+	}
+	if len(fw.Pages) != 2 || fw.PageSize() != bootloader.DefaultPageSize {
+		t.Fatalf("%d pages of %d bytes, want 2 of the %d-byte default",
+			len(fw.Pages), fw.PageSize(), bootloader.DefaultPageSize)
+	}
+	if !bytes.Equal(append(append([]byte{}, fw.Pages[0]...), fw.Pages[1]...), image) {
+		t.Error("the image that came back is not the one on disk")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // what a jump can actually be said to prove
 // ---------------------------------------------------------------------------
 

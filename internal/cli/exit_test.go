@@ -16,6 +16,7 @@ import (
 
 	"github.com/jzbz/gflex/internal/bootloader"
 	"github.com/jzbz/gflex/internal/session"
+	"github.com/jzbz/gflex/internal/transport/rawmidi"
 	"github.com/jzbz/gflex/internal/usbfs"
 )
 
@@ -62,6 +63,27 @@ func TestExitCode(t *testing.T) {
 			name: "an explicit code beats the sentinel underneath it",
 			err:  coded(ExitNoDevice, &fs.PathError{Op: "open", Path: "/dev/snd/midiC1D0", Err: syscall.EBUSY}),
 			want: ExitNoDevice,
+		},
+		// ESHUTDOWN reaches this switch only when nothing wrapped it: a usbfs
+		// failure arrives as a usbfs.Error whose Class is already ErrNoDevice,
+		// so what this covers is the bare errno a rawmidi write to a node the
+		// kernel has swapped for the disconnected file operations would return.
+		// Both sibling classifiers -- session.deviceGone and usbfs.classify --
+		// count it as a device that went away, and this is where the agreement
+		// between the three is pinned.
+		{name: "a bare ESHUTDOWN", err: syscall.ESHUTDOWN, want: ExitNoDevice},
+		// The two the set deliberately stops short of. A missing firmware image
+		// is by far the commonest ENOENT at this level and stays a plain
+		// failure, and os.ErrClosed is this tool closing its own port.
+		{name: "ENOENT is not a device that went away", err: syscall.ENOENT, want: ExitFailure},
+		{name: "a port this tool closed is not a device that went away", err: os.ErrClosed, want: ExitFailure},
+		// The transport fstats the descriptor it opened and refuses a regular
+		// file. Whichever of the two checks catches it -- the stat on the
+		// --port name or this one -- the command line named the wrong object.
+		{
+			name: "a --port path the transport found was a regular file",
+			err:  fmt.Errorf("opening /home/jz/notes.txt: %w", rawmidi.ErrNotADevice),
+			want: ExitUsage,
 		},
 	}
 	for _, tt := range tests {

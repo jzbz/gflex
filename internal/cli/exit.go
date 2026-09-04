@@ -11,6 +11,7 @@ import (
 
 	"github.com/jzbz/gflex/internal/bootloader"
 	"github.com/jzbz/gflex/internal/session"
+	"github.com/jzbz/gflex/internal/transport/rawmidi"
 	"github.com/jzbz/gflex/internal/usbfs"
 )
 
@@ -120,10 +121,37 @@ func ExitCode(err error) int {
 		return ExitBusy
 	case errors.Is(err, fs.ErrPermission), errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
 		return ExitPermission
-	case errors.Is(err, usbfs.ErrNoDevice), errors.Is(err, syscall.ENODEV), errors.Is(err, syscall.ENXIO):
+	case errors.Is(err, rawmidi.ErrNotADevice):
+		// The transport fstat'd the descriptor it had just opened and found a
+		// regular file. openRawMIDI stats the --port path first and refuses the
+		// same thing with the same wording, but a name and a descriptor answer
+		// two different questions and only the descriptor's answer is
+		// authoritative; this is the code for the one that is. Either way the
+		// command line named the wrong object, which is a usage error and not a
+		// device that failed.
+		return ExitUsage
+	case errors.Is(err, usbfs.ErrNoDevice), errors.Is(err, syscall.ENODEV),
+		errors.Is(err, syscall.ENXIO), errors.Is(err, syscall.ESHUTDOWN):
 		// A device that vanished mid-operation is the same outcome to a script
 		// as one that was never there. Without this it unwraps only to ENODEV,
 		// which nothing below matches, and lands on the generic failure code.
+		//
+		// ESHUTDOWN is here for agreement rather than for a live bug: every
+		// shipped path that can produce it goes through usbfs.Error, whose
+		// Class is already usbfs.ErrNoDevice, so nothing currently arrives here
+		// as a bare ESHUTDOWN. It is listed because both sibling classifiers --
+		// session.deviceGone and usbfs.classify -- list it, and a set described
+		// as the same set should not quietly differ from one.
+		//
+		// The set stops here on purpose, and the two obvious additions are
+		// wrong. syscall.ENOENT is one of them: usbfs maps it to ErrNoDevice
+		// for a /dev/bus/usb path that disappeared, but by this level the
+		// commonest ENOENT by far is a firmware image the user misnamed, and
+		// that must stay exit 1 (localFileError). os.ErrClosed is the other:
+		// that is this tool closing its own port, not a device that went away.
+		// session.deviceGone matches it because a send after Close means "stop
+		// retrying", which is a statement about the session and not about the
+		// hardware a script would go looking for.
 		return ExitNoDevice
 	case isTimeout(err):
 		return ExitTimeout
