@@ -612,6 +612,18 @@ strings, the inverted LED byte, the HIGH-before-LOW voltage limits, and the full
 including its serial-latch invariant. No decode had to be corrected afterwards. The second was
 brought up to settle the pacing question below, and matched the first on everything re-measured.
 
+**Re-checked on a third unit, 2026-09-11, before v0.3.0.** Unit `86383db3` — firmware
+`APP.05.00.00`, manufacturing date `004apr26`, the same batch values as the two above — was driven
+with the code this release ships, reads only: `info --all` answered all nine optional reads, `pdo
+dump` downloaded all 12 chunks, `firmware fetch` returned the image the vendor service holds for it
+(165 pages of 320 bytes, declared CRC `0x30` — the same version, geometry and CRC as the image
+flashed to `58b4f621`), `firmware flash --dry-run` loaded the saved image back identically, and
+`voltage get` read 5000 mV. ADC offset and scale again read 0 alongside a calibrated measurement
+(434 counts → 5221 mV). What that run did **not** do is write anything: no flash, and none of
+`voltage set`, `current set`, `vlimit set`, `calibrate`, `led`, `tolerance` or `authlock`. Those
+paths changed in v0.3.0 and are verified by the test suite, not on hardware; the most recent
+hardware flash and write tests are still the 2026-08-21 ones described below.
+
 Ten of the sixteen questions in [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
 are now answered from measurement — plus one the original list did not contain — and three of the
 answers corrected the documentation. Highlights:
@@ -658,8 +670,11 @@ by field comparison before and after found no drift at all.
 
 That also answers [SPEC.md §14](SPEC.md#14-open-questions--mostly-resolved-on-hardware-2026-08-21)
 question 16, the last one a single unit could settle, and it independently validates the payload
-parsing above: the CRC is computed by the device over what it was actually given, so an image
-assembled wrongly from the vendor's chunk map would not have matched.
+parsing above: the device's CRC matched the value the image declared, so an image assembled
+wrongly from the vendor's chunk map would not have matched. What that CRC covers is narrower than
+it looks: the service sends the image as ciphertext, fresh on every request, while the declared
+CRC never changes, so the device evidently checks the decrypted image rather than the bytes on the
+wire ([SPEC.md §10.3](SPEC.md#103-firmware-image-delivery)).
 
 Note what was flashed was the same version already installed — the service serves a unit's current
 image, so this exercised the path rather than delivering an update.
@@ -683,7 +698,9 @@ the effect on the user is not. Details in
 date `004apr26`, so they are plausibly from a single production batch, and both were measured on the
 same host. That is materially stronger than n=1 and it is what §14 asked for — but it is not
 evidence about a different firmware revision or a different USB controller, and nothing above should
-be read as such. Writes have now been re-tested at 1 ms on both units, and neither has lost one:
+be read as such. A third unit, `86383db3`, re-read on 2026-09-11, carries the same firmware and the
+same date, so it adds to the batch rather than widening it. Writes have now been re-tested at 1 ms
+on both units, and neither has lost one:
 0/30 failed and 0/30 read back wrong on unit 1, then the same on unit 2, which took 0.077 s per
 write plus read-back. Unit 2's run is the stronger of the two, because it wrote the current limit
 **alternating between 4900 and 5000 mA**, checked each read-back against the value just written, and

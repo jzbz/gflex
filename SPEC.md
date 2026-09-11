@@ -1156,8 +1156,25 @@ Fetched *after* the device is already in bootloader mode, over a WebSocket:
   of type json.Number"* -- meaning that path had never worked. It now accepts this shape, orders
   pages by `pg_id`, refuses a payload that states `pg_id` on some pages but not others, and refuses a
   chunk map that is short, gappy or duplicated, because a wrongly
-  assembled image can flash and even verify cleanly: the device computes the CRC over whatever it
-  was given.
+  assembled image can flash and even verify cleanly: a one-byte CRC passes one wrong image in 256,
+  and what it covers is not the bytes the service sends (next item).
+- **The image is served as ciphertext, and a fresh one on every request.** Four fetches for serial
+  `86383db3` on 2026-09-11 — the last two one second apart — returned four entirely different
+  images: no page and no 40-byte chunk in common between any two, each at 7.9964–7.9966 bits/byte
+  of entropy. Everything else was identical every time: 165 pages of 320 bytes, `crc` 48,
+  `app_version` `APP.05.00.00`, `release` `RELEASE.04.00.00`. The JSON size moves with the
+  ciphertext (254,934 to 255,219 bytes), because each chunk is an array of decimal byte values.
+  Three consequences. The declared CRC stays constant while the bytes change, and the device's own
+  CRC matched it after the 2026-08-21 flash of `58b4f621`, so the CRC is **not** computed over the
+  bytes on the wire; most plausibly the bootloader decrypts and checks the decrypted image, but that
+  is inference, and the cipher is unknown. No host-side check of image *content* is possible beyond
+  structure: two correct downloads never compare equal, and there is nothing to hash against. And
+  whether a plaintext raw `.bin` (§10.2) can be flashed meaningfully to a bootloader that expects
+  ciphertext is unestablished — no raw image has been flashed on hardware as far as this document
+  records. The host side is not in doubt: on one of these replies, this tool at `01ac9d3`, at
+  `v0.2.0` and at `1df7d03` (the revision that flashed `58b4f621`), plus an independent decoder
+  written from this section, produced byte-identical pages, and `fetch -o`'s saved form
+  round-trips them losslessly.
 - 15000 ms timeout. **No HTTP fallback and no local `.bin` path exist in the client.**
 - No server-side auth was observed — only client-side UI gating. Unverified.
 
@@ -1479,6 +1496,14 @@ the serial-latch invariant. No decode had to be corrected after contact with har
 What remains open needs either a second unit, a firmware image, or a deliberate bootloader
 excursion. The originals are kept below for provenance; nothing has been deleted.
 
+**A third unit, read-only, 2026-09-11.** Ahead of v0.3.0, unit `86383db3` — firmware
+`APP.05.00.00`, manufacturing date `004apr26`, the same batch values as the first two — was driven
+with reads only: `info --all`, with all nine optional reads answered and the identity layouts
+unchanged; `pdo dump`, all 12 chunks; `firmware fetch`, 165 pages of 320 bytes with crc `0x30`; and
+`voltage get`. Everything it re-read matched what is recorded here, and row 11 gains a data point.
+It wrote nothing and flashed nothing, so it adds no evidence to the write, flash or pacing answers
+below.
+
 ### Answered on hardware
 
 | # | Question | Measured answer |
@@ -1488,7 +1513,7 @@ excursion. The originals are kept below for provenance; nothing has been deleted
 | 3 | Descriptor layout | Three interfaces: `1.0` audio control (01/01), `1.1` **MIDIStreaming (01/03)** with **bulk** EP `0x02` OUT / `0x83` IN, 64-byte packets, and `1.2` **vendor class (0xFF)** with bulk EP `0x01`/`0x81`. Both driven by `snd-usb-audio` except 1.2, which is unbound. No interrupt endpoints, no UMP alt setting. |
 | 4 | `CMD_FLAG_SCRATCHPAD` (0x40) | **Validate-and-discard**, corroborated on a second unit and a second command. Unit 1: a scratchpad write of 6000 mV was acknowledged and echoed back (`tx 04 d2 17 70` → `rx 04 12 17 70`), yet `voltage get` still returned 5000. Unit 2 reproduced that exactly (`tx 04 d2 0c e4` → `rx 04 12 0c e4`, voltage unchanged at 5000). **But what the response carries is per-command, not a property of the flag.** The same unit, minutes apart, answered a scratchpad write of `CMD_CURRENT_LIMIT_MA` with the *stored* value rather than the requested one: `tx 04 d3 0f a0` (4000 mA) → `rx 04 13 13 88` (5000 mA), limit unchanged. So command 18 echoes what you asked for and command 19 echoes what it holds, and both discard the write. The other 27 commands are uncharacterised; do not generalise either behaviour to them. A scratchpad *read* returns the same value as a normal read. The flag makes a write not take effect. |
 | 8 | AUTHLOCK read layout | **The vendor client was right.** `tx 02 16` → `rx 04 16 16 00`: a two-byte payload of `[0x16, level]` — the command code echoed a second time, then the level. Reading `payload[1]` was never an off-by-one. Levels beyond 0 remain untested. |
-| 11 | ADC calibration | Offset and scale both read **0** on a factory unit, and `CMD_VMEASURE` still returns a sensible calibrated value (raw 437 counts → 5270 mV). Confirms the inference that firmware treats 0 as "use built-in calibration". The formula itself is still device-side and unknown. |
+| 11 | ADC calibration | Offset and scale both read **0** on a factory unit, and `CMD_VMEASURE` still returns a sensible calibrated value (raw 437 counts → 5270 mV), and again on a third unit, `86383db3`, on 2026-09-11 (raw 434 counts → 5221 mV): both near 12.0 mV per count. Confirms the inference that firmware treats 0 as "use built-in calibration". The formula itself is still device-side and unknown. |
 | 13 | Does the device echo the flag bits? | **No — it clears them.** Corroborated on both units. Unit 1: `tx 04 92 13 88` (write flag set) → `rx 04 12 13 88`. Unit 2: `tx 04 93 13 88` → `rx 04 13 13 88`, and in the Q4 exchange above both flag bits were set on the way out (`04 d2`, `04 d3`) and neither came back. Masking the received command byte with `CmdCodeMask` is required, not merely defensive. |
 | 14 | Unsolicited frames? | **None.** Twelve seconds idle on a connected unit produced nothing. The device speaks only when spoken to. Repeated on a second unit (`58b4f621`, §14.15): twelve seconds idle, zero frames. |
 | 15 | Is the 20 ms inter-message delay required? | **No, but zero is not safe — and this is now corroborated on a second unit.** Failure rates over plain `gflex info` (6 commands each — the count `internal/session/info_test.go` pins; 7 would be `info --all`, which adds the chip UUID); every failure was a response timeout. *Unit 1* (`81a0bcc3`): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 3/120 (2.5%)**; `info` end to end 0.38 s at 20 ms, 0.04 s at 1 ms; writes at 1 ms 0/30 failed, 0/30 wrong read-back. *Unit 2* (`58b4f621`, obtained 2026-08-21; same firmware `APP.05.00.00`, same mfg date `004apr26`, same host, rawmidi): 20 ms 0/40, 1 ms 0/120, 100 µs 0/120, **1 ns 4/120 (3.3%)**; `info` 0.391 s at 20 ms, 0.045 s at 1 ms, 0.043 s at 100 µs, 0.202 s at 1 ns. Writes at 1 ms on unit 2: **0/30 failed, 0/30 wrong read-back**, 0.077 s per write plus read-back. That instrument was `CMD_CURRENT_LIMIT_MA` **alternating 4900/5000 mA**, each read-back checked against the value just written, with the limit restored to 5000 mA afterwards and the restore verified independently. The alternation is not incidental: a no-op write that is dropped in transit reads back as the value the device already held, so a fixed-value write test scores a success in exactly the case where the write failed. Unit 2's write figure is therefore slightly stronger evidence than unit 1's, not merely a match for it. **The default moved from 20 ms to 1 ms** (§3.1, §11, §17): 240 `info` runs across the two units with no failure, and going lower buys nothing measurable — 100 µs came in 0.002 s ahead of 1 ms, inside the noise, because the wall time is already the device's turnaround. 1 ns is where both units lose frames, which is why `--byte-delay 0` stays refused. Two units from one apparent batch on one host is what this question asked for and is materially stronger than n=1; it is still not evidence about another firmware revision or another USB controller. |
@@ -1523,7 +1548,9 @@ excursion. The originals are kept below for provenance; nothing has been deleted
 Questions **5** (commands 4–7, 13, 14), **6** (`CMD_ENCRYPT_MSG`), **7** (`CMD_IOS_HOST_MODE_FLAG`),
 **9** (`VTOLERANCE_SAG_PER_MA` units — it reads 0 on a factory unit, so nothing can be inferred about
 its scale), **10** (whether the 750 mV tolerance is symmetric — needs a variable load) and **12**
-(the CRC algorithm — a device-side function, and having an image does not reveal it) are unchanged.
+(the CRC algorithm — a device-side function, and having an image does not reveal it; nor could it,
+since the served image is per-request ciphertext and the CRC evidently covers the decrypted one,
+§10.3) are unchanged.
 Question 5's probes remain the ones to run last and with nothing attached.
 
 **Question 16 is answered** — see the table above. It was the last one a single unit could settle.
@@ -1620,7 +1647,7 @@ table; the first four take minutes and unblock the rest.
 | 9 | `VTOLERANCE_SAG_PER_MA` units | `gflex raw 02 19` on a factory unit, then vary under load | Exposing tolerance in real units |
 | 10 | Is the 750 mV tolerance symmetric? | Set a known voltage, vary load, watch for the red LED | Same |
 | 11 | ADC calibration formula | `gflex measure` against a meter, at several voltages | `calibrate adc` being usable rather than raw |
-| 12 | Firmware CRC algorithm | Compare `res.CRC` against candidate CRC-8 variants over a known image | Verifying an image offline |
+| 12 | Firmware CRC algorithm | Compare `res.CRC` against candidate CRC-8 variants over a known image — the *decrypted* one, which the host never holds; the served image is per-request ciphertext (§10.3) | Verifying an image offline |
 | 4 | `CMD_FLAG_SCRATCHPAD` semantics | `gflex raw` a write with 0x40 set, power-cycle, re-read | Whether volatile writes are possible |
 | 5 | Commands 4–7, 13, 14 | Last resort. Probe read-form only, one at a time, nothing attached | Nothing — they are unused |
 | 16 | Bootloader re-enumeration details | `udevadm monitor` across a `firmware bootloader` jump | Tightening the flash sequence |
