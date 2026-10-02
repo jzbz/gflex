@@ -32,12 +32,13 @@ env:
   #
   # It is coupled to the Go version in go.mod, which is what setup-go installs
   # above. staticcheck reads the compiler's export data, and a release only
-  # understands the Go it was built against or older: v0.7.0 handles Go 1.26 and
-  # fails on 1.27 with "export data version 4 is greater than maximum supported
-  # version 2" -- an alarming-looking error that says nothing about the code.
-  # (Observed locally 2026-08-21 when the host toolchain moved to 1.27 while
-  # go.mod still said 1.26.) So: bumping the go directive means bumping this
-  # too, in the same commit.
+  # understands the Go it was built against or older: v0.7.0, the previous pin,
+  # handles Go 1.26 and fails on 1.27 with "export data version 4 is greater
+  # than maximum supported version 2" -- an alarming-looking error that says
+  # nothing about the code. (Observed locally 2026-08-21 when the host toolchain
+  # moved to 1.27 while go.mod still said 1.26.) So: bumping the go directive
+  # means bumping this too, in the same commit. v0.8.0 (2026.2) is the first
+  # release to support Go 1.27.
   #
   # This name is documentation and an assertion, not the pin: the install below
   # uses the commit SHA. A tag is a mutable git ref, and this workflow already
@@ -46,11 +47,11 @@ env:
   # weaker rule than an action does. The staticcheck step checks that the SHA
   # still resolves to this version, which is what keeps the two lines from
   # drifting apart when only one of them is bumped.
-  STATICCHECK_VERSION: v0.7.0
-  # dominikh/go-tools, the commit tagged v0.7.0. There is no Dependabot
-  # ecosystem covering a `go install` outside the module graph, so unlike the
-  # action SHAs this pair is bumped by hand.
-  STATICCHECK_COMMIT: ff63afafc529279f454e02f1d060210bd4263951
+  STATICCHECK_VERSION: v0.8.1
+  # dominikh/go-tools, the commit tagged v0.8.1 (and 2026.2.1). There is no
+  # Dependabot ecosystem covering a `go install` outside the module graph, so
+  # unlike the action SHAs this pair is bumped by hand.
+  STATICCHECK_COMMIT: 1285a6a5ec1e0ebb658f49e82b6c566a878cc3cb
 
 jobs:
   check:
