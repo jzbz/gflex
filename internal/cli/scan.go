@@ -255,12 +255,16 @@ func (a *App) runScan(ctx context.Context, f Formatter, o scanOpts) error {
 
 	// --- phase 2: the user attaches the unit to the source under test --------
 	if err := a.scanHandover(ctx, f, o, waitForDevice); err != nil {
-		// Everything from here on is past the erase, so an abort leaves the
-		// unit holding nothing. Say so plainly rather than leaving the user to
-		// infer it from the Diag line above: the only recovery SPEC.md §9.2
-		// describes is to attach the unit to the source and scan again.
-		f.Diag("the capture log was already erased, so this unit now holds no capture; " +
-			"re-run `gflex scan` to take a fresh one")
+		// Everything from here on is past the erase, but not necessarily past
+		// the capture: the handover can fail after the user has already
+		// attached the unit to the source and brought it back -- a timeout
+		// waiting for the node, a Ctrl-C at the last moment -- and then the
+		// unit holds exactly the capture the scan was for. "Holds no capture,
+		// scan again" would have them erase it and walk back to the charger.
+		// Point at the read that costs nothing first.
+		f.Diag("the capture log was erased before the handover. If the unit was attached to the " +
+			"source since, it may already hold a fresh capture: read it with `gflex pdo dump` " +
+			"before re-running `gflex scan`, which erases it again")
 		return err
 	}
 

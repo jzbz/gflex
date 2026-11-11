@@ -326,7 +326,7 @@ func TestCheckAuthLock(t *testing.T) {
 }
 
 func TestCheckCalibrate(t *testing.T) {
-	d := CheckCalibrate(10, 20, 1, 2, true, true, true)
+	d := CheckCalibrate(10, 20, 1, 2, CalibrationPrevRead, true, true)
 	if !d.OK() {
 		t.Fatalf("unexpected refusal %q", d.Refused)
 	}
@@ -337,16 +337,21 @@ func TestCheckCalibrate(t *testing.T) {
 		t.Errorf("the restore command must carry the previous values; got %q", d.Warnings)
 	}
 
-	unknown := CheckCalibrate(10, 20, 0, 0, false, true, true)
+	unknown := CheckCalibrate(10, 20, 0, 0, CalibrationPrevUnread, true, true)
 	if !containsAny(unknown.Warnings, "could not be read") {
 		t.Errorf("an unreadable previous calibration must be called out; got %q", unknown.Warnings)
+	}
+	// A dry run made no read, so it must not report one failing.
+	dry := CheckCalibrate(10, 20, 0, 0, CalibrationPrevNotAttempted, true, true)
+	if containsAny(dry.Warnings, "could not be read") || !containsAny(dry.Warnings, "--dry-run reads nothing") {
+		t.Errorf("a dry run reports a read it never made; got %q", dry.Warnings)
 	}
 
 	// `calibrate adc --offset 10` keeps the scale it read, so the prompt must
 	// not offer to write it. The prompt is the whole of what --yes suppresses,
 	// and a wrong calibration is invisible afterwards (SPEC.md §13.5), so it
 	// has to describe the writes that will actually happen.
-	kept := CheckCalibrate(10, 20, 1, 20, true, true, false)
+	kept := CheckCalibrate(10, 20, 1, 20, CalibrationPrevRead, true, false)
 	if !strings.Contains(kept.Prompt, "scale=20 (unchanged)") {
 		t.Errorf("the prompt offers to write a term the command keeps: %q", kept.Prompt)
 	}
@@ -441,6 +446,17 @@ func TestCheckRawFrame(t *testing.T) {
 	// of them here would pin a detail the firmware does not hold to.
 	if d := CheckRawFrame(scratch); !containsAny(d.Warnings, "never committed") {
 		t.Errorf("the scratchpad warning does not say the write will not take effect: %q", d.Warnings)
+	}
+	// But only where it was measured. §14.4 characterised commands 18 and 19
+	// and says not to generalise; on AUTHLOCK, whose levels may not be
+	// reversible, "change nothing" would be reassurance nobody measured.
+	lock := proto.Frame{Cmd: proto.CmdAuthLock, Write: true, Scratchpad: true, Payload: []byte{1}}
+	d = CheckRawFrame(lock)
+	if !d.Confirm || !containsAny(d.Warnings, "unmeasured") {
+		t.Errorf("a scratchpad AUTHLOCK write is not called unmeasured: confirm=%v %q", d.Confirm, d.Warnings)
+	}
+	if containsAny(d.Warnings, "change nothing") || containsAny(d.Warnings, "never committed") {
+		t.Errorf("a scratchpad AUTHLOCK write is promised to change nothing: %q", d.Warnings)
 	}
 }
 
@@ -590,6 +606,16 @@ func TestCheckRawFramePDOChunkReadPassesSilently(t *testing.T) {
 	if !d.OK() || d.Confirm || len(d.Warnings) != 0 {
 		t.Errorf("`raw 03 11 00` is a documented read; got confirm=%v refused=%q warnings=%q",
 			d.Confirm, d.Refused, d.Warnings)
+	}
+	// The bare read stays silent too; it carries no payload at all.
+	if d := CheckRawFrame(proto.Frame{Cmd: proto.CmdPDOLog}); !d.OK() || d.Confirm {
+		t.Errorf("`raw 02 11` is a documented read; got confirm=%v warnings=%q", d.Confirm, d.Warnings)
+	}
+	// And the exemption is that shape exactly. Any other flag-clear payload on
+	// CMD_PDO_LOG is no more a documented read than `04 12 2e e0` is.
+	d = CheckRawFrame(proto.Frame{Cmd: proto.CmdPDOLog, Payload: []byte{0, 1}})
+	if !d.Confirm || !containsAny(d.Warnings, "write flag is clear but the frame carries a payload") {
+		t.Errorf("`raw 04 11 00 01` passed as a chunk read: confirm=%v warnings=%q", d.Confirm, d.Warnings)
 	}
 }
 

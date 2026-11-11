@@ -688,6 +688,42 @@ func TestScratchpadWriteIsAcknowledgedAndDiscarded(t *testing.T) {
 	}
 }
 
+// The other measured shape, on NewTypical: CMD_CURRENT_LIMIT_MA answers a
+// scratchpad write with the value it kept, not the one it was sent
+// (SPEC.md §14.4: tx 04 d3 0f a0 -> rx 04 13 13 88), and stores nothing. An
+// ordinary write still commits and echoes the request.
+func TestTypicalCurrentLimitScratchpadAnswersWithTheStoredValue(t *testing.T) {
+	d := NewTypical()
+	defer d.Close()
+	h := newHost(t, d)
+
+	w, err := proto.Build(proto.CmdCurrentLimitMa, proto.EncodeU16(4000), true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, w)
+	// The write bit survives, as in the test above: the fake echoes it
+	// deliberately where hardware answers 04 13 13 88.
+	if got, want := h.mustRecv(t), []byte{0x04, 0x93, 0x13, 0x88}; !bytes.Equal(got, want) {
+		t.Errorf("scratchpad write answer = %x, want %x (the stored 5000 mA)", got, want)
+	}
+	if v, _ := d.Register(proto.CmdCurrentLimitMa); !bytes.Equal(v, proto.EncodeU16(5000)) {
+		t.Errorf("register after a scratchpad write = %x, want 1388", v)
+	}
+
+	w, err = proto.Build(proto.CmdCurrentLimitMa, proto.EncodeU16(4000), true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, w)
+	if got := h.mustRecv(t); !bytes.Equal(got[2:], proto.EncodeU16(4000)) {
+		t.Errorf("ordinary write answer = %x, want the 4000 mA request echoed", got)
+	}
+	if v, _ := d.Register(proto.CmdCurrentLimitMa); !bytes.Equal(v, proto.EncodeU16(4000)) {
+		t.Errorf("register after an ordinary write = %x, want 0fa0", v)
+	}
+}
+
 // TestOverlongResponseIsDroppedByTheHost pins that a responder returning more
 // than 62 bytes produces the drop hardware would, not a truncated frame the
 // host accepts. The frame goes out declaring its real length and the receive

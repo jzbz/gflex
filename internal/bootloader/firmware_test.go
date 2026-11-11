@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -663,31 +661,23 @@ func TestParseImageRawBinaryBadPageSize(t *testing.T) {
 	}
 }
 
-func TestLoadFile(t *testing.T) {
+// TestParseImageBothShapes: the format is sniffed from the bytes, leading
+// whitespace included, with no help from a file name.
+func TestParseImageBothShapes(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-
-	binPath := filepath.Join(dir, "image.bin")
-	if err := os.WriteFile(binPath, page(3, 512), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fw, err := LoadFile(binPath)
+	fw, err := ParseImage(page(3, 512), LoadOptions{})
 	if err != nil {
-		t.Fatalf("LoadFile(bin): %v", err)
+		t.Fatalf("ParseImage(bin): %v", err)
 	}
 	if len(fw.Pages) != 1 || fw.CRCKnown {
 		t.Errorf("bin: %d pages, CRCKnown=%v", len(fw.Pages), fw.CRCKnown)
 	}
 
-	jsonPath := filepath.Join(dir, "image.json")
 	body := fmt.Sprintf("\n  {\"firmware\":[%s],\"app_version\":\" 5.2.0 \",\"crc\":18}",
 		numberArray(page(0, 64)))
-	if err := os.WriteFile(jsonPath, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fw, err = LoadFile(jsonPath)
+	fw, err = ParseImage([]byte(body), LoadOptions{})
 	if err != nil {
-		t.Fatalf("LoadFile(json): %v", err)
+		t.Fatalf("ParseImage(json): %v", err)
 	}
 	if fw.Version != "5.2.0" {
 		t.Errorf("Version = %q, want 5.2.0", fw.Version)
@@ -698,21 +688,13 @@ func TestLoadFile(t *testing.T) {
 	if fw.ChunkSize() != 8 {
 		t.Errorf("ChunkSize = %d, want 8", fw.ChunkSize())
 	}
-
-	if _, err := LoadFile(filepath.Join(dir, "missing.bin")); err == nil {
-		t.Error("expected an error for a missing file")
-	}
 }
 
-func TestLoadFileWithOptionsPageSize(t *testing.T) {
+func TestParseImagePageSize(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(t.TempDir(), "image.bin")
-	if err := os.WriteFile(path, page(0, 256), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fw, err := LoadFileWithOptions(path, LoadOptions{PageSize: 128})
+	fw, err := ParseImage(page(0, 256), LoadOptions{PageSize: 128})
 	if err != nil {
-		t.Fatalf("LoadFileWithOptions: %v", err)
+		t.Fatalf("ParseImage: %v", err)
 	}
 	if fw.PageSize() != 128 || len(fw.Pages) != 2 {
 		t.Errorf("got %d pages of %d bytes, want 2 of 128", len(fw.Pages), fw.PageSize())
@@ -723,13 +705,9 @@ func TestLoadFileWithOptionsPageSize(t *testing.T) {
 	// .bin above. Substituting DefaultPageSize for a geometry the caller named
 	// is wrong on precisely the path where a wrong split can flash and still
 	// verify clean (SPEC.md §10.2, §14.12).
-	jsonPath := filepath.Join(filepath.Dir(path), "image.json")
-	if err := os.WriteFile(jsonPath, []byte(numberArray(page(0, 256))), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fw, err = LoadFileWithOptions(jsonPath, LoadOptions{PageSize: 128})
+	fw, err = ParseImage([]byte(numberArray(page(0, 256))), LoadOptions{PageSize: 128})
 	if err != nil {
-		t.Fatalf("LoadFileWithOptions(bare array): %v", err)
+		t.Fatalf("ParseImage(bare array): %v", err)
 	}
 	if fw.PageSize() != 128 || len(fw.Pages) != 2 {
 		t.Errorf("bare array: got %d pages of %d bytes, want 2 of 128", len(fw.Pages), fw.PageSize())
@@ -885,16 +863,12 @@ func TestLoadOptionsPageSizeIsValidated(t *testing.T) {
 		}
 	}
 
-	path := filepath.Join(t.TempDir(), "image.bin")
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
+	if _, err := ParseImage(raw, LoadOptions{PageSize: math.MaxInt - 7}); err == nil {
+		t.Error("ParseImage with an unrepresentable page size was accepted")
 	}
-	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: math.MaxInt - 7}); err == nil {
-		t.Error("LoadFileWithOptions with an unrepresentable page size was accepted")
-	}
-	// The ceiling itself stays usable from every entry point.
-	if _, err := LoadFileWithOptions(path, LoadOptions{PageSize: ceiling}); err != nil {
-		t.Errorf("LoadFileWithOptions(PageSize %d): %v", ceiling, err)
+	// The ceiling itself stays usable.
+	if _, err := ParseImage(raw, LoadOptions{PageSize: ceiling}); err != nil {
+		t.Errorf("ParseImage(PageSize %d): %v", ceiling, err)
 	}
 }
 
@@ -1158,6 +1132,13 @@ func TestChunkedPageRejectsBadGeometry(t *testing.T) {
 			name: "no chunks at all",
 			doc:  `{"app_bin":[{"pg_id":0,"chunks":{}}]}`,
 			want: "no chunks",
+		},
+		{
+			// Eight distinct keys once the map has kept the last "0", so only
+			// the token walk can see that a chunk's bytes were dropped.
+			name: "a chunk index given twice",
+			doc:  `{"app_bin":[{"pg_id":0,"chunks":{"0":[1],"0":[9],"1":[2],"2":[3],"3":[4],"4":[5],"5":[6],"6":[7],"7":[8]}}]}`,
+			want: `chunk "0" more than once`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

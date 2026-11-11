@@ -136,7 +136,6 @@ var (
 // bootloader is strictly one command in flight (SPEC.md §5.3).
 type Flasher struct {
 	dev     bulkDevice
-	iface   usbfs.Interface
 	in, out usbfs.Endpoint
 	setup   error // non-nil when the interface cannot carry the protocol
 	readLen int
@@ -156,12 +155,12 @@ func (f *Flasher) pause(ctx context.Context, d time.Duration) error {
 }
 
 // NewFlasher builds a Flasher over an already-open device and an interface that
-// has already been claimed (see Connect).
+// has already been claimed (see ConnectWithOptions).
 //
 // Endpoint selection happens here, but a missing endpoint pair is reported from
 // the first operation rather than the constructor, which has no error return.
 func NewFlasher(dev *usbfs.Device, iface usbfs.Interface) *Flasher {
-	f := &Flasher{iface: iface, readLen: minReadBufferLen, t: defaultTiming()}
+	f := &Flasher{readLen: minReadBufferLen, t: defaultTiming()}
 	if dev == nil {
 		// Assigning a nil *usbfs.Device would produce a non-nil interface
 		// value, so the field is left alone and every method bails on setup.
@@ -179,14 +178,15 @@ func NewFlasher(dev *usbfs.Device, iface usbfs.Interface) *Flasher {
 	// The endpoint is addressed by its full bEndpointAddress. The vendor's
 	// WebUSB code stores a 4-bit endpoint *number*; translating rather than
 	// copying that is the trap called out in SPEC.md §10.2.
-	if int(in.MaxPacketSize) > f.readLen {
-		f.readLen = int(in.MaxPacketSize)
+	// The size bits only (Endpoint.PacketSize): the whole field can exceed
+	// usbfs's 16384-byte transfer ceiling, and a buffer sized from it would
+	// make every ACK read fail locally with ErrTooLarge before reaching the
+	// device -- the same reason the MIDI transport masks it (usbmidi.bufSize).
+	if n := in.PacketSize(); n > f.readLen {
+		f.readLen = n
 	}
 	return f
 }
-
-// Interface reports the interface this flasher is bound to.
-func (f *Flasher) Interface() usbfs.Interface { return f.iface }
 
 // send writes one frame to the bulk OUT endpoint.
 func (f *Flasher) send(ctx context.Context, frame []byte) error {
@@ -521,47 +521,23 @@ const (
 	reqSetControlLineState uint8 = 0x22
 )
 
-// Connect retry policy. The device is still re-enumerating after the jump out
-// of application mode, so the first few attempts are expected to find nothing.
+// ConnectWithOptions retry policy. The device is still re-enumerating after the
+// jump out of application mode, so the first few attempts are expected to find
+// nothing.
 //
-// Exported because Connect owns this loop and callers need to be able to see
-// that, rather than guess and add a second one on top; see Connect.
+// Exported because ConnectWithOptions owns this loop and callers need to be
+// able to see that, rather than guess and add a second one on top; see
+// ConnectWithOptions.
 const (
-	// ConnectRetryWindow is how long Connect keeps retrying before giving up.
+	// ConnectRetryWindow is how long ConnectWithOptions keeps retrying before
+	// giving up.
 	ConnectRetryWindow = 8 * time.Second
-	// ConnectRetryInterval is the pause between Connect's attempts.
+	// ConnectRetryInterval is the pause between ConnectWithOptions's attempts.
 	ConnectRetryInterval = 250 * time.Millisecond
 )
 
-// Connect finds the VFLEX bootloader, claims its vendor-class interface and
-// returns both so a Flasher can be built over them.
-//
-// **Connect owns the retry loop.** It retries the whole enumerate-open-claim
-// sequence itself, every ConnectRetryInterval (250 ms) for up to
-// ConnectRetryWindow (8 s), and only then returns an error. It retries because
-// the device disappears and comes back under a new bus address after
-// CMD_JUMP_APP_TO_BOOTLOADER; the caller is expected to have already waited
-// BOOTLOADER_MODE_SWITCH_DELAY_MS (4 s) before the first call.
-//
-// A caller must therefore *not* wrap it in a second loop. Doing so does not add
-// 8 s of patience to an outer budget, it multiplies: an outer loop that retries
-// for N seconds actually waits up to N+8, and every error message that quotes
-// its own window then understates the real wait. One call is the whole retry
-// policy; if the window is wrong it should change here. The one exception is a
-// caller that needs to keep waiting for a fundamentally slower event than
-// re-enumeration -- a human replugging the unit, say -- which should say so in
-// its own message rather than presenting the sum as one timeout.
-//
-// A ctx deadline shorter than the window still wins: a cancelled context aborts
-// the wait immediately.
-//
-// The caller owns the returned device and must Close it.
-func Connect(ctx context.Context) (*usbfs.Device, usbfs.Interface, error) {
-	return ConnectWithOptions(ctx, ConnectOptions{})
-}
-
-// ConnectOptions tunes ConnectWithOptions. The zero value is what Connect uses
-// and is the right choice everywhere the device is expected to be mid-excursion.
+// ConnectOptions tunes ConnectWithOptions. The zero value is the right choice
+// everywhere the device is expected to be mid-excursion.
 type ConnectOptions struct {
 	// FailFastOnApplicationMode abandons the retry window as soon as a pass
 	// finds only units still running the application (ErrApplicationMode),
@@ -583,7 +559,32 @@ type ConnectOptions struct {
 	FailFastOnApplicationMode bool
 }
 
-// ConnectWithOptions is Connect with the retry policy tuned by opts.
+// ConnectWithOptions finds the VFLEX bootloader, claims its vendor-class
+// interface and returns both so a Flasher can be built over them.
+//
+// **ConnectWithOptions owns the retry loop.** It retries the whole
+// enumerate-open-claim sequence itself, every ConnectRetryInterval (250 ms) for
+// up to ConnectRetryWindow (8 s), and only then returns an error. It retries
+// because the device disappears and comes back under a new bus address after
+// CMD_JUMP_APP_TO_BOOTLOADER; the caller is expected to have already waited
+// BOOTLOADER_MODE_SWITCH_DELAY_MS (4 s) before the first call.
+//
+// A caller must therefore *not* wrap it in a second loop. Doing so does not add
+// 8 s of patience to an outer budget, it multiplies: an outer loop that retries
+// for N seconds actually waits up to N+8, and every error message that quotes
+// its own window then understates the real wait. One call is the whole retry
+// policy; if the window is wrong it should change here. The one exception is a
+// caller that needs to keep waiting for a fundamentally slower event than
+// re-enumeration -- a human replugging the unit, say -- which should say so in
+// its own message rather than presenting the sum as one timeout.
+//
+// A ctx deadline shorter than the window still wins: a cancelled context aborts
+// the wait immediately.
+//
+// opts tunes the policy; its zero value is right everywhere the device is
+// expected to be mid-excursion.
+//
+// The caller owns the returned device and must Close it.
 func ConnectWithOptions(ctx context.Context, opts ConnectOptions) (*usbfs.Device, usbfs.Interface, error) {
 	deadline := time.Now().Add(ConnectRetryWindow)
 	var lastErr error
@@ -618,7 +619,7 @@ func connectOnce(ctx context.Context) (*usbfs.Device, usbfs.Interface, error) {
 		return nil, usbfs.Interface{}, fmt.Errorf("bootloader: enumerating USB: %w", err)
 	}
 	if len(refs) == 0 {
-		return nil, usbfs.Interface{}, errors.New("bootloader: no device with vendor 0x37BF is attached")
+		return nil, usbfs.Interface{}, fmt.Errorf("bootloader: no device with vendor 0x%04X is attached", proto.VendorID)
 	}
 	var lastErr error
 	// allApplicationMode records that every attached candidate refused because
@@ -699,10 +700,9 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 	}
 	// A unit still running its application also exposes a vendor-class interface
 	// (see InApplicationMode), so picking by class alone would select a healthy
-	// device and let a --recover flash write to it. Refuse unless the caller
-	// says otherwise; the jump path never trips this, because by the time it
-	// reconnects the MIDI interface is gone.
-	if !AllowApplicationMode && InApplicationMode(cfg) {
+	// device and let a --recover flash write to it. Refuse; the jump path never
+	// trips this, because by the time it reconnects the MIDI interface is gone.
+	if InApplicationMode(cfg) {
 		dev.Close()
 		return nil, usbfs.Interface{}, fmt.Errorf("%w: %s is running its application, not the bootloader "+
 			"(it still presents a MIDI interface). A unit in the bootloader blinks its LED slowly in "+
@@ -761,8 +761,12 @@ func claim(ctx context.Context, ref usbfs.DeviceRef) (*usbfs.Device, usbfs.Inter
 // The check fails safe in both directions: MIDI present means refuse (correct
 // for an application-mode unit), MIDI absent means proceed (correct for a
 // bootloader). Should some future firmware keep MIDI alive in the bootloader,
-// this refuses a legitimate recovery rather than permitting a dangerous flash,
-// and the caller can override.
+// this refuses a legitimate recovery rather than permitting a dangerous flash.
+// There is deliberately no override: nothing outside this module can import the
+// package, so a switch would have to become a CLI flag -- a way to stream
+// WRITE_CHUNK frames at a unit that never entered the bootloader -- and a
+// firmware that needs it needs this check changed, with the measurement that
+// shows why.
 //
 // Both spellings of "MIDI" count, because the rest of the tool drives both:
 // SPEC.md §4.2 selects the MIDI interface on (Class == 0x01 || Class == 0xFF)

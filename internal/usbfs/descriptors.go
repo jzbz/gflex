@@ -51,6 +51,14 @@ type Endpoint struct {
 	Interval uint8
 }
 
+// PacketSize returns the maximum packet size in bytes: bits 10:0 of
+// wMaxPacketSize. On a high-speed periodic endpoint bits 12:11 count the
+// additional transactions per microframe (USB 2.0 §9.6.6), so 0x1400 is a
+// 1024-byte packet, not a 5120-byte one, and the field read whole can exceed
+// what Device.Transfer accepts. Every buffer sized from a descriptor should be
+// sized from this.
+func (e Endpoint) PacketSize() int { return int(e.MaxPacketSize & 0x07FF) }
+
 // Number returns the bare 4-bit endpoint number, without the direction bit.
 func (e Endpoint) Number() uint8 { return e.Address & endpointNumMask }
 

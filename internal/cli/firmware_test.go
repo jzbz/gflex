@@ -589,6 +589,33 @@ func TestTheResumeCommandKeepsEveryFlagThatDecidesWhatIsFlashed(t *testing.T) {
 	}
 }
 
+// TestTheResumeCommandSurvivesTheShell: the line is printed to be pasted while
+// the unit sits in the bootloader, so a path the shell would split, expand or
+// read as a flag must come back as the one argument the user gave.
+func TestTheResumeCommandSurvivesTheShell(t *testing.T) {
+	app, _, _ := newFlashTestApp()
+	for _, tc := range []struct{ path, want string }{
+		{"fw.bin", " fw.bin "},
+		{"/home/u/Werewolf VFLEX/fw.bin", ` '/home/u/Werewolf VFLEX/fw.bin' `},
+		{"it's $(here).json", ` 'it'\''s $(here).json' `},
+		{"-fw.bin", " ./-fw.bin "},
+		{"-a b.bin", ` './-a b.bin' `},
+	} {
+		o := baseOpts()
+		o.path = tc.path
+		if got := app.resumeCommand(o); !strings.Contains(got, tc.want) {
+			t.Errorf("path %q: resume command %q does not contain %q", tc.path, got, tc.want)
+		}
+	}
+
+	o := baseOpts()
+	o.fetch = true
+	o.wsURL = "wss://lab.example/boot loader"
+	if got := app.resumeCommand(o); !strings.Contains(got, ` --ws-url 'wss://lab.example/boot loader' `) {
+		t.Errorf("the --ws-url value is not one shell word: %s", got)
+	}
+}
+
 // TestSerialMismatchPromisesNothingWasFlashed: identity is checked before the
 // first page is written, so this is the one failure that can say so.
 func TestSerialMismatchPromisesNothingWasFlashed(t *testing.T) {
@@ -1324,13 +1351,13 @@ func TestAnInterruptedDisconnectWaitIsNotReportedAsATimeout(t *testing.T) {
 // opening the bootloader interface: exactly one retry loop
 // ---------------------------------------------------------------------------
 
-// TestBootloaderConnectIsNotWrappedInASecondRetryLoop is the regression test for
-// two retry budgets stacked on each other. bootloader.Connect retries for
-// bootloader.ConnectRetryWindow itself and burns that whole window before it
-// ever returns an error; the CLI wrapped it in a further 15 s / 500 ms loop, so
-// the real wait was one window plus another full pass, and the failure quoted
-// two different budgets in one message. Nothing here may call Connect more than
-// once or sit on a timer of its own.
+// TestBootloaderConnectIsNotWrappedInASecondRetryLoop is the regression test
+// for two retry budgets stacked on each other. bootloader.ConnectWithOptions
+// retries for bootloader.ConnectRetryWindow itself and burns that whole window
+// before it ever returns an error; the CLI wrapped it in a further 15 s / 500
+// ms loop, so the real wait was one window plus another full pass, and the
+// failure quoted two different budgets in one message. Nothing here may call
+// ConnectWithOptions more than once or sit on a timer of its own.
 func TestBootloaderConnectIsNotWrappedInASecondRetryLoop(t *testing.T) {
 	var calls int
 	stubConnect(t, func(context.Context) (*usbfs.Device, usbfs.Interface, error) {
@@ -1347,10 +1374,10 @@ func TestBootloaderConnectIsNotWrappedInASecondRetryLoop(t *testing.T) {
 		t.Fatal("a failed connect was not reported as an error")
 	}
 	if calls != 1 {
-		t.Errorf("bootloader.Connect called %d times; it owns the retry loop, so the CLI calls it once", calls)
+		t.Errorf("bootloader.ConnectWithOptions called %d times; it owns the retry loop, so the CLI calls it once", calls)
 	}
 	if elapsed > 500*time.Millisecond {
-		t.Errorf("openBootloaderInterface waited %s of its own; the retry window belongs to Connect", elapsed)
+		t.Errorf("openBootloaderInterface waited %s of its own; the retry window belongs to ConnectWithOptions", elapsed)
 	}
 	if code := ExitCode(err); code != ExitNoDevice {
 		t.Errorf("exit code %d, want ExitNoDevice (%d)", code, ExitNoDevice)
@@ -1362,9 +1389,9 @@ func TestBootloaderConnectIsNotWrappedInASecondRetryLoop(t *testing.T) {
 	if !strings.Contains(msg, "install-udev") {
 		t.Errorf("the fix for a raw-USB interface is missing: %s", msg)
 	}
-	// The CLI must not quote a window it does not own: Connect names its own in
-	// the error being wrapped, and two numbers in one message is the confusion
-	// this fix removes.
+	// The CLI must not quote a window it does not own: ConnectWithOptions names
+	// its own in the error being wrapped, and two numbers in one message is the
+	// confusion this fix removes.
 	if strings.Contains(msg, "after 15s") {
 		t.Errorf("the CLI still advertises a retry budget of its own: %s", msg)
 	}
@@ -1373,10 +1400,10 @@ func TestBootloaderConnectIsNotWrappedInASecondRetryLoop(t *testing.T) {
 	}
 }
 
-// TestBootloaderConnectInterruptionIsNotReportedAsAMissingDevice: Connect
-// returns the context's own error when a Ctrl-C lands in the middle of its
-// wait. Dressing that up as ExitNoDevice would tell a user their unit had
-// vanished when in fact they interrupted the flash themselves.
+// TestBootloaderConnectInterruptionIsNotReportedAsAMissingDevice:
+// ConnectWithOptions returns the context's own error when a Ctrl-C lands in the
+// middle of its wait. Dressing that up as ExitNoDevice would tell a user their
+// unit had vanished when in fact they interrupted the flash themselves.
 func TestBootloaderConnectInterruptionIsNotReportedAsAMissingDevice(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	stubConnect(t, func(c context.Context) (*usbfs.Device, usbfs.Interface, error) {
@@ -1855,7 +1882,7 @@ func TestFetchedImageSaveIsAtomic(t *testing.T) {
 	}
 
 	// The point of saving is that `firmware flash <file>` can read it back.
-	back, err := bootloader.LoadFile(path)
+	back, err := loadSavedImage(path)
 	if err != nil {
 		t.Fatalf("the saved image does not load: %v", err)
 	}
@@ -1923,7 +1950,7 @@ func TestASavedImageRoundTripsWhereBase64WouldNot(t *testing.T) {
 				t.Fatalf("reportFetched: %v", err)
 			}
 
-			back, err := bootloader.LoadFile(path)
+			back, err := loadSavedImage(path)
 			if err != nil {
 				t.Fatalf("the saved image does not load: %v", err)
 			}
@@ -1982,7 +2009,7 @@ func TestFetchedImageSaveLeavesThePreviousFileIntactWhenItFails(t *testing.T) {
 }
 
 // TestBootloaderFailFastOnlyUnderRecover pins which side of the flash asks
-// Connect to give up early on a unit still running the application.
+// ConnectWithOptions to give up early on a unit still running the application.
 //
 // Under --recover no jump was issued: the user is asserting the unit is already
 // in the bootloader, so an application-mode answer is settled and re-asking for
@@ -2045,4 +2072,122 @@ func TestPresenceIsNotMeaningfulOnAPortOnlyThisRunIdentified(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheReturnedUnitMustIdentifyItselfBeforeTheReplay: the §10.4 replay
+// unlocks AUTHLOCK, writes calibration and may widen the voltage window, so it
+// runs only on a unit that reported the flashed serial. A dropped reply is
+// retried; one that never comes is a refusal, not a pass.
+func TestTheReturnedUnitMustIdentifyItselfBeforeTheReplay(t *testing.T) {
+	t.Run("slow but right", func(t *testing.T) {
+		r := scripted([2]any{"", session.ErrTimeout}, [2]any{"VF001234", nil})
+		if err := identifyReturnedUnit(context.Background(), r.read, "VF001234", time.Microsecond); err != nil {
+			t.Errorf("a dropped reply then the right serial was refused: %v", err)
+		}
+	})
+	t.Run("never answers", func(t *testing.T) {
+		r := scripted([2]any{"", session.ErrTimeout})
+		err := identifyReturnedUnit(context.Background(), r.read, "VF001234", time.Microsecond)
+		if err == nil {
+			t.Fatal("a unit that never said who it is was accepted for the replay")
+		}
+		if !errors.Is(err, session.ErrTimeout) || !strings.Contains(err.Error(), "NOT replayed") {
+			t.Errorf("the refusal loses its cause or does not say the replay was skipped: %v", err)
+		}
+		if r.calls != scanSerialAttempts {
+			t.Errorf("read %d times, want %d", r.calls, scanSerialAttempts)
+		}
+	})
+	t.Run("another unit", func(t *testing.T) {
+		r := scripted([2]any{"VF009999", nil})
+		err := identifyReturnedUnit(context.Background(), r.read, "VF001234", time.Microsecond)
+		if !errors.Is(err, errWrongUnit) {
+			t.Errorf("a different serial was not reported as the wrong unit: %v", err)
+		}
+	})
+}
+
+// TestAnInterruptedReplayIsNotASuccessExit: a signal that cuts the §10.4
+// replay short leaves settings at whatever the flash left them as, so the
+// command must not exit 0 -- and the result object must still be written and
+// say so, because the error return skips the flush App.run does on success.
+func TestAnInterruptedReplayIsNotASuccessExit(t *testing.T) {
+	app, out, errOut := newFlashTestApp()
+	app.AsJSON = true
+	f := app.newFormatter()
+	rep := replayReport{
+		restored: []string{"set authlock 0 ok"},
+		failed:   []string{},
+		cut:      context.Canceled,
+	}
+	err := reportFlashResult(f, rep, &bootloader.UpdateResult{CRC: 0x5A, CRCChecked: true}, "5.1.0", "VFX-0001")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("an interrupted replay returned %v, want an error carrying the cancellation", err)
+	}
+	if !strings.Contains(err.Error(), "SUCCEEDED") {
+		t.Errorf("the error does not say the flash itself succeeded: %v", err)
+	}
+	var doc map[string]any
+	if jerr := json.Unmarshal(out.Bytes(), &doc); jerr != nil {
+		t.Fatalf("no JSON object was written: %v\n%s", jerr, out.String())
+	}
+	if doc["replay_interrupted"] != true {
+		t.Errorf("replay_interrupted = %v, want true: %s", doc["replay_interrupted"], out.String())
+	}
+	if doc["serial_num"] != "VFX-0001" {
+		t.Errorf("the serial was lost from the object: %s", out.String())
+	}
+	if !strings.Contains(errOut.String(), "did not finish") {
+		t.Errorf("stderr does not say the replay was cut short: %q", errOut.String())
+	}
+
+	// And a replay that ran to the end says so in the same field.
+	app, out, _ = newFlashTestApp()
+	app.AsJSON = true
+	rep = replayReport{restored: []string{"set authlock 0 ok"}, failed: []string{}}
+	f = app.newFormatter()
+	if err := reportFlashResult(f, rep, &bootloader.UpdateResult{CRCChecked: true}, "5.1.0", "VFX-0001"); err != nil {
+		t.Fatalf("a complete replay failed: %v", err)
+	}
+	if err := f.Flush(); err != nil { // App.run's flush on success
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil || doc["replay_interrupted"] != false {
+		t.Errorf("a complete replay does not report replay_interrupted false: %s", out.String())
+	}
+}
+
+// TestPostFlashFailureDoesNotForbidARecoveryNothingConfirmedWasUnneeded: a
+// device that left the bus while CMD_BOOTLOAD_END was being written may have
+// been unplugged in the bootloader rather than started, so the unit that does
+// not come back must be pointed at the LED and the resume command, not told
+// the update succeeded and never to re-flash.
+func TestPostFlashFailureDoesNotForbidARecoveryNothingConfirmedWasUnneeded(t *testing.T) {
+	app, _, errOut := newFlashTestApp()
+	o := baseOpts()
+	o.path = "fw.json"
+	err := app.postFlashFailure(app.newFormatter(), o,
+		&bootloader.UpdateResult{CRC: 0x5A, CRCChecked: true, JumpedToApp: true, JumpUnconfirmed: true},
+		"waiting for the unit to come back", errors.New("no device"))
+	said := errOut.String()
+	for _, unwanted := range []string{"SUCCEEDED", "Do NOT re-flash"} {
+		if strings.Contains(said, unwanted) || strings.Contains(err.Error(), unwanted) {
+			t.Errorf("an unconfirmed jump was reported with %q: %q / %v", unwanted, said, err)
+		}
+	}
+	for _, want := range []string{"slowly", "--recover fw.json"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the guidance is missing %q: %q", want, said)
+		}
+	}
+}
+
+// loadSavedImage reads an image back the way `firmware flash <file>` does: one
+// open through readImageFile, then the shared parser.
+func loadSavedImage(path string) (*bootloader.Firmware, error) {
+	data, err := readImageFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return bootloader.ParseImage(data, bootloader.LoadOptions{})
 }

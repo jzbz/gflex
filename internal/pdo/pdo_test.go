@@ -806,12 +806,15 @@ func TestDerivedCurrentNeverExceedsTheBudget(t *testing.T) {
 			PPSPowerLimited: true, PPSBudgetW: pdp}
 		for tenths := 150; tenths <= 480; tenths++ {
 			v := float64(tenths) / 10
-			budget := float64(pdp) / v
-			if a := eprAVS.CurrentAt(v); a > budget+cmpEps && a < MaxCableCurrentA {
-				t.Fatalf("EPR AVS %d W at %v V reports %v A, above the %v A the budget allows", pdp, v, a, budget)
+			// The ceiling is the smaller of the budget and the cable. Exempting
+			// any answer at the cable ceiling instead -- `&& a < 5` -- let
+			// through exactly the result a regression in the clamp would give.
+			ceiling := math.Min(float64(pdp)/v, MaxCableCurrentA)
+			if a := eprAVS.CurrentAt(v); a > ceiling+cmpEps {
+				t.Fatalf("EPR AVS %d W at %v V reports %v A, above the %v A ceiling", pdp, v, a, ceiling)
 			}
-			if a := pps.CurrentAt(v); a > budget+cmpEps && a < MaxCableCurrentA {
-				t.Fatalf("PPS %d W at %v V reports %v A, above the %v A the budget allows", pdp, v, a, budget)
+			if a := pps.CurrentAt(v); a > ceiling+cmpEps {
+				t.Fatalf("PPS %d W at %v V reports %v A, above the %v A ceiling", pdp, v, a, ceiling)
 			}
 		}
 	}

@@ -329,6 +329,22 @@ func CheckAuthLock(level int) Decision {
 	return d
 }
 
+// CalibrationPrev says what is known of the calibration a write replaces.
+type CalibrationPrev int
+
+const (
+	// CalibrationPrevRead means both terms were read; the restore command can
+	// be printed.
+	CalibrationPrevRead CalibrationPrev = iota
+	// CalibrationPrevUnread means a read was made and failed.
+	CalibrationPrevUnread
+	// CalibrationPrevNotAttempted means no read was made: --dry-run opens no
+	// device, so "could not be read" would report a failure that never
+	// happened -- the same distinction LimitsNotAttempted draws for the
+	// voltage window.
+	CalibrationPrevNotAttempted
+)
+
 // CheckCalibrate applies interlock 5 of SPEC.md §13.
 //
 // A wrong offset or scale makes every subsequent voltage reading silently
@@ -339,13 +355,21 @@ func CheckAuthLock(level int) Decision {
 // actually write: `calibrate adc --offset 5` keeps the scale it read, so the
 // prompt has to describe the pair that results without claiming a write that
 // does not happen.
-func CheckCalibrate(offset, scale, prevOffset, prevScale int32, prevKnown, writingOffset, writingScale bool) Decision {
+func CheckCalibrate(offset, scale, prevOffset, prevScale int32, prev CalibrationPrev,
+	writingOffset, writingScale bool,
+) Decision {
 	var d Decision
-	if prevKnown {
+	switch prev {
+	case CalibrationPrevRead:
 		d.warn("previous calibration: offset=%d scale=%d\n"+
 			"  restore it with: gflex calibrate adc --offset %d --scale %d --yes",
 			prevOffset, prevScale, prevOffset, prevScale)
-	} else {
+	case CalibrationPrevNotAttempted:
+		d.warn("--dry-run reads nothing from the device, so the previous calibration is not shown;\n"+
+			"  the real run prints it first, with the command that restores it. The factory default\n"+
+			"  is offset=%d scale=%d (SPEC.md §6.5)",
+			proto.DefaultADCOffset, proto.DefaultADCScale)
+	default:
 		d.warn("the previous calibration could not be read, so it cannot be restored automatically.\n"+
 			"  The factory default is offset=%d scale=%d (SPEC.md §6.5)",
 			proto.DefaultADCOffset, proto.DefaultADCScale)
@@ -446,12 +470,25 @@ func CheckRawFrame(f proto.Frame) Decision {
 		reasons = append(reasons, fmt.Sprintf("command code %d is outside the known table", uint8(f.Cmd)))
 	}
 	if f.Scratchpad {
-		reasons = append(reasons, "the scratchpad flag is set; the vendor app never sets it, and on "+
-			"both units measured such a write is acknowledged but never committed, so this frame will "+
-			"look like it succeeded and change nothing. Do not read the response as confirmation: "+
-			"what it carries varies by command -- a scratchpad write of CMD_VOLTAGE_MV answers with "+
-			"the value you sent, one of CMD_CURRENT_LIMIT_MA with the value the device kept, and "+
-			"neither was stored (SPEC.md §14.4)")
+		// The "acknowledged and never committed" behaviour was measured on two
+		// commands only, and SPEC.md §14.4 says in as many words not to
+		// generalise it. Promising "changes nothing" for the rest -- AUTHLOCK
+		// among them, whose levels may not be reversible (SPEC.md §6.3) --
+		// would be reassurance the measurement does not cover, attached to the
+		// one prompt that is supposed to make the user stop.
+		if f.Cmd == proto.CmdVoltageMv || f.Cmd == proto.CmdCurrentLimitMa {
+			reasons = append(reasons, "the scratchpad flag is set; the vendor app never sets it, and on "+
+				"both units measured a scratchpad write of this command is acknowledged but never "+
+				"committed, so this frame will look like it succeeded and change nothing. Do not read "+
+				"the response as confirmation: a scratchpad write of CMD_VOLTAGE_MV answers with the "+
+				"value you sent, one of CMD_CURRENT_LIMIT_MA with the value the device kept, and "+
+				"neither was stored (SPEC.md §14.4)")
+		} else {
+			reasons = append(reasons, fmt.Sprintf("the scratchpad flag is set; the vendor app never "+
+				"sets it, and what it does on %s is unmeasured -- it was characterised on "+
+				"CMD_VOLTAGE_MV and CMD_CURRENT_LIMIT_MA only, so do not count on this write being "+
+				"discarded, nor read the response as confirmation (SPEC.md §14.4)", f.Cmd))
+		}
 	}
 	// A frame that is neither a read nor a write by the definitions of SPEC.md
 	// §5.1: the write flag is clear, so it is not a write, and a read is always
@@ -463,12 +500,15 @@ func CheckRawFrame(f proto.Frame) Decision {
 	// chunk read `03 11 kk` (SPEC.md §6.1). A length-keyed parser is therefore
 	// not ruled out, and §13.10's promise is about a plain documented READ.
 	//
-	// That same chunk read is why CMD_PDO_LOG is excluded rather than the rule
-	// being written more loosely: it is a documented read that carries a
-	// payload, and §13.10 requires it to pass silently. An unknown or
+	// That same chunk read is why CMD_PDO_LOG's one-byte form is excluded
+	// rather than the rule being written more loosely: it is a documented read
+	// that carries a payload, and §13.10 requires it to pass silently. The
+	// exemption is that shape exactly, `03 11 kk`, and no wider: `04 11 00 01`
+	// is no more a documented read than `04 12 2e e0` is. An unknown or
 	// undocumented code is excluded too, because it already has its own, more
 	// specific reason above and two overlapping ones say less than one.
-	if !f.Write && len(f.Payload) > 0 && f.Cmd != proto.CmdPDOLog &&
+	pdoChunkRead := f.Cmd == proto.CmdPDOLog && len(f.Payload) == 1
+	if !f.Write && len(f.Payload) > 0 && !pdoChunkRead &&
 		f.Cmd.Known() && !f.Cmd.Undocumented() {
 		reasons = append(reasons, "the write flag is clear but the frame carries a payload; a read is "+
 			"the bare 2-byte frame (SPEC.md §5.1) and what the firmware does with this shape is unmeasured")

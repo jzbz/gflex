@@ -70,8 +70,12 @@ const (
 //     rather than an echo: the LED colour write has no read side at all
 //     (SPEC.md §6.2, measured 2026-09-01).
 //
-// A write carrying CMD_FLAG_SCRATCHPAD is acknowledged and discarded on every
-// register, the way hardware treats it (SPEC.md §14.4); see SetRegister.
+// A write carrying CMD_FLAG_SCRATCHPAD is acknowledged and discarded on the
+// plain registers (SetRegister), the way hardware treated it on the two
+// commands measured (SPEC.md §14.4). What the acknowledgement carries follows
+// the measurement too: CMD_VOLTAGE_MV echoes the request, CMD_CURRENT_LIMIT_MA
+// the value it kept. AUTHLOCK and the PDO log have handlers of their own that
+// do not look at the flag; what hardware does with it there is unmeasured.
 //
 // Erasing the PDO log zeroes it, as it does on hardware, so a scan test that
 // erases first must put a capture back with
@@ -105,6 +109,17 @@ func NewTypical() *Device {
 	d.SetRegister(proto.CmdDisableLEDDuringOp, []byte{proto.EncodeLEDAlwaysOn(true)})
 	d.SetRegister(proto.CmdVoltageMv, proto.EncodeU16(proto.DefaultVoltageMv))
 	d.SetRegister(proto.CmdCurrentLimitMa, proto.EncodeU16(proto.DefaultCurrentLimitMa))
+	// Measured (SPEC.md §14.4): a scratchpad write of the current limit is
+	// discarded like any other, but answered with the stored value rather than
+	// the requested one -- tx 04 d3 0f a0 -> rx 04 13 13 88.
+	d.SetHandler(proto.CmdCurrentLimitMa, func(f proto.Frame) []byte {
+		if f.Write && !f.Scratchpad {
+			d.StoreRegister(proto.CmdCurrentLimitMa, f.Payload)
+			return append([]byte{}, f.Payload...)
+		}
+		v, _ := d.Register(proto.CmdCurrentLimitMa)
+		return v
+	})
 	d.SetRegister(proto.CmdUserVLimit, proto.EncodeVLimit(proto.DefaultVLimitLowMv, proto.DefaultVLimitHighMv))
 	d.SetRegister(proto.CmdVToleranceNominalMv, proto.EncodeU16(proto.DefaultVToleranceNominal))
 	d.SetRegister(proto.CmdVToleranceSagPerMa, proto.EncodeU16(0))

@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 # Deliberately not cancel-in-progress, unlike ci.yml. There a superseded run is
-# just wasted minutes; here an interrupted run can leave a published release
-# with only half its assets attached, which is worse than a slow one.
+# just wasted minutes; here an interrupted run can leave a draft release with
+# only half its assets attached, which is worse than a slow one.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -155,7 +155,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: publish
+    name: draft release
     needs: build
     runs-on: ubuntu-latest
     # The one non-default permission in this file, and the step that needs it is
@@ -217,9 +217,10 @@ jobs:
               install -m 0755 gflex-$VERSION-linux-amd64 ~/.local/bin/gflex
 
           Chained on purpose: a bad signature or a failed checksum stops that paste before install
-          runs. SHA256SUMS.asc is signed by hand once this workflow has published, because the
-          signing key never goes near CI; the README's "Verifying a download" says where to get that
-          key and which fingerprint it has to be.
+          runs. SHA256SUMS.asc is signed by hand from the SHA256SUMS this workflow attached, because
+          the signing key never goes near CI, and the release is published only once it is attached;
+          the README's "Verifying a download" says where to get that key and which fingerprint it
+          has to be.
 
           The USB transport and every firmware operation need a udev rule; run **gflex install-udev**
           or see the README's Install section.
@@ -231,7 +232,13 @@ jobs:
           # --verify-tag because gh will otherwise happily create a tag that
           # does not exist; the tag that triggered this run must be the one the
           # release is attached to.
+          #
+          # --draft because SHA256SUMS.asc is made by hand afterwards, from the
+          # SHA256SUMS attached here: published straight away, every release
+          # would sit public with binaries and no signature until it was
+          # uploaded. The draft is published by hand once the .asc is on it.
           gh release create "$VERSION" \
+            --draft \
             --verify-tag \
             --title "$VERSION" \
             --notes "$notes" \

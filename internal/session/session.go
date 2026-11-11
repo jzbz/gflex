@@ -72,20 +72,20 @@ var (
 	// back before relying on it.
 	//
 	// It is attached in exactly one situation: the send returned nil and the
-	// wait that followed ended in ErrTimeout or a dead context. The two
-	// exclusions are as load-bearing as the rule.
+	// wait that followed ended in ErrTimeout, a dead context, or the link
+	// closing (ErrTransportClosed). The last is there because how the wait
+	// ended says nothing about a frame that had already left: a unit unplugged
+	// a moment after receiving a complete write applied it just the same, and
+	// "the device was disconnected" alone reads as "so nothing happened". The
+	// sentinel is added alongside, not instead -- ErrTransportClosed still
+	// classifies the failure as permanent and names the link as its cause.
 	//
-	//   - A send that FAILED gets no sentinel. SendFrame stops at the message
-	//     it could not write, so the frame is truncated and the device's
-	//     receive machine drops it for want of an end-of-frame marker
-	//     (SPEC.md §3.3): the write demonstrably did not land. Warning that the
-	//     rail may have moved would be a false alarm on the one message that
-	//     has to stay trustworthy.
-	//   - ErrTransportClosed gets none either. It is already a distinct,
-	//     permanent classification that names the link as the cause and is
-	//     acted on as such; a timeout and an interrupt are the two failures
-	//     that get rendered to the user as "the device refused it" and "the run
-	//     was aborted", which is what makes them worth marking.
+	// The exclusion is as load-bearing as the rule: a send that FAILED gets no
+	// sentinel. SendFrame stops at the message it could not write, so the
+	// frame is truncated and the device's receive machine drops it for want of
+	// an end-of-frame marker (SPEC.md §3.3): the write demonstrably did not
+	// land. Warning that the rail may have moved would be a false alarm on the
+	// one message that has to stay trustworthy.
 	ErrUnacknowledged = errors.New("write sent but not acknowledged")
 )
 
@@ -339,16 +339,17 @@ func (s *Session) exchange(ctx context.Context, cmd proto.Cmd, payload []byte, w
 	return f, err
 }
 
-// unacknowledged marks err with ErrUnacknowledged when it is one of the two
+// unacknowledged marks err with ErrUnacknowledged when it is one of the
 // outcomes that leave a transmitted write's fate unknown: no answer within the
-// deadline, or a context that ended while waiting for one. Anything else is
-// returned untouched; ErrUnacknowledged's declaration says why each exclusion
-// is there.
+// deadline, a context that ended while waiting for one, or the link closing
+// under the wait. Anything else is returned untouched; ErrUnacknowledged's
+// declaration says why.
 func unacknowledged(err error) error {
 	switch {
 	case errors.Is(err, ErrTimeout),
 		errors.Is(err, context.Canceled),
-		errors.Is(err, context.DeadlineExceeded):
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, ErrTransportClosed):
 		return fmt.Errorf("%w: %w", ErrUnacknowledged, err)
 	}
 	return err

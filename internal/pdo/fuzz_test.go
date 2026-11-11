@@ -81,9 +81,13 @@ func FuzzParse(f *testing.F) {
 				// A power budget is the other ceiling, and it is derived by
 				// division rather than read off the wire, so a rounding that went
 				// to nearest could put the answer above it by a few milliamps.
+				// The ceiling is the smaller of the two, with no exemption for an
+				// answer sitting at the cable limit: that is precisely what a
+				// clamp regressed to "5 A whatever the budget" would return.
 				if budget := budgetAt(p, v); budget > 0 {
-					if a := p.CurrentAt(v); a > budget+cmpEps && a < MaxCableCurrentA {
-						t.Fatalf("CurrentAt(%v) = %v, above the %v A its power budget allows: %+v", v, a, budget, p)
+					ceiling := math.Min(budget, MaxCableCurrentA)
+					if a := p.CurrentAt(v); a > ceiling+cmpEps {
+						t.Fatalf("CurrentAt(%v) = %v, above the %v A its power budget allows: %+v", v, a, ceiling, p)
 					}
 				}
 			}

@@ -9,7 +9,7 @@
 // belong to the session layer; this package starts from an already-enumerated
 // bootloader device and ends at CMD_BOOTLOAD_END. See SPEC.md §10.
 //
-// Update is the entry point: Connect, then Update, and the whole
+// Update is the entry point: ConnectWithOptions, then Update, and the whole
 // flash-verify-jump sequence — its ordering, its delays and the interlocks that
 // decide whether the device is ever told to run what was written — lives inside
 // it. Flasher's individual methods are exported for diagnostics and recovery,
@@ -60,15 +60,6 @@ const MaxChunkSize = maxBootloaderFrameLen - proto.PreambleLen - writeChunkHeade
 // ErrApplicationMode reports that the device found on the bus is running its
 // application rather than sitting in the bootloader. See InApplicationMode.
 var ErrApplicationMode = errors.New("bootloader: device is in application mode")
-
-// AllowApplicationMode disables the InApplicationMode guard in claim.
-//
-// It exists for the case the guard cannot anticipate: a firmware that keeps its
-// MIDI interface alive in the bootloader would make the guard refuse a genuine
-// recovery. Nothing in this repository sets it -- it is a deliberate escape
-// hatch for an operator who has confirmed with the LED (slow white blink) that
-// the unit really is in the bootloader.
-var AllowApplicationMode = false
 
 // ErrFrameTooLong reports a frame whose total length will not fit the one-byte
 // length field.

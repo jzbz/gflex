@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/jzbz/gflex/internal/proto"
+	"github.com/jzbz/gflex/internal/transport/fake"
 )
 
 // withEuid points the privilege gate in installUdev at a fixed value for the
@@ -325,4 +326,72 @@ func TestTheUdevTriggerIsScopedToTheRuleItInstalls(t *testing.T) {
 		t.Errorf("the embedded rule no longer matches vendor %04x, so the trigger scope is wrong:\n%s",
 			proto.VendorID, udevRules)
 	}
+}
+
+// TestTheActiveUdevRuleGrantsTheDevice checks the line that does the work, not
+// the file. Every substring check above is also satisfied by the commented-out
+// non-seat fallback, so deleting the active rule from both copies left the
+// whole suite green while `install-udev` installed a file that grants nothing.
+// The vendor is spelled from proto.VendorIDString, which is the only thing
+// tying this hand-written file to the constant the rest of the tool matches on.
+func TestTheActiveUdevRuleGrantsTheDevice(t *testing.T) {
+	if proto.VendorIDString != fmt.Sprintf("%04x", proto.VendorID) {
+		t.Fatalf("proto.VendorIDString %q does not spell proto.VendorID 0x%04X", proto.VendorIDString, proto.VendorID)
+	}
+	want := fmt.Sprintf(`SUBSYSTEM=="usb", ATTR{idVendor}=="%s", MODE="0660", TAG+="uaccess"`, proto.VendorIDString)
+	var active []string
+	for _, line := range strings.Split(udevRules, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			active = append(active, line)
+		}
+	}
+	if !slices.Contains(active, want) {
+		t.Errorf("no active rule line is exactly\n  %s\nactive lines: %q", want, active)
+	}
+	for _, line := range active {
+		if strings.Contains(line, "idVendor") && !strings.Contains(line, `"`+proto.VendorIDString+`"`) {
+			t.Errorf("an active rule matches a vendor other than %s: %s", proto.VendorIDString, line)
+		}
+	}
+}
+
+// The install-udev command, driven through the real command tree rather than
+// by calling installUdev: the tests above prove the function, these prove
+// that the command a user types reaches it, with the dry run free and the real
+// run refused without root -- and without a device ever being opened.
+func TestInstallUdevThroughTheCommandTree(t *testing.T) {
+	withEuid(t, 1000)
+
+	t.Run("dry run", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		if err := tr.run(t, "--dry-run", "install-udev"); err != nil {
+			t.Fatalf("`gflex --dry-run install-udev` as an ordinary user: %v", err)
+		}
+		if !strings.Contains(tr.stdout.String(), udevRulesPath) {
+			t.Errorf("the dry run does not say where the rule would go:\n%s", tr.stdout.String())
+		}
+		if tr.opens != 0 {
+			t.Errorf("install-udev opened the device %d times", tr.opens)
+		}
+	})
+	t.Run("print", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		if err := tr.run(t, "install-udev", "--print"); err != nil {
+			t.Fatalf("`gflex install-udev --print`: %v", err)
+		}
+		if tr.stdout.String() != udevRules {
+			t.Errorf("--print did not write the embedded rule verbatim:\n%s", tr.stdout.String())
+		}
+	})
+	t.Run("without root", func(t *testing.T) {
+		tr := newFakeTree(t, fake.NewTypical())
+		err := tr.run(t, "install-udev")
+		if code := ExitCode(err); code != ExitPermission {
+			t.Errorf("`gflex install-udev` as an ordinary user: exit %d (%v), want %d", code, err, ExitPermission)
+		}
+		if tr.opens != 0 {
+			t.Errorf("install-udev opened the device %d times", tr.opens)
+		}
+	})
 }

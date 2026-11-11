@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/jzbz/gflex/internal/proto"
 )
 
 func TestWrapErrnoClassification(t *testing.T) {
@@ -172,5 +174,15 @@ func TestTransferRejectsOversizedBuffer(t *testing.T) {
 	}
 	if _, err := d.Control(context.Background(), 0x21, 0x22, 1, 0, make([]byte, MaxControlTransferSize+1), time.Second); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("err = %v, want ErrTooLarge", err)
+	}
+}
+
+// The EACCES hint hands the user a udev rule to install, with the vendor ID
+// spelled out. It must be the vendor the tool matches on, or a change to
+// proto.VendorID would leave the remediation naming a device nothing finds.
+func TestPermissionHintNamesTheToolsVendor(t *testing.T) {
+	hint, _ := classify(unix.EACCES)
+	if want := `ATTR{idVendor}=="` + proto.VendorIDString + `"`; !strings.Contains(hint, want) {
+		t.Errorf("the EACCES hint %q does not carry %s", hint, want)
 	}
 }

@@ -141,6 +141,33 @@ func TestEvaluateSPRUpgradeToAVS(t *testing.T) {
 	checkMatch(t, l2.Evaluate(10, 1), true, ModeSPRPPS, 3)
 }
 
+// The fixed arm used to consult PPS and nothing else, so a fixed 9 V 1.5 A
+// object beside an SPR AVS range offering 5 A at 9 V answered "no" to 4 A.
+// SPEC.md §17 (row 9.5): any covering object is considered, and the verdict
+// upgrades where the weaker one is short.
+func TestEvaluateSPRFixedUpgradesToAVS(t *testing.T) {
+	l := simpleLog(t, fixed5V3A, fixed9V15A, sprAVS)
+	m := l.Evaluate(9, 4)
+	checkMatch(t, m, true, ModeUpgradeSPRAVSMoreCurrent, 5)
+	wantMessage(t, m, "SPR AVS supplies 5.00 A")
+
+	// A request the fixed object meets stays on it.
+	checkMatch(t, l.Evaluate(9, 1), true, ModeSPRFixed, 1.5)
+}
+
+// And from the EPR side: a PPS range can decode past 20 V, and where an EPR
+// object covers the request but is short, a PPS range offering more wins.
+func TestEvaluateEPRUpgradesToPPS(t *testing.T) {
+	const pps3321V5A uint32 = 0xC1A42164 // PPS 3.3-21.0 V, 5.00 A
+	l := simpleLog(t, fixed5V3A, eprAVS84W, pps3321V5A)
+	m := l.Evaluate(21, 4.5) // 84 W at 21 V is 4.00 A
+	checkMatch(t, m, true, ModeUpgradeSPRPPSMoreCurrent, 5)
+	wantMessage(t, m, "the PPS range 3.3-21.0 V supplies 5.00 A")
+
+	// Met by the EPR object: no upgrade.
+	checkMatch(t, l.Evaluate(21, 3), true, ModeEPRAVS, 4)
+}
+
 func TestEvaluateSPRAVSOnly(t *testing.T) {
 	l := simpleLog(t, fixed5V3A, sprAVS)
 
@@ -279,6 +306,22 @@ func TestEvaluateEPRRequiredOnSPROnlySource(t *testing.T) {
 	if hasMessage(m, "eMarker-equipped 5 A EPR cable; a fast-blinking") {
 		t.Errorf("cable advisory emitted for an unachievable request: %v", m.Messages)
 	}
+}
+
+// A source that declares EPR capability (bit 23 on its fixed objects) but
+// whose scan captured only SPR objects is not an SPR-only charger: EPR mode was
+// never entered. The vendor's "is Required" sentence would send the user to
+// replace a charger that is fine.
+func TestEvaluateEPRCapableSourceWithoutEPRObjects(t *testing.T) {
+	const eprCapable uint32 = 1 << 23
+	l := simpleLog(t, fixed5V3A|eprCapable, fixed20V5A|eprCapable)
+	m := l.Evaluate(28, 3)
+	checkMatch(t, m, false, ModeNone, 0)
+	if hasMessage(m, eprRequiredMessage) {
+		t.Errorf("an EPR-capable source was told it needs an EPR source: %v", m.Messages)
+	}
+	wantMessage(t, m, "declares itself EPR-capable")
+	wantMessage(t, m, "5 A EPR cable")
 }
 
 func TestEvaluateEPRSupportedButWrongVoltage(t *testing.T) {

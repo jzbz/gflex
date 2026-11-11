@@ -157,10 +157,11 @@ func TestUnansweredWriteIsMarkedUnacknowledged(t *testing.T) {
 		}
 	})
 
-	t.Run("a dead transport is not marked", func(t *testing.T) {
-		// ErrTransportClosed already names the link as the cause and is acted
-		// on as permanent; the sentinel is for the two failures that otherwise
-		// read as "the device refused it" and "the run was aborted".
+	t.Run("a link that dies after the frame left is marked", func(t *testing.T) {
+		// The handler runs once the device has the whole frame, so the write
+		// may have been applied however the wait then ended. The sentinel goes
+		// alongside ErrTransportClosed, which still names the link as the
+		// cause and is still permanent.
 		s, d := newTestSession(t, Options{Timeout: 5 * time.Second})
 		d.SetHandler(proto.CmdVoltageMv, func(proto.Frame) []byte {
 			d.Unplug(errors.New("read /dev/snd/midiC1D0: no such device"))
@@ -168,11 +169,11 @@ func TestUnansweredWriteIsMarkedUnacknowledged(t *testing.T) {
 		})
 
 		err := write(t, context.Background(), s)
-		if !errors.Is(err, ErrTransportClosed) {
-			t.Fatalf("error = %v, want ErrTransportClosed", err)
+		if !errors.Is(err, ErrTransportClosed) || !PermanentErr(err) {
+			t.Fatalf("error = %v, want ErrTransportClosed, still permanent", err)
 		}
-		if errors.Is(err, ErrUnacknowledged) {
-			t.Errorf("error = %v, want the transport-closed verdict left alone", err)
+		if !errors.Is(err, ErrUnacknowledged) {
+			t.Errorf("error = %v, want it marked: the device had the whole frame", err)
 		}
 	})
 }

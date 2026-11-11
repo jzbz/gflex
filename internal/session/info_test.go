@@ -65,6 +65,10 @@ func TestInfoCoreOnly(t *testing.T) {
 // issued by the vendor app, so a silent unit must leave those fields nil rather
 // than fail the whole call.
 func TestInfoIncludeUnusedToleratesFailure(t *testing.T) {
+	// Parallel, like TestPostUpdateInitOrder: the two together are most of this
+	// package's real-time sleeping, each builds its own fake and session, and
+	// nothing they touch is shared.
+	t.Parallel()
 	// A short timeout keeps the nine unanswered reads quick.
 	s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 	scriptCore(d)
@@ -507,7 +511,9 @@ func TestInfoFailsOnCoreCommand(t *testing.T) {
 
 // TestPostUpdateInitOrder pins the replay sequence of SPEC.md §10.4.
 func TestPostUpdateInitOrder(t *testing.T) {
+	t.Parallel()
 	t.Run("plausible vlimit is left alone", func(t *testing.T) {
+		t.Parallel()
 		s, d := newTestSession(t, Options{Timeout: time.Second})
 		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
 		d.SetResponse(proto.CmdAuthLock, []byte{0x00})
@@ -543,6 +549,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 	})
 
 	t.Run("implausible vlimit is rewritten", func(t *testing.T) {
+		t.Parallel()
 		s, d := newTestSession(t, Options{Timeout: time.Second})
 		// A flash left the window at 0/0.
 		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(0, 0))
@@ -576,6 +583,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 	})
 
 	t.Run("an unreadable window is retried and then left alone", func(t *testing.T) {
+		t.Parallel()
 		// One dropped frame must not cost the user their guard rail. The read
 		// is asked again, and a window that still cannot be read is left as the
 		// flash left it rather than replaced by the 48 V default -- SPEC.md §17
@@ -620,6 +628,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 	})
 
 	t.Run("a surviving narrow window is widened out loud", func(t *testing.T) {
+		t.Parallel()
 		// [3300, 5000] is a 5 V ceiling: the strictest guard rail there is, and
 		// the vendor's erased-window test rejects it for being under 6 V
 		// (SPEC.md §17, row 2) even though nothing erased it. The rewrite is
@@ -652,6 +661,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 	})
 
 	t.Run("write failures are tolerated and reported", func(t *testing.T) {
+		t.Parallel()
 		s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
 		// Nothing else answers: every write times out.
@@ -674,6 +684,7 @@ func TestPostUpdateInitOrder(t *testing.T) {
 	})
 
 	t.Run("force rewrites the vlimit", func(t *testing.T) {
+		t.Parallel()
 		s, d := newTestSession(t, Options{Timeout: 20 * time.Millisecond})
 		d.SetResponse(proto.CmdUserVLimit, proto.EncodeVLimit(3300, 48000))
 

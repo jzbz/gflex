@@ -789,19 +789,10 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 	// other one -- and opens it unambiguously. Identity across a re-enumeration
 	// is the invariant the bootloader half already enforces
 	// (UpdateOptions.ExpectSerial); this is where it has to hold on the way
-	// back, and it costs one read.
+	// back, and it costs a read (identifyReturnedUnit).
 	//
-	// A read that failed is not a mismatch. The protocol has no NACK (SPEC.md
-	// §5.2), so a dropped response is routine, and refusing to replay onto the
-	// right unit because one read went missing would cost more than the case
-	// this guards.
-	if got, serr := c.Session.SerialNumber(ctx); serr != nil {
-		f.Diag("warning: could not confirm the reconnected unit's serial (%v); "+
-			"replaying the settings for %s", serr, serial)
-	} else if got != serial {
-		return a.postFlashFailure(f, o, res, "identifying the unit that came back",
-			fmt.Errorf("%w: it reports serial %s, not %s; the settings were NOT replayed",
-				errWrongUnit, got, serial))
+	if err := identifyReturnedUnit(ctx, c.Session.SerialNumber, serial, scanSerialRetryDelay); err != nil {
+		return a.postFlashFailure(f, o, res, "identifying the unit that came back", err)
 	}
 
 	// Read the new version before the replay rather than after it: the replay
@@ -815,6 +806,12 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 
 	rep := replaySettings(ctx, f, c.Session, forceVLimit)
 
+	return reportFlashResult(f, rep, res, version, serial)
+}
+
+// reportFlashResult records the end of a flash whose update succeeded: the
+// version and serial the unit came back with and what the §10.4 replay did.
+func reportFlashResult(f Formatter, rep replayReport, res *bootloader.UpdateResult, version, serial string) error {
 	f.KV("fw_id", "firmware", version, version)
 	f.KV("serial_num", "serial", serial, serial)
 	f.KV("restored", "restored settings", rep.restored, fmt.Sprintf("%d", len(rep.restored)))
@@ -825,16 +822,35 @@ func (a *App) runFlash(ctx context.Context, f Formatter, o flashOpts) error {
 	} else {
 		f.KV("not_restored", "settings NOT restored", rep.failed, fmt.Sprintf("%d", len(rep.failed)))
 	}
+	// JSON-only, and always present for the same reason as not_restored: a
+	// script reading the object must be able to tell a replay that ran to the
+	// end from one a signal cut short, and not_restored lists only the steps
+	// that ran and failed -- the ones that never ran appear nowhere else.
+	f.KV("replay_interrupted", "", rep.cut != nil, "")
 	for _, line := range rep.restored {
 		f.Note("  %s", line)
 	}
 	reportReplayIncomplete(f, rep, res)
-	// Deliberately nil, and not a failure exit: the flash -- what this command
-	// exists to do -- succeeded, the unit is running the new image, and the
-	// settings that did not come back are named above along with the commands
-	// that set them. Returning an error here would also skip Formatter.Flush,
-	// throwing away the version, the serial and the JSON object, and would push
-	// a user whose firmware is fine towards re-flashing it.
+	if rep.cut != nil {
+		// A replay that never finished is not a success exit: a SIGTERM from
+		// a supervisor would otherwise read as a unit fully restored. The
+		// result block is flushed first, by hand, because the error return
+		// skips the flush App.run does on success, and the version, the serial
+		// and what was restored are exactly what the user needs next. The
+		// error keeps the cut's class, and its text leads with the flash having
+		// succeeded so nobody re-flashes for this.
+		if err := f.Flush(); err != nil {
+			return err
+		}
+		return postFlashFailed("the firmware update SUCCEEDED, but the settings replay did not finish", rep.cut)
+	}
+	// Deliberately nil, and not a failure exit, when every step ran: the flash
+	// -- what this command exists to do -- succeeded, the unit is running the
+	// new image, and the settings that did not take are named above along with
+	// the commands that set them. Returning an error here would also skip
+	// Formatter.Flush, throwing away the version, the serial and the JSON
+	// object, and would push a user whose firmware is fine towards re-flashing
+	// it.
 	return nil
 }
 
@@ -1288,6 +1304,31 @@ func (a *App) awaitApplicationReturn(ctx context.Context, f Formatter, o flashOp
 	return nil
 }
 
+// identifyReturnedUnit is phase 5's identity check: nil only when the unit
+// that answered the reconnect reports the serial that was flashed.
+//
+// A read that failed is not a mismatch, but it is not a match either. The
+// protocol has no NACK (SPEC.md §5.2), so a dropped response is routine, which
+// is why the read gets scan's patience (SPEC.md §9.2: six attempts, delay
+// apart) rather than one try. A unit that still cannot say who it is after
+// that gets nothing written to it: the replay unlocks AUTHLOCK, writes
+// calibration and may widen the voltage window, and on the wrong unit each of
+// those is a §13 hazard, while on the right one the cost of refusing is the
+// by-hand replay postFlashReplayNote spells out.
+func identifyReturnedUnit(ctx context.Context, read func(context.Context) (string, error),
+	serial string, delay time.Duration,
+) error {
+	got, err := readSerialRetrying(ctx, read, scanSerialAttempts, delay)
+	if err != nil {
+		return fmt.Errorf("%w; the settings were NOT replayed, since nothing showed this is %s", err, serial)
+	}
+	if got != serial {
+		return fmt.Errorf("%w: it reports serial %s, not %s; the settings were NOT replayed",
+			errWrongUnit, got, serial)
+	}
+	return nil
+}
+
 // errWrongUnit is phase 5's identity failure: the unit that answered the
 // reconnect is not the unit that was flashed.
 var errWrongUnit = errors.New("the reconnected unit is not the one that was flashed")
@@ -1338,6 +1379,25 @@ func (a *App) postFlashFailure(f Formatter, o flashOpts, res *bootloader.UpdateR
 		f.Diag("Re-flash it with:  %s", a.resumeCommand(o))
 		return postFlashFailed(fmt.Sprintf(
 			"the image was written, but the unit was not started and %s failed", what), err)
+	}
+	if res.JumpUnconfirmed {
+		// CMD_BOOTLOAD_END went out as the unit left the bus, and a jump that
+		// completes normally lets that write finish, so "the jump was sent" is
+		// all that is known (UpdateResult.JumpUnconfirmed). A unit unplugged
+		// or browned out in the bootloader looks the same from here, and "Do
+		// NOT re-flash" would forbid the one action that recovers it
+		// (SPEC.md §10.5). The LED is what tells them apart.
+		f.Diag("the image was written -- %s -- but the unit left the bus while CMD_BOOTLOAD_END",
+			flashOutcomePhrase(res))
+		f.Diag("was being sent, so nothing confirms it accepted that command and started the image.")
+		f.Diag("What failed is %s: %v", what, err)
+		f.Diag("If it comes back running, do not re-flash it. If it does not and %s,", bootloaderLEDNote)
+		f.Diag("it never left the bootloader, and re-flashing is the fix:")
+		f.Diag("  %s", a.resumeCommand(o))
+		f.Diag("")
+		postFlashReplayNote(f)
+		return postFlashFailed(fmt.Sprintf(
+			"the image was written, but nothing confirms the unit started it, and %s failed", what), err)
 	}
 	if !res.CRCChecked {
 		// --force, on an image that carries no CRC: every byte was written and
@@ -1409,15 +1469,15 @@ func (a *App) loadFirmware(ctx context.Context, o flashOpts, serial string) (*bo
 		}
 	} else {
 		// One open, one read, one parse. The image used to be opened twice --
-		// once by the sniff below, once by bootloader.LoadFileWithOptions --
-		// and on a FIFO those two opens share one stream, so the sniff would
-		// swallow its first 4 KiB and hand the loader the remainder. That is
-		// not a corrupt image, it is a *different* one, on the path where a
-		// wrong split can flash and even verify cleanly (SPEC.md §10.2,
-		// §14.12). Reading the bytes once and asking both questions of the
-		// bytes is what the loader would do anyway: LoadFileWithOptions is
-		// os.ReadFile plus ParseImage, and this is the same two steps with the
-		// open under this package's control.
+		// once by the sniff below, once by a library loader that was
+		// os.ReadFile plus ParseImage -- and on a FIFO those two opens share
+		// one stream, so the sniff would swallow its first 4 KiB and hand the
+		// loader the remainder. That is not a corrupt image, it is a
+		// *different* one, on the path where a wrong split can flash and even
+		// verify cleanly (SPEC.md §10.2, §14.12). Reading the bytes once and
+		// asking both questions of the bytes is the same two steps with the
+		// open under this package's control; the library loader is gone, so
+		// this is the only way an image is read from disk.
 		data, rerr := readImageFile(o.path)
 		if rerr != nil {
 			return nil, localFileError("loading", o.path, rerr)
@@ -1550,26 +1610,27 @@ func imageLooksJSON(data []byte) bool {
 // openBootloaderInterface opens the vendor-class interface and turns a failure
 // into CLI guidance.
 //
-// It does NOT retry. bootloader.Connect owns that loop -- it re-enumerates for
-// bootloader.ConnectRetryWindow because the device is still coming back on the
-// bus after the mode switch -- and this function used to wrap it in a second
-// loop of its own (15 s, 500 ms apart). The two multiplied instead of bounding
-// each other: Connect burns its whole window before it ever returns an error,
-// so the outer loop could only add another full pass on top of it, and the
-// failure then quoted two different budgets in one message ("after 15s: ...
-// after 8s"). Someone watching a stalled flash had no way to tell which one
-// they were in. One retry loop, and it belongs to the package that knows what
-// it is waiting for; do not add another here.
+// It does NOT retry. bootloader.ConnectWithOptions owns that loop -- it
+// re-enumerates for bootloader.ConnectRetryWindow because the device is still
+// coming back on the bus after the mode switch -- and this function used to
+// wrap it in a second loop of its own (15 s, 500 ms apart). The two multiplied
+// instead of bounding each other: ConnectWithOptions burns its whole window
+// before it ever returns an error, so the outer loop could only add another
+// full pass on top of it, and the failure then quoted two different budgets in
+// one message ("after 15s: ... after 8s"). Someone watching a stalled flash had
+// no way to tell which one they were in. One retry loop, and it belongs to the
+// package that knows what it is waiting for; do not add another here.
 //
-// noJumpInFlight is set only by --recover, and it is what lets Connect give up
-// early on a unit that is still running the application. Everywhere else a jump
-// has just been issued and that refusal is expected and transient -- the unit is
-// mid-reset and has not left the bus yet -- so abandoning the window there would
-// give up on a flash that was about to succeed.
+// noJumpInFlight is set only by --recover, and it is what lets
+// ConnectWithOptions give up early on a unit that is still running the
+// application. Everywhere else a jump has just been issued and that refusal is
+// expected and transient -- the unit is mid-reset and has not left the bus yet
+// -- so abandoning the window there would give up on a flash that was about to
+// succeed.
 func openBootloaderInterface(ctx context.Context, f Formatter, noJumpInFlight bool) (*usbfs.Device, usbfs.Interface, error) {
-	// Said before the call, not after a first failure: Connect blocks for its
-	// whole window, so a message that waits for one is a message nobody sees
-	// while they are waiting for it.
+	// Said before the call, not after a first failure: ConnectWithOptions
+	// blocks for its whole window, so a message that waits for one is a message
+	// nobody sees while they are waiting for it.
 	f.Diag("opening the bootloader interface (retrying for up to %s while the device enumerates)...",
 		bootloader.ConnectRetryWindow)
 	dev, iface, err := connectBootloader(ctx, bootloader.ConnectOptions{
@@ -1579,7 +1640,7 @@ func openBootloaderInterface(ctx context.Context, f Formatter, noJumpInFlight bo
 		return dev, iface, nil
 	}
 	// An interrupted run is not a missing device and must not be reported as
-	// one: Connect returns the context's own error when it is cancelled
+	// one: ConnectWithOptions returns the context's own error when it is cancelled
 	// mid-wait, and ExitNoDevice would tell someone who pressed Ctrl-C that
 	// their unit had vanished.
 	if ctx.Err() != nil {
@@ -1615,8 +1676,8 @@ func openBootloaderInterface(ctx context.Context, f Formatter, noJumpInFlight bo
 	if !usbPresent() {
 		hint = fmt.Sprintf("\n  No device with vendor 0x%04X is on the bus at all.", proto.VendorID)
 	}
-	// The window is not restated here: Connect owns the retry and names its own
-	// budget in the error being wrapped.
+	// The window is not restated here: ConnectWithOptions owns the retry and
+	// names its own budget in the error being wrapped.
 	return nil, usbfs.Interface{}, coded(ExitNoDevice, fmt.Errorf(
 		"could not open the bootloader interface: %w%s\n"+
 			"  The bootloader is a raw USB interface, not MIDI, so it needs a udev rule:\n"+
@@ -1642,6 +1703,12 @@ func openBootloaderInterface(ctx context.Context, f Formatter, noJumpInFlight bo
 // because it decides which stack opens the unit; the connection details that do
 // not change what is written -- --port, --timeout, --byte-delay -- are left to
 // the user's own shell history, which is where the whole command came from.
+//
+// The two values the user typed -- the image path and the WebSocket URL -- go
+// through shellWord. The line is printed to be pasted while the unit sits in
+// the bootloader, so a path with a space in it that splits into two arguments,
+// or one starting with '-' that parses as a flag, would leave the user holding
+// the one instruction that does not run at the one moment it matters.
 func (a *App) resumeCommand(o flashOpts) string {
 	cmd := "gflex"
 	if a.Transport != "" && a.Transport != transportRawMIDI {
@@ -1651,7 +1718,13 @@ func (a *App) resumeCommand(o flashOpts) string {
 	if o.fetch {
 		cmd += " --fetch"
 	} else {
-		cmd += " " + o.path
+		path := o.path
+		if strings.HasPrefix(path, "-") {
+			// Quoting does not stop cobra reading a leading dash as a flag;
+			// naming the same file relative to "." does.
+			path = "./" + path
+		}
+		cmd += " " + shellWord(path)
 	}
 	if o.pageSize != 0 {
 		cmd += fmt.Sprintf(" --page-size %d", o.pageSize)
@@ -1666,12 +1739,27 @@ func (a *App) resumeCommand(o flashOpts) string {
 		cmd += " --ack-mode"
 	}
 	if o.fetch && o.wsURL != "" && o.wsURL != bootloader.DefaultWSURL {
-		cmd += " --ws-url " + o.wsURL
+		cmd += " --ws-url " + shellWord(o.wsURL)
 	}
 	if o.fetch && o.fetchTimeout != 0 && o.fetchTimeout != bootloader.DefaultFetchTimeout {
 		cmd += " --fetch-timeout " + o.fetchTimeout.String()
 	}
 	return cmd + " --yes"
+}
+
+// shellWord renders s as one POSIX shell word: unchanged when every byte is
+// one no shell treats specially, single-quoted otherwise, with each embedded
+// single quote closed, escaped and reopened. Quoting only when needed keeps
+// the common case -- fw.bin, a wss:// URL -- reading exactly as the user typed
+// it.
+func shellWord(s string) string {
+	if s != "" && strings.IndexFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			strings.ContainsRune("@%+=:,./_-", r))
+	}) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // progressWriter renders flash progress on stderr, and keeps the log lines the

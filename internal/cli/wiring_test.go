@@ -36,6 +36,11 @@ type fakeTree struct {
 	dev    *fake.Device
 	stdout bytes.Buffer
 	stderr bytes.Buffer
+	// opens counts transport opens. A refusal that must happen before the
+	// device is touched is asserted on this rather than on frames sent: an
+	// open that sends nothing still claims the port, and on --transport usb it
+	// detaches snd-usb-audio.
+	opens int
 }
 
 // newFakeTree wires dev into an App. stdin is deliberately not a terminal: that
@@ -49,6 +54,7 @@ func newFakeTree(t *testing.T, dev *fake.Device) *fakeTree {
 	tr.app = &App{
 		stdin: strings.NewReader(""),
 		testTransport: func(context.Context) (proto.Transport, string, error) {
+			tr.opens++
 			return dev.Transport(), fake.TransportName, nil
 		},
 	}
@@ -400,6 +406,12 @@ func TestArgumentOnlyRefusalsOpenNoDevice(t *testing.T) {
 			}
 			if frames := dev.Sent(); len(frames) != 0 {
 				t.Errorf("the device was asked %v before the refusal", cmdNames(frames))
+			}
+			// Not one frame is not the same as not opened: connect sends
+			// nothing, so an open-then-refuse regression would pass the check
+			// above while still claiming the port.
+			if tr.opens != 0 {
+				t.Errorf("the transport was opened %d times before the refusal", tr.opens)
 			}
 		})
 	}

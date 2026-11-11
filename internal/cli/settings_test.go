@@ -459,10 +459,35 @@ func TestVLimitSetComparesItsReadBack(t *testing.T) {
 	echoAndKeepTheOldValue(dev, proto.CmdUserVLimit)
 	tr := newFakeTree(t, dev)
 
-	if err := tr.run(t, "vlimit", "set", "--low", "3300mV", "--high", "5000mV"); err != nil {
-		t.Fatalf("`vlimit set --low 3300mV --high 5000mV`: %v", err)
+	err := tr.run(t, "vlimit", "set", "--low", "3300mV", "--high", "5000mV")
+	if !errors.Is(err, errVLimitWider) {
+		t.Fatalf("a stored window wider than the one written exited %v; "+
+			"`vlimit set --high 5 && voltage set 12` would reach its second command", err)
 	}
-	if !strings.Contains(tr.stderr.String(), "read back [3300, 48000] mV after writing [3300, 5000] mV") {
+	if got := ExitCode(err); got != ExitFailure {
+		t.Errorf("exit code %d, want %d", got, ExitFailure)
+	}
+	if !strings.Contains(err.Error(), "the device holds [3300, 48000] mV after [3300, 5000] mV was written") {
+		t.Errorf("the error does not say which window the device keeps: %v", err)
+	}
+	if strings.Contains(err.Error(), "failed") {
+		t.Errorf("something was stored, so the write did not fail; the error says it did: %v", err)
+	}
+}
+
+// A stored window inside the requested one only refuses more. That is not a
+// lost guard rail, and nothing measured says the firmware never clamps, so it
+// is reported and the command still succeeds.
+func TestVLimitSetAcceptsANarrowerReadBackWithAWarning(t *testing.T) {
+	dev := fake.NewTypical()
+	dev.StoreRegister(proto.CmdUserVLimit, proto.EncodeVLimit(5000, 9000))
+	echoAndKeepTheOldValue(dev, proto.CmdUserVLimit)
+	tr := newFakeTree(t, dev)
+
+	if err := tr.run(t, "vlimit", "set", "--low", "3300mV", "--high", "20000mV", "--yes"); err != nil {
+		t.Fatalf("a narrower stored window failed the command: %v", err)
+	}
+	if !strings.Contains(tr.stderr.String(), "read back [5000, 9000] mV after writing [3300, 20000] mV") {
 		t.Errorf("a window the device did not keep was reported without a word:\n%s", tr.stderr.String())
 	}
 }

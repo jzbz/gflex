@@ -92,6 +92,15 @@ type UpdateResult struct {
 	Reflashed bool
 	// JumpedToApp reports whether CMD_BOOTLOAD_END was sent.
 	JumpedToApp bool
+	// JumpUnconfirmed qualifies JumpedToApp: the CMD_BOOTLOAD_END write failed
+	// because the device left the bus, so whether it accepted the command
+	// first is not known. A completed jump normally lets the OUT transfer
+	// finish -- the host controller sees the packet acknowledged before the
+	// firmware acts on it -- so a device gone mid-write is as likely to have
+	// been unplugged or lost power in the bootloader as to have jumped. A
+	// caller must not tell the user the unit is running the new image on the
+	// strength of this send alone.
+	JumpUnconfirmed bool
 }
 
 // Update runs the bootloader half of a firmware update as a single sequence:
@@ -114,7 +123,7 @@ type UpdateResult struct {
 // MIDI stack. The caller owns the phases either side:
 //
 //	before  Session.JumpToBootloader, require a disconnect within 3 s as proof
-//	        the jump took, wait BOOTLOADER_MODE_SWITCH_DELAY_MS (4 s), Connect.
+//	        the jump took, wait BOOTLOADER_MODE_SWITCH_DELAY_MS (4 s), ConnectWithOptions.
 //	after   close the usbfs device so the interface is released, wait 4 s, wait
 //	        for the unit to re-enumerate in application mode, then
 //	        Session.PostUpdateInit.
@@ -306,6 +315,7 @@ func update(ctx context.Context, f *Flasher, fw *Firmware, opts UpdateOptions) (
 				"probably still in bootloader mode (slow blinking white LED) and can be re-flashed: %w", err)
 		}
 		logf("warning: %v (the device may already have jumped)", err)
+		res.JumpUnconfirmed = true
 	}
 	res.JumpedToApp = true
 	return res, nil

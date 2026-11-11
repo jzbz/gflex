@@ -588,7 +588,7 @@ const DefaultFetchTimeout = 15 * time.Second
 // wsURL may be empty, in which case DefaultWSURL is used; timeout may be zero
 // for DefaultFetchTimeout. It must name a TLS endpoint — see insecureWSScheme
 // for why, and for the one spelling that says otherwise on purpose. Callers who
-// want to work offline should prefer LoadFile — the local file is the primary
+// want to work offline should read a local image with ParseImage — the local file is the primary
 // input and this service is a convenience (SPEC.md §10.3).
 func FetchRaw(ctx context.Context, wsURL, serial string, timeout time.Duration) ([]byte, error) {
 	if wsURL == "" {

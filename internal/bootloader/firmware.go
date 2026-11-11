@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 
@@ -140,31 +139,6 @@ type LoadOptions struct {
 	PageSize int
 }
 
-// LoadFile reads a firmware image from disk using the default options.
-//
-// Both input shapes are accepted:
-//
-//   - the vendor's JSON payload, {"app_bin"|"app_bin_data"|"firmware": [...],
-//     "app_version": "...", "crc": n}, where the pages may be arrays of byte
-//     values, base64 strings, or hex strings;
-//   - a raw .bin image, which is split into LoadOptions.PageSize pages.
-func LoadFile(path string) (*Firmware, error) {
-	return LoadFileWithOptions(path, LoadOptions{})
-}
-
-// LoadFileWithOptions reads a firmware image from disk with explicit options.
-func LoadFileWithOptions(path string, opts LoadOptions) (*Firmware, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("bootloader: reading firmware %s: %w", path, err)
-	}
-	fw, err := ParseImage(data, opts)
-	if err != nil {
-		return nil, fmt.Errorf("bootloader: %s: %w", path, err)
-	}
-	return fw, nil
-}
-
 // ParseImage interprets an in-memory firmware image.
 //
 // The format is detected from the first non-whitespace byte: '{' or '[' means
@@ -172,9 +146,9 @@ func LoadFileWithOptions(path string, opts LoadOptions) (*Firmware, error) {
 func ParseImage(data []byte, opts LoadOptions) (*Firmware, error) {
 	// An explicit page size is refused here, on every path, rather than only
 	// where it is consumed: this is the one place LoadOptions enters the
-	// package, so LoadFile, LoadFileWithOptions and ParseImage all inherit the
-	// check. Zero is not "invalid", it is "unset" — the zero value of
-	// LoadOptions has to keep working — so only a stated geometry is judged.
+	// package, so every caller inherits the check. Zero is not "invalid", it
+	// is "unset" — the zero value of LoadOptions has to keep working — so only
+	// a stated geometry is judged.
 	if opts.PageSize != 0 {
 		if err := validatePageSize(opts.PageSize); err != nil {
 			return nil, err
@@ -652,6 +626,14 @@ func decodeChunkedPage(raw json.RawMessage) ([]byte, *int, error) {
 	if len(wp.Chunks) == 0 {
 		return nil, nil, fmt.Errorf("%w: page object carries no chunks", ErrBadPageLength)
 	}
+	// Unmarshalling into a map keeps the last of two equal keys and says
+	// nothing, so {"0":[1],"0":[9],"1":...,"7":...} has eight distinct keys
+	// and passes every count below while one chunk's bytes were silently
+	// dropped. SPEC.md §10.3 promises a duplicated chunk map is refused; this
+	// is where that is kept.
+	if key, dup := duplicateChunkKey(raw); dup {
+		return nil, nil, fmt.Errorf("%w: page has chunk %q more than once", ErrBadPageLength, key)
+	}
 	if len(wp.Chunks) != ChunksPerPage {
 		return nil, nil, fmt.Errorf("%w: page has %d chunks, want exactly %d",
 			ErrBadPageLength, len(wp.Chunks), ChunksPerPage)
@@ -671,6 +653,56 @@ func decodeChunkedPage(raw json.RawMessage) ([]byte, *int, error) {
 		out = append(out, b...)
 	}
 	return out, wp.PageID, nil
+}
+
+// duplicateChunkKey reports the first key that appears twice in raw's
+// "chunks" object. raw has already unmarshalled cleanly, so the token walk can
+// rely on the shape; anything unexpected is left for the caller's own checks
+// and reported as no duplicate. The member name is matched the way
+// encoding/json matches it, case-insensitively, so this inspects the same
+// object the map was filled from.
+func duplicateChunkKey(raw []byte) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return "", false
+	}
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		name, _ := t.(string)
+		if !strings.EqualFold(name, "chunks") {
+			var skip json.RawMessage
+			if dec.Decode(&skip) != nil {
+				return "", false
+			}
+			continue
+		}
+		if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+			return "", false
+		}
+		seen := make(map[string]bool, ChunksPerPage)
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return "", false
+			}
+			key, _ := kt.(string)
+			if seen[key] {
+				return key, true
+			}
+			seen[key] = true
+			var skip json.RawMessage
+			if dec.Decode(&skip) != nil {
+				return "", false
+			}
+		}
+		if _, err := dec.Token(); err != nil {
+			return "", false
+		}
+	}
+	return "", false
 }
 
 // decodeChunk converts one chunk: an array of byte values, or a base64/hex

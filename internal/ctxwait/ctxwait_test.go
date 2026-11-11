@@ -38,8 +38,8 @@ func TestSleepCancelledWhileWaiting(t *testing.T) {
 	}
 }
 
-// An already-cancelled context is reported before any timer is armed, so a long
-// wait on a dead context costs nothing.
+// An already-cancelled context is reported at once rather than slept through,
+// so a long wait on a dead context costs nothing.
 func TestSleepPositiveDurationHonoursCancellation(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,5 +83,19 @@ func TestSleepNonPositiveOnALiveContextSucceeds(t *testing.T) {
 	}
 	if err := Sleep(context.Background(), -time.Second); err != nil {
 		t.Errorf("Sleep(live, -1s) = %v, want nil", err)
+	}
+}
+
+// A cancelled context wins a tie with the timer. With both select cases ready
+// Go picks one at random, so a 1 ns wait on a dead context used to report
+// success about half the time; across a thousand tries that is never missed.
+func TestSleepCancellationWinsATieWithTheTimer(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 1000; i++ {
+		if err := Sleep(ctx, time.Nanosecond); !errors.Is(err, context.Canceled) {
+			t.Fatalf("try %d: Sleep(cancelled, 1ns) = %v, want context.Canceled", i, err)
+		}
 	}
 }

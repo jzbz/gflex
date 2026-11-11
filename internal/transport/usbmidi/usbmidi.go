@@ -54,9 +54,6 @@ const (
 	// 64 is the full-speed bulk maximum and what snd-usb-audio uses for
 	// USB-MIDI 1.0.
 	defaultPacketSize = 64
-	// maxPacketSizeMask selects the size bits of wMaxPacketSize; the rest are
-	// the transactions-per-microframe multiplier (USB 2.0 §9.6.6). See bufSize.
-	maxPacketSizeMask = 0x07FF
 	// ctxSlack is added to the transfer timeout when deriving the context
 	// deadline, so the transfer's own timeout fires first and the context
 	// deadline stays a backstop.
@@ -315,7 +312,7 @@ func OpenAuto() (proto.Transport, usbfs.DeviceRef, error) {
 // refuse outright as too large -- which ReadMIDI would report as a hard error
 // rather than as the timeout an idle device produces.
 func bufSize(ep usbfs.Endpoint) int {
-	n := int(ep.MaxPacketSize & maxPacketSizeMask)
+	n := ep.PacketSize()
 	if n < 4 {
 		return defaultPacketSize
 	}

@@ -119,6 +119,10 @@ func (e *Error) Unwrap() []error {
 }
 
 // classify maps an errno onto an exported sentinel plus a remediation hint.
+//
+// The EACCES hint spells the vendor ID as a literal because this package sits
+// below proto and takes the vendor as an argument everywhere else; the usbfs
+// tests pin it to proto.VendorIDString so the two cannot drift apart.
 // The hints matter: the two failure modes users actually hit are a missing udev
 // rule and an interface held by snd-usb-audio, and neither "permission denied"
 // nor "device or resource busy" tells them what to do about it.

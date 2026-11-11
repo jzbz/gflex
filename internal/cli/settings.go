@@ -240,6 +240,11 @@ func newVoltageCommand(app *App) *cobra.Command {
 	return cmd
 }
 
+// errVLimitWider reports that `vlimit set` read back a window admitting
+// voltages the requested one would refuse: the guard rail the user asked for is
+// not the one the device keeps.
+var errVLimitWider = errors.New("the voltage window read back is wider than the one written")
+
 // ---------------------------------------------------------------------------
 // current
 // ---------------------------------------------------------------------------
@@ -483,8 +488,26 @@ func newVLimitCommand(app *App) *cobra.Command {
 				// against, so a write that did not take is a lost guard rail
 				// rather than a cosmetic mismatch -- and with no NACK in the
 				// protocol (SPEC.md §5.2) the read-back is the only thing that
-				// can notice. A warning and not a failure: nothing measured says
-				// the firmware never clamps or rounds a window it is given.
+				// can notice.
+				//
+				// Which way it differs decides what that means. A stored window
+				// that lets through any voltage the requested one would refuse
+				// is a guard rail the user believes in and does not have, and a
+				// script chaining `vlimit set --high 5 && voltage set 12` must
+				// not reach its second command: that is a failure exit. A
+				// stored window inside the requested one only refuses more, so
+				// it stays a warning -- nothing measured says the firmware never
+				// clamps or rounds a window it is given, and a narrower guard
+				// rail is not a hazard. Either way the message says what the
+				// device holds rather than that the write "failed": something
+				// was stored, and it is the window every later `voltage set`
+				// is checked against.
+				if int(low) < req.NewLowMv || int(high) > req.NewHighMv {
+					return fmt.Errorf("%w: the device holds [%d, %d] mV after [%d, %d] mV was written, "+
+						"and that is the window every later `voltage set` is checked against; "+
+						"check it with `gflex vlimit get`", errVLimitWider,
+						low, high, req.NewLowMv, req.NewHighMv)
+				}
 				if low != uint16(req.NewLowMv) || high != uint16(req.NewHighMv) {
 					f.Diag("warning: read back [%d, %d] mV after writing [%d, %d] mV",
 						low, high, req.NewLowMv, req.NewHighMv)
@@ -763,7 +786,7 @@ func newCalibrateCommand(app *App) *cobra.Command {
 						return codedf(ExitUsage,
 							"--dry-run needs both --offset and --scale: the missing one would have to be read from the device")
 					}
-					if err := app.applyDryRun(f, CheckCalibrate(offset, scale, 0, 0, false, true, true)); err != nil {
+					if err := app.applyDryRun(f, CheckCalibrate(offset, scale, 0, 0, CalibrationPrevNotAttempted, true, true)); err != nil {
 						return err
 					}
 					offFrame, err := proto.Write(proto.CmdVMeasureADCOffset, proto.EncodeI32(offset))
@@ -804,7 +827,10 @@ func newCalibrateCommand(app *App) *cobra.Command {
 				if oerr == nil || !haveScale {
 					prevScale, serr = c.Session.ADCScale(ctx)
 				}
-				prevKnown := oerr == nil && serr == nil
+				prev := CalibrationPrevUnread
+				if oerr == nil && serr == nil {
+					prev = CalibrationPrevRead
+				}
 				// Each omitted flag is filled from its OWN read. Failing because
 				// the other term could not be read refused a `--offset 0` whose
 				// scale had arrived perfectly well, and the value it needed was
@@ -822,7 +848,7 @@ func newCalibrateCommand(app *App) *cobra.Command {
 					scale = prevScale
 				}
 				if err := app.apply(ctx, f, CheckCalibrate(offset, scale, prevOffset, prevScale,
-					prevKnown, haveOffset, haveScale)); err != nil {
+					prev, haveOffset, haveScale)); err != nil {
 					return err
 				}
 				// Only the terms the user actually gave are written. The other

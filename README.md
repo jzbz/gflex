@@ -220,8 +220,9 @@ fingerprint gpg prints against the one above and move on, or sign the key locall
 The order is the whole point. `SHA256SUMS` sits in the same release as the files it describes, so on
 its own it catches a truncated download and nothing else — anyone able to replace a binary could
 replace the list beside it just as easily. The signature is what turns it into a check, and it is
-made by hand after the release workflow has published: the key never goes near CI, so a compromised
-workflow can publish a binary but cannot sign for one.
+made by hand from the `SHA256SUMS` the release workflow attaches to a draft, and the release is
+published only once the signature is on it: the key never goes near CI, so a compromised workflow
+can build a binary but cannot sign for one.
 
 None of this is the [CRC a firmware image carries](#firmware-update). That one is the vendor's, it
 travels in the same document as the image it describes, and the device recomputes it over whatever
@@ -395,8 +396,11 @@ gflex -v info                    # hex trace of every frame, both directions
 ```
 
 `monitor` shows the **receive** direction only: the ALSA rawmidi node doesn't loop back what
-another process writes, so to watch a full exchange run `monitor` in one terminal and the command
-you care about with `-v` in another, which traces the session's own frames as well as the replies.
+another process writes. Nor can it run alongside the command you want to watch: ALSA opens the
+node exclusively, so a second `gflex` on the same port fails with "busy" while `monitor` holds it,
+and `--transport usb` for the second one detaches the driver that `monitor`'s node belongs to. To
+watch a full exchange, run the command on its own with `-v`, which traces the session's own frames
+as well as the replies.
 
 `gflex monitor` and `gflex raw` exist mainly to help resolve the open questions in
 [SPEC.md §14](SPEC.md) against real hardware.

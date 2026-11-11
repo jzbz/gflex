@@ -1,7 +1,6 @@
 package proto
 
 import (
-	"context"
 	"io"
 	"time"
 )
@@ -132,15 +131,5 @@ type Transport interface {
 	ReadMIDI(p []byte) (int, error)
 	// Name identifies the endpoint for diagnostics, e.g. a device node path.
 	Name() string
-	io.Closer
-}
-
-// BulkTransport is a raw bidirectional bulk/interrupt USB channel, used for
-// the bootloader's vendor-class interface where no MIDI framing exists.
-type BulkTransport interface {
-	// Send writes one frame to the OUT endpoint.
-	Send(ctx context.Context, p []byte) error
-	// Receive reads one packet from the IN endpoint.
-	Receive(ctx context.Context, p []byte) (int, error)
 	io.Closer
 }

@@ -208,6 +208,21 @@ func (l *Log) evaluateEPR(v, i float64) Match {
 		l.appendEPRFailure(&m, v)
 	}
 
+	// The same rule from the other side: a PPS range can decode up to 25.5 V,
+	// and the default arm above consults it only when no EPR object covered v
+	// at all. Where one did and is short of the request, a PPS range that
+	// covers v and genuinely offers more wins (SPEC.md §17, row 9.5).
+	if m.Mode != ModeNone && m.chosen.Kind != KindPPS && m.MaxCurrentA+cmpEps < i {
+		if pps, ok := l.ppsCovering(v); ok {
+			if a := pps.CurrentAt(v); a > m.MaxCurrentA+cmpEps {
+				m.pick(ModeUpgradeSPRPPSMoreCurrent, pps, v)
+				m.Messages = append(m.Messages,
+					fmt.Sprintf("no EPR capability supplies the requested %s at %s; the PPS range %s supplies %s",
+						formatA(i), formatV(v), formatRange(pps.MinVoltageV, pps.MaxVoltageV), formatA(a)))
+			}
+		}
+	}
+
 	l.finish(&m, v, i)
 	return m
 }
@@ -227,6 +242,21 @@ const eprRequiredMessage = "Power source with Extended Power Range is Required"
 // appendEPRFailure explains why no EPR capability could produce v.
 func (l *Log) appendEPRFailure(m *Match, v float64) {
 	if !l.hasEPRCapability() {
+		if l.declaresEPRCapable() {
+			// No EPR object was captured, but the source itself says it does
+			// EPR: bit 23 of its fixed objects, which USB-PD requires an
+			// EPR-capable source to set on every one (SPEC.md §9.4). The
+			// vendor's sentence would send the user to replace a charger that
+			// is fine; what is missing is the EPR negotiation, and the usual
+			// reason is the cable.
+			m.Messages = append(m.Messages, "the source declares itself EPR-capable, but the scan captured "+
+				"no EPR objects, so EPR mode was never entered: fit an eMarker-equipped 5 A EPR cable and rescan")
+			if l.EPRCableFail {
+				m.addCaveat(CaveatEPRCableFail)
+				m.Messages = append(m.Messages, "the scan also reported an EPR cable failure")
+			}
+			return
+		}
 		// The headline case: an ordinary SPR-only charger.
 		m.Messages = append(m.Messages, eprRequiredMessage)
 		if l.EPRCableFail {
@@ -288,6 +318,18 @@ func (l *Log) evaluateSPR(v, i float64) Match {
 			m.Messages = append(m.Messages,
 				fmt.Sprintf("the fixed PDO cannot supply the requested %s; PPS %s supplies %s",
 					formatA(i), formatRange(pps.MinVoltageV, pps.MaxVoltageV), formatA(ppsA)))
+		}
+		// The vendor's fixed arm consults PPS and nothing else, so a fixed
+		// 9 V 1.5 A object beside an SPR AVS range offering 5 A at 9 V answered
+		// "no" to 4 A. SPEC.md §17 (row 9.5): any object whose range covers the
+		// request is considered, and the verdict upgrades where the weaker one
+		// is short. Same condition as above -- still short of the request, and
+		// the AVS range genuinely offers more than what was picked.
+		if hasAVS && avsA > m.MaxCurrentA+cmpEps && m.MaxCurrentA+cmpEps < i {
+			m.pick(ModeUpgradeSPRAVSMoreCurrent, avs, v)
+			m.Messages = append(m.Messages,
+				fmt.Sprintf("no fixed or PPS object supplies the requested %s; SPR AVS supplies %s",
+					formatA(i), formatA(avsA)))
 		}
 
 	case hasPPS && ppsA > 0:
@@ -736,6 +778,18 @@ func (l *Log) hasEPRCapability() bool {
 			return true
 		}
 		if p.Kind == KindFixed && p.Valid && p.EPR {
+			return true
+		}
+	}
+	return false
+}
+
+// declaresEPRCapable reports whether any fixed object carries the EPR Capable
+// bit (bit 23): the source's own statement that it supports EPR, independent of
+// whether this scan captured any EPR object.
+func (l *Log) declaresEPRCapable() bool {
+	for _, p := range l.PDOs {
+		if p.Kind == KindFixed && p.EPRCapable != nil && *p.EPRCapable {
 			return true
 		}
 	}

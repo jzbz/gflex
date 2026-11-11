@@ -37,6 +37,11 @@ func Sleep(ctx context.Context, d time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-t.C:
-		return nil
+		// Not a bare nil. When the context has ended and the timer has fired
+		// by the time select looks, it picks either case at random, and a
+		// cancellation that loses that draw would be swallowed -- a short wait
+		// on a dead context reporting success. Asking ctx here makes ending
+		// win every tie.
+		return ctx.Err()
 	}
 }

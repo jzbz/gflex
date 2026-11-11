@@ -521,6 +521,36 @@ func TestNewFlasherWithoutDevice(t *testing.T) {
 	}
 }
 
+// The ACK read buffer comes from the size bits of wMaxPacketSize only. The
+// whole field read as a size can pass usbfs's 16384-byte ceiling, and every
+// read would then fail locally before reaching the device.
+func TestNewFlasherSizesItsReadBufferFromThePacketSizeBits(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		declared uint16
+		want     int
+	}{
+		{64, 64},
+		{512, 512},
+		{0x5800, 64}, // multiplier bits only, size bits 0: the 64-byte floor
+		{0x4400, 1024},
+		{0xFFFF, 2047},
+	} {
+		iface := usbfs.Interface{Endpoints: []usbfs.Endpoint{
+			{Address: 0x81, Attributes: 0x02, MaxPacketSize: tc.declared},
+			{Address: 0x01, Attributes: 0x02, MaxPacketSize: 64},
+		}}
+		f := NewFlasher(&usbfs.Device{}, iface)
+		want := max(tc.want, minReadBufferLen)
+		if f.readLen != want {
+			t.Errorf("wMaxPacketSize 0x%04X: readLen = %d, want %d", tc.declared, f.readLen, want)
+		}
+		if f.readLen > usbfs.MaxBulkTransferSize {
+			t.Errorf("wMaxPacketSize 0x%04X: readLen %d exceeds the usbfs ceiling", tc.declared, f.readLen)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Update
 // ---------------------------------------------------------------------------
@@ -921,6 +951,9 @@ func TestUpdateReportsACMDBootloadEndThatWasNotDelivered(t *testing.T) {
 				if !res.JumpedToApp {
 					t.Error("JumpedToApp = false for a device that disappeared as it jumped")
 				}
+				if !res.JumpUnconfirmed {
+					t.Error("JumpUnconfirmed = false, so the caller would report a jump nothing confirmed")
+				}
 				if !lines.contains("may already have jumped") {
 					t.Errorf("log = %v, want the ambiguity reported", *lines)
 				}
@@ -1248,7 +1281,7 @@ func TestInApplicationModeAcceptsAVendorClassMIDIInterface(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Connect's fail-fast option
+// ConnectWithOptions's fail-fast option
 // ---------------------------------------------------------------------------
 
 // TestEveryCandidateWasApplicationModeNeedsEveryCandidate pins the guard that
