@@ -235,7 +235,7 @@ them.
 CGO_ENABLED=0 go install github.com/jzbz/gflex/cmd/gflex@latest
 ```
 
-Requires Go 1.26+. `CGO_ENABLED=0` is what makes the result static: gflex imports `net` to reach the
+Requires Go 1.27+. `CGO_ENABLED=0` is what makes the result static: gflex imports `net` to reach the
 vendor's firmware service, and a cgo-enabled build links that against the system resolver.
 
 Every package here lives under `internal/`, so the module exposes no importable Go API — the version

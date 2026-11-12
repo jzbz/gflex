@@ -38,7 +38,12 @@ env:
   # nothing about the code. (Observed locally 2026-08-21 when the host toolchain
   # moved to 1.27 while go.mod still said 1.26.) So: bumping the go directive
   # means bumping this too, in the same commit. v0.8.0 (2026.2) is the first
-  # release to support Go 1.27.
+  # release to support Go 1.27, but a Go point release can move the format too:
+  # 1.27.2 did, and v0.8.1 fails on it with "export data version 5 is greater
+  # than maximum supported version 4" (observed locally 2026-11-12 on 1.27.4).
+  # setup-go's check-latest picks up such a point release without any edit
+  # here, so the first red run after one is likely this, not the code. v0.8.2
+  # (2026.2.2) is the first release to read 1.27.2's export data.
   #
   # This name is documentation and an assertion, not the pin: the install below
   # uses the commit SHA. A tag is a mutable git ref, and this workflow already
@@ -47,11 +52,11 @@ env:
   # weaker rule than an action does. The staticcheck step checks that the SHA
   # still resolves to this version, which is what keeps the two lines from
   # drifting apart when only one of them is bumped.
-  STATICCHECK_VERSION: v0.8.1
-  # dominikh/go-tools, the commit tagged v0.8.1 (and 2026.2.1). There is no
+  STATICCHECK_VERSION: v0.8.2
+  # dominikh/go-tools, the commit tagged v0.8.2 (and 2026.2.2). There is no
   # Dependabot ecosystem covering a `go install` outside the module graph, so
   # unlike the action SHAs this pair is bumped by hand.
-  STATICCHECK_COMMIT: 1285a6a5ec1e0ebb658f49e82b6c566a878cc3cb
+  STATICCHECK_COMMIT: 54455593555daf6bfcf3c480faaada7de3145357
 
 jobs:
   check:

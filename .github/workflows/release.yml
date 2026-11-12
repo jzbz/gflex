@@ -50,7 +50,7 @@ jobs:
           # Tracks the toolchain in go.mod, exactly as ci.yml does, so a
           # release is built with the Go the tree declares. go.mod names a
           # minor version and no toolchain directive, so that is a range:
-          # check-latest resolves it to the newest 1.26.x on the day of the
+          # check-latest resolves it to the newest 1.27.x on the day of the
           # build. See what the build step below says about reproducing one.
           go-version-file: go.mod
           check-latest: true
@@ -90,12 +90,12 @@ jobs:
           # standing in the way of reproducing a release.
           #
           # The toolchain is the part that still varies, and it is not this
-          # workflow's to stamp: setup-go above resolves go.mod's "go 1.26" to
+          # workflow's to stamp: setup-go above resolves go.mod's "go 1.27" to
           # the newest patch of the day, and runtime.Version() is compiled into
           # the binary (gflex version prints it). So two builds of one tag
           # either side of a Go point release differ in bytes. Reproducing a
           # published binary means building with the toolchain "go version -m"
-          # reports for it, not whichever 1.26.x happens to be current.
+          # reports for it, not whichever 1.27.x happens to be current.
           builddate="$(git log -1 --format=%cI)"
           # These three variables exist in internal/cli/version.go for exactly
           # this. The import path has to be spelled in full and a typo in it
@@ -146,7 +146,7 @@ jobs:
       - name: checksum
         run: sha256sum "$BIN" > "$BIN.sha256"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gflex-linux-${{ matrix.goarch }}
           path: |
@@ -165,7 +165,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: gflex-linux-*
           merge-multiple: true
